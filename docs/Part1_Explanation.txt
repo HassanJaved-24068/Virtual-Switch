@@ -1,0 +1,202 @@
+=====================================================================
+PART 1 - PROJECT SKELETON, BUILD SYSTEM, UTILITIES, SIMPLE LOGGING
+=====================================================================
+
+1. WHAT PART 1 IMPLEMENTS
+-------------------------
+Part 1 builds the foundation of the Virtual Switch. There is no networking
+yet. It gives us:
+
+  * A Makefile that builds everything with the course compiler flags.
+  * common.h: constants, the MAC address type and error-checking macros.
+  * util.c: helpers for MAC addresses and for time.
+  * log.h / log.c: a simple thread-safe logging function, log_msg().
+  * Empty "stub" programs (switch, host, swctl) so the build links.
+  * A unit test (tests/test_util.c) that checks all of the above.
+
+Every later part reuses these helpers, so they must be correct.
+
+
+2. FILES
+--------
+Makefile
+    Targets: all, clean, tsan, test.
+      make        builds ./switch ./host ./swctl
+      make tsan   builds ./switch_tsan ./host_tsan (ThreadSanitizer)
+      make clean  deletes programs and the build/ folder
+      make test   runs tests/run_all.sh
+    Flags (CFLAGS): -std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread
+    Libraries (LDLIBS): -pthread -lrt
+    -Werror turns every warning into an error, so warnings can never be
+    ignored. -D_GNU_SOURCE is needed because -std=c11 hides some POSIX
+    functions we need later (sigaction, shm_open, ...).
+    "-MMD -MP" makes gcc write .d files listing which headers each .c file
+    uses, and "-include" reads them. So if you edit common.h, every file that
+    includes it is rebuilt automatically.
+    Normal objects go to build/obj/, TSan objects go to build/tsan/. They are
+    never mixed, because TSan code must be compiled with different flags.
+
+include/common.h
+    * MAX_PORTS (64), MAX_PAYLOAD (1500), HDR_LEN (17) and the default
+      settings from the roadmap (queue capacity, MAC aging time, ...).
+    * typedef uint8_t mac_t[6]; - a MAC address is just 6 bytes.
+    * CHECK(call): for system calls that return -1 on failure. If the call
+      fails it prints the call text, file, line and strerror(errno), then
+      exits. Used at startup only.
+    * CHECK_PT(rc): same idea for pthread functions. These return the error
+      number directly (0 = success) and do NOT set errno, so CHECK_PT passes
+      the returned code to strerror instead of errno.
+    * Prototypes of everything in util.c.
+
+src/util.c
+    MAC helpers:
+      mac_parse("02:00:00:00:00:0a", out)  text -> 6 bytes. Returns 0 or -1.
+      mac_format(mac, buf, len)            6 bytes -> text (lower case).
+      mac_is_broadcast(mac)                true if all six bytes are 0xFF.
+      mac_is_multicast(mac)                true if the lowest bit of byte 0 is 1.
+    Time helpers:
+      now_mono()          current CLOCK_MONOTONIC time.
+      ts_add_ms(t, ms)    t plus ms milliseconds (ms may be negative).
+      ts_diff_ms(a, b)    a minus b in milliseconds.
+      deadline_mono(ms)   "now + ms" as an absolute monotonic time.
+      deadline_real(sec)  "now + sec" as an absolute real-time time.
+      cond_init_mono(cv)  creates a condition variable that uses the
+                          monotonic clock for timed waits.
+
+include/log.h and src/log.c
+    log_msg(LOG_INFO | LOG_WARN | LOG_ERR, "printf format", ...)
+    Prints one line to stderr:  2026-11-15 16:42:00.918 [INFO] message
+    One mutex makes sure lines from different threads never mix.
+    In Part 9 the inside will change to a logger thread; callers will not.
+
+src/switch.c, src/host.c, src/swctl.c
+    Stubs. Each just logs "not implemented yet" and exits 0, so that the
+    three programs exist and link against util.o and log.o.
+
+tests/test_util.c
+    The unit test program (95 checks).
+tests/run_all.sh
+    Builds and runs the tests. Later parts add more scripts here.
+
+notes/bugs.md
+    The bug diary required by the project rules (two small bugs so far).
+
+
+3. HOW THE IMPORTANT FUNCTIONS WORK
+-----------------------------------
+mac_parse
+    A valid MAC has exactly 17 characters: 6 pairs of hex digits separated by
+    5 colons. The function first checks the length, then for each pair checks
+    both characters with hex_value() (0-9, a-f, A-F) and checks the colon.
+    It writes to a temporary array first and copies it to the caller only at
+    the end, so a bad string never leaves the output half-filled. I wrote my
+    own hex_value() instead of using strtol/sscanf because those accept
+    things like "+", "-", spaces and "0x", which are not valid here.
+
+mac_is_multicast
+    Ethernet marks group addresses by setting the lowest bit of the first
+    byte. Broadcast (FF:...) has that bit set too, so it counts as multicast.
+    Normal host addresses like 02:00:00:00:00:0a have bit 0 clear (0x02).
+
+ts_add_ms / ts_diff_ms
+    A struct timespec has tv_sec (seconds) and tv_nsec (0..999,999,999).
+    ts_add_ms adds the whole seconds and the leftover milliseconds
+    separately, then fixes tv_nsec so it stays in range (carry if >= 1 s,
+    borrow if negative). Calculations use long long so nothing overflows.
+    ts_diff_ms converts the difference to nanoseconds and divides by 1,000,000.
+
+deadline_mono vs deadline_real
+    Two different clocks are used on purpose:
+      * CLOCK_MONOTONIC never jumps if someone changes the system date. We
+        use it for every internal timeout and age.
+      * CLOCK_REALTIME is the calendar clock. POSIX requires it for
+        sem_timedwait, and it is the right clock for log timestamps.
+
+cond_init_mono
+    By default pthread_cond_timedwait measures its absolute deadline against
+    CLOCK_REALTIME. We create the condition variable with an attribute set
+    by pthread_condattr_setclock(CLOCK_MONOTONIC), so deadline_mono() values
+    can be used safely. It returns the pthread error code (0 = success).
+
+CHECK / CHECK_PT
+    Both are wrapped in do { ... } while (0) so they behave like one
+    statement (for example inside an if without braces). The result of the
+    call is stored once, so the call is never evaluated twice.
+
+log_msg
+    1. Format the message into a local buffer with vsnprintf (outside the
+       lock, and truncated to 1024 bytes so it can never overflow).
+    2. Get the real time and build the timestamp text.
+    3. Lock the mutex, fprintf one whole line to stderr, unlock.
+    The __attribute__((format(printf, 2, 3))) in log.h makes the compiler
+    check that format strings match their arguments.
+
+
+4. DATA STRUCTURES AND DECISIONS (AND WHY)
+------------------------------------------
+* mac_t is a plain byte array, not a struct. Frames are read as raw bytes,
+  so a byte array can be copied and compared with memcpy/memcmp directly.
+* Constants live in one header (common.h), so a number such as 1500 is never
+  typed in two different places.
+* Monotonic clock for timeouts: wall-clock time can jump (NTP, manual
+  change), which could make a timeout fire instantly or never.
+* The logger uses a mutex: several threads will log at once later, and
+  without a lock their lines would be mixed together. The lock is only held
+  while writing to stderr, never during socket reads or writes.
+* Error policy (from the roadmap): errors at startup exit the program, errors
+  at runtime on one port close only that port. CHECK is for startup only.
+* Source in src/, headers in include/ (the folders already existed). The
+  Makefile uses -Iinclude so code just writes #include "common.h".
+* TSan build is separate (build/tsan, *_tsan programs) because a program
+  built with -fsanitize=thread cannot be mixed with normal object files.
+
+
+5. HOW TO COMPILE AND TEST
+--------------------------
+  make clean && make       # must print no warnings or errors
+  make test                # builds and runs tests/test_util
+  make tsan                # builds switch_tsan and host_tsan
+  ./switch ; ./host ; ./swctl      # each prints "not implemented yet"
+
+Extra checks that were run for Part 1:
+  valgrind --leak-check=full --error-exitcode=1 ./build/test_util
+  make build/test_util_tsan && setarch -R ./build/test_util_tsan
+
+NOTE about TSan: on this machine (new kernel with high-entropy address-space
+randomisation) a TSan program stops immediately with "FATAL: ThreadSanitizer:
+unexpected memory mapping". This is an environment problem, not a code bug.
+Running it with ASLR switched off for that one process fixes it, and needs no
+root rights:   setarch -R ./switch_tsan
+
+What the unit test checks:
+  * mac_parse accepts valid strings (upper, lower, mixed case) and rejects 15
+    bad ones: empty, too short, too long, spaces, wrong separators,
+    non-hex letters, sign characters, missing colons, NULL arguments. A bad
+    string must leave the output unchanged.
+  * mac_format output, a too-small buffer, and a round trip text -> bytes ->
+    text for 256 different values.
+  * broadcast and multicast detection, including a near-broadcast address.
+  * ts_add_ms (carry, borrow, zero, negative), ts_diff_ms, now_mono not going
+    backwards, deadline_mono and deadline_real.
+  * cond_init_mono: a timed wait on a 200 ms monotonic deadline really
+    returns ETIMEDOUT after about 200 ms.
+  * CHECK and CHECK_PT exit with failure and print the right message (run in
+    a child process with fork()).
+  * log_msg line format, all three levels, truncation of a 3000-character
+    message, and 4 threads x 100 lines with no mixed-up lines.
+
+
+6. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+----------------------------------------------
+Q: Why CHECK_PT and not CHECK for pthread functions?
+A: pthread functions return the error code and do not set errno.
+Q: Why is the frame header not read into a struct?
+A: (Part 2) padding makes sizeof 18, not 17. Part 1 uses mac_t byte arrays.
+Q: Why two clocks?
+A: Monotonic for timeouts (cannot jump); real time for sem_timedwait and logs.
+Q: Why -Werror?
+A: A warning is often a real bug; making it an error forces us to fix it.
+Q: What does -MMD -MP do?
+A: Generates header dependency files so changed headers trigger rebuilds.
+Q: Why is TSan built separately?
+A: It needs special compile and link flags; mixed objects would not link/run.

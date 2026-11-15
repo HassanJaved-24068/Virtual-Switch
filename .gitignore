@@ -1,0 +1,15 @@
+# Compiled binaries and object files
+build/
+*.o
+*.out
+
+# Debugging and profiling
+core
+core.*
+*.log
+
+# Editor and OS files
+.vscode/
+.idea/
+*~
+.DS_Store
