@@ -4,7 +4,7 @@ CFLAGS  = -std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread -Iinclude
 LDLIBS  = -pthread -lrt
 
 # Shared code used by every program (grows in later parts).
-COMMON_SRC = src/util.c src/log.c
+COMMON_SRC = src/util.c src/log.c src/frame.c
 
 PROGRAMS      = switch host swctl
 TSAN_PROGRAMS = switch_tsan host_tsan
@@ -35,14 +35,14 @@ $(TSAN_DIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fsanitize=thread -MMD -MP -c -o $@ $<
 
-# ---- unit tests ----
-build/test_util: tests/test_util.c $(COMMON_OBJ)
-	@mkdir -p build
-	$(CC) $(CFLAGS) -MMD -MP -o $@ $^ $(LDLIBS)
-
-build/test_util_tsan: tests/test_util.c $(TSAN_OBJ)
+# ---- unit tests (tests/test_NAME.c -> build/test_NAME) ----
+build/test_%_tsan: tests/test_%.c $(TSAN_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -fsanitize=thread -o $@ $^ $(LDLIBS)
+
+build/test_%: tests/test_%.c $(COMMON_OBJ)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -MMD -MP -o $@ $^ $(LDLIBS)
 
 test:
 	./tests/run_all.sh

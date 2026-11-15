@@ -1,0 +1,320 @@
+=====================================================================
+PART 2 - WIRE PROTOCOL MODULE AND THE HOST PROGRAM
+=====================================================================
+
+1. WHAT PART 2 IMPLEMENTS
+-------------------------
+Part 2 teaches our programs to send and receive frames correctly over a TCP
+connection, and gives us the test host (./host) that every later test uses.
+
+New files:
+  include/frame.h   declarations: frame_hdr_t, enum frame_rc, the functions
+  src/frame.c       read_full, write_full, frame_pack, frame_unpack,
+                    frame_recv, frame_send, frame_rc_str
+  src/host.c        the host program (replaces the Part 1 stub)
+  tests/test_frame.c   unit tests for frame.c (socketpair and loopback TCP)
+  tests/test_host.py   end-to-end tests of ./host against a fake switch
+  tests/wire_bytes.sh  byte-order check with xxd
+Changed files:
+  Makefile          frame.c added to the shared sources; one generic rule
+                    builds any tests/test_NAME.c into build/test_NAME
+  tests/run_all.sh  now runs the Part 1 and Part 2 tests
+
+
+2. BACKGROUND: BYTE STREAMS AND PARTIAL READS/WRITES
+----------------------------------------------------
+TCP is a BYTE STREAM. It is like a water pipe: bytes come out in the order
+they went in, but there are NO message boundaries. If a host sends two frames
+of 30 bytes, the receiver may get them as:
+    60 bytes at once, or 1 byte + 59 bytes, or 17 + 17 + 26 bytes, ...
+So read(fd, buf, 17) is allowed to return 5. Likewise write(fd, buf, 1000)
+may accept only 400 bytes when the socket buffer is nearly full. A signal can
+also interrupt either call and make it fail with errno == EINTR.
+
+If the code ignores this, it works on a fast local test and breaks later in
+a way that is very hard to debug. So everything goes through two loops:
+read_full and write_full, which keep going until ALL the bytes are done.
+
+
+3. THE FRAME FORMAT AND WHY THE HEADER IS EXACTLY 17 BYTES
+----------------------------------------------------------
+  offset  size  field        meaning
+    0      2    length       payload length, 0..1500, network byte order
+    2      6    src          source MAC
+    8      6    dst          destination MAC (FF:FF:FF:FF:FF:FF = broadcast)
+   14      2    vlan         1..4094, network byte order
+   16      1    priority     0 high, 1 normal, 2 low
+   17    length payload      the data
+
+2 + 6 + 6 + 2 + 1 = 17. The project specification fixes this layout, and
+every host and the switch must agree on it byte for byte.
+
+Why not read the header straight into a struct? Because the compiler adds
+padding so that fields sit at "nice" addresses. A struct with two uint16_t,
+two 6-byte arrays and a uint8_t has sizeof == 18, not 17, and its fields
+are not at offsets 0,2,8,14,16. So frame_hdr_t is used only inside our
+program. On the wire we use a plain byte buffer, and frame_pack/frame_unpack
+copy field by field to the right offsets with memcpy.
+
+NETWORK BYTE ORDER: a 2-byte number like 0x0102 can be stored two ways:
+   big-endian    01 02   (the "network byte order" - used on the wire)
+   little-endian 02 01   (what x86 PCs use in memory)
+htons() ("host to network short") converts a number from our machine's order
+to network order, ntohs() converts back. On the wire, length 0x0102 (258)
+must appear as the bytes 01 02. The test wire_bytes.sh checks exactly this
+with xxd (output: "0102 0200 0000 000a ...").
+
+
+4. HOW THE FUNCTIONS WORK
+-------------------------
+ssize_t read_full(fd, buf, n)
+    Loop: call read() for the bytes still missing.
+      - read < 0 and errno == EINTR: just try again.
+      - read < 0 for any other reason: return -1 (errno is untouched).
+      - read == 0: the other side closed (EOF), stop the loop.
+      - otherwise add to the count.
+    Return value: n if everything arrived; the number of bytes that did
+    arrive (0..n-1) if EOF came first; -1 on error.
+    So 0 means "EOF before even one byte", and 1..n-1 means "EOF in the
+    middle". frame_recv needs this difference.
+
+int write_full(fd, buf, n)
+    Loop: call write() for the bytes still unsent.
+      - EINTR: try again.
+      - other errors (EPIPE = peer closed, ECONNRESET = peer reset):
+        return -1, errno kept.
+      - A write that returns 0 for n > 0 should never happen; we treat it as
+        an error (EIO) so the loop can never spin forever.
+    Returns 0 on success, -1 on error.
+
+int frame_pack(hdr, payload, out)
+    Writes the 17 header bytes into out at the offsets 0, 2, 8, 14, 16:
+    htons(len) -> out[0..1], src -> out[2..7], dst -> out[8..13],
+    htons(vlan) -> out[14..15], prio -> out[16]; then the payload is copied
+    to out[17...]. Returns the total size (17 + len). It refuses len > 1500
+    (errno = EMSGSIZE) and a NULL payload with len > 0 (errno = EINVAL).
+    memcpy is used for the 2-byte values too, because out+14 is not
+    guaranteed to be aligned for a uint16_t store.
+
+void frame_unpack(bytes, hdr)
+    The reverse: reads the 17 bytes into the struct with ntohs() for len
+    and vlan. It does not judge the values; frame_recv checks the length.
+
+enum frame_rc frame_recv(fd, hdr, payload)
+    1. read_full(17 bytes).     0 bytes  -> FR_EOF
+                                1..16    -> FR_TRUNC_HDR
+                                -1       -> FR_ERR
+    2. frame_unpack, then if len > 1500 -> FR_PROTO. This check comes BEFORE
+       reading the payload, so a bad length can never make us read or
+       overflow the buffer.
+    3. If len > 0: read_full(len bytes).   fewer than len -> FR_TRUNC_PAYLOAD
+                                           -1            -> FR_ERR
+       If len == 0 nothing more is read: an empty payload is valid.
+    4. return FR_OK.
+    The payload buffer must have room for 1500 bytes. It is not
+    NUL-terminated.
+
+int frame_send(fd, hdr, payload)
+    frame_pack into a local buffer of 17+1500 bytes, then ONE write_full for
+    the whole frame (so the header and payload are not separated). Returns 0
+    or -1 (errno set).
+
+const char *frame_rc_str(rc)
+    Text for an rc value, used in error messages.
+
+
+5. THE MEANING OF EVERY frame_rc VALUE
+--------------------------------------
+  FR_OK              =  1  one complete frame was read.
+  FR_EOF             =  0  the peer closed the connection cleanly, BETWEEN
+                           frames. This is a normal disconnect.
+  FR_ERR             = -1  read() failed (for example ECONNRESET); errno
+                           has the reason.
+  FR_TRUNC_HDR       = -2  the connection ended inside the 17-byte header.
+  FR_TRUNC_PAYLOAD   = -3  the connection ended inside the payload (this
+                           includes "header arrived, payload never did").
+  FR_PROTO           = -4  protocol violation: length > 1500.
+Callers (switch, later) treat 0 as a normal leave, and all negative values
+as "drop this host". The truncated frame is discarded (never delivered).
+
+NOTE: the roadmap text (section Part 2) describes a shorter list (1, 0, -1 for
+"truncated or error", -2 for protocol). We follow the more detailed list
+above, as asked for this assignment: truncation is split into header/payload
+and the protocol error is -4. Only the numbers differ; the behaviour is the same.
+
+
+6. THE HOST PROGRAM (src/host.c)
+--------------------------------
+Usage:  ./host <ip> <port> <mac> [options]
+The host connects to the switch (TCP) and uses <mac> as its own address: it
+is the "src" of every frame it sends. (There is no login message; the switch
+learns the MAC from the frames.)
+
+TWO THREADS
+  * main thread  - reads lines from stdin (getline) and sends frames.
+  * receiver thread - loops on frame_recv and prints every frame.
+  They are separate because a host must be able to receive while it is
+  waiting for the next command, and the other way round. If one thread did
+  both, a full receive buffer could freeze the sending side.
+  The shared state is small: the socket (the main thread only writes, the
+  receiver only reads), an atomic frame counter, and a mutex that guarantees
+  only one thread runs the exit code (host_finish).
+
+STDIN COMMANDS (one per line)
+  send <dst_mac|bcast> <text>            vlan 1, priority 1
+  sendx <dst_mac|bcast> <vlan> <prio> <text>   vlan 1..4094, prio 0..2
+  quit                                   leave (end of stdin does the same)
+  "bcast" means FF:FF:FF:FF:FF:FF. The text is the rest of the line, spaces
+  included; no text means an empty (zero-length) payload. Wrong commands,
+  bad MACs, vlan/prio out of range or text longer than 1500 bytes print an
+  error on stderr and send nothing; the host keeps running.
+  NOTE: end of stdin = quit. If you use echo "send ..." | ./host ... the host
+  quits as soon as the line is sent, before any reply can arrive. To wait for
+  replies, keep stdin open, e.g.  (echo "send bcast hi"; sleep 2) | ./host ...
+
+RECEIVE OUTPUT (stdout, one line per frame)
+  RX src=02:00:00:00:00:0b dst=02:00:00:00:00:0a vlan=1 prio=1 len=5 data=hello
+  Printable characters are shown as they are; backslash is shown as \\ and
+  other bytes as \xNN (e.g. a newline in the data is \x0a). That keeps the
+  rule "one line = one frame" true for any payload. Output is flushed after
+  every line so scripts can read it at once.
+
+OPTIONS (for testing)
+  --noread        do not start the receiver thread: the socket is never read.
+                  Simulates a frozen host (the switch's queue to it fills up).
+  --partial       send each frame one byte at a time with 1 ms (nanosleep)
+                  between bytes. Tests the switch's partial-read handling.
+                  (nanosleep is used only to slow the test tool, not to
+                  wait for another thread.)
+  --flood N --to <mac>   send N frames as fast as possible to <mac> (payload
+                  "flood 0", "flood 1", ...), then keep running until stdin
+                  ends. The two options must be used together.
+  --die-midframe  right after connecting, write HALF a frame (the first 18 of
+                  37 bytes) and exit: the switch sees a truncated frame.
+  --quiet         do not print RX lines; count frames and print
+                  "RX_TOTAL <n>" when the host exits.
+
+EXIT CODES
+  0  normal exit (quit, end of stdin, or the switch closed the connection)
+  1  error (bad arguments, connect failed, send failed, receive error,
+     truncated or invalid frame from the switch)
+  2  "switch full": the switch sent its fixed reply frame
+        src 00:00:00:00:00:00, dst FF:FF:FF:FF:FF:FF, vlan 1, prio 0,
+        payload "switch full"
+     The host prints "SWITCH FULL" and exits with code 2. (The switch side
+     of this arrives in Part 5.)
+
+SIGPIPE
+  Writing to a socket whose peer is gone normally sends SIGPIPE, which kills
+  the process silently. At start-up the host calls sigaction(SIGPIPE,
+  SIG_IGN), so write() just fails with EPIPE, and the host prints
+  "host: send failed: Broken pipe" and exits with code 1.
+
+host_finish(code)
+  Single exit point. It takes a mutex that is never released, so only one
+  thread can run it. It prints RX_TOTAL (in --quiet mode), flushes stdout
+  and calls _exit(code). _exit is used because the other thread may still be
+  blocked in read(), and we do not want it to take part in a normal exit.
+
+
+7. TECHNICAL DECISIONS AND WHY
+------------------------------
+* One function pair (read_full / write_full) for ALL socket I/O: partial
+  I/O and EINTR are handled in exactly one place.
+* Length check before reading the payload: never trust a length from the
+  network.
+* Six distinct results from frame_recv: later parts need to know "normal
+  leave" (FR_EOF) from "broken host" (the negative values) and logging
+  should say which one happened.
+* frame_hdr_t is a normal struct but is never used as the wire format.
+* The wire buffer is 17 + 1500 bytes on the stack: small, so no malloc is
+  needed (and no leak is possible) in the protocol code.
+* No locks in frame.c: it has no shared state.
+* Host: errors for one bad command never stop the host; only a broken
+  connection does.
+
+
+8. HOW TO COMPILE AND TEST
+--------------------------
+  make clean && make       # builds switch, host, swctl, no warnings
+  make test                # runs ALL tests (Part 1 and Part 2)
+
+make test runs these four programs one by one (run_all.sh):
+  ./build/test_util          Part 1 unit tests (95 checks)
+  ./build/test_frame         Part 2 protocol tests (91 checks)
+  python3 tests/test_host.py Part 2 host tests (109 checks)
+  tests/wire_bytes.sh        byte-order check with xxd
+
+What test_frame checks (socketpair / loopback TCP, wire bytes written by
+hand so the code is not only checked against itself):
+  - pack/unpack round trip for many lengths (0..1500), vlans (1..4094),
+    priorities (0..2); header is exactly 17 bytes; every field at its offset;
+    0x0102 appears as 01 02; nothing written past the end; bad inputs
+  - read_full: normal, n == 0, EOF at start (0), EOF in the middle (count),
+    invalid fd (-1, errno EBADF), 1-byte-at-a-time writer, 1.5 frames in one
+    write, EINTR (a timer signal every 20 ms while read_full waits)
+  - write_full: a 4 MB write that blocks and is interrupted by signals (all
+    bytes must still arrive intact), EPIPE, ECONNRESET (real TCP reset),
+    invalid fd
+  - frame_recv: normal, zero-length, 1500-byte, 3 frames in one write, frame
+    written byte by byte, clean EOF, EOF after a frame, truncated header
+    (1, 2, 9, 16 bytes), truncated payload (0, 1, 9 of 10 bytes), length
+    1501 / 2000 / 65535 (FR_PROTO), I/O errors (EBADF, ECONNRESET)
+  - frame_send: exact bytes, 1500 and 0 length, too long (nothing is sent),
+    closed peer
+
+What test_host.py checks: a fake switch written in Python (independent of
+frame.c) receives the host's bytes and sends frames to it. It covers every
+command, bad commands, the RX line format (including escaping, 5 frames in
+one write, 1-byte-at-a-time arrival), a switch that closes / truncates /
+sends length 1501, SWITCH FULL (exit 2), --partial, --flood, --noread,
+--die-midframe, --quiet, SIGPIPE, and 16 kinds of wrong command line.
+
+Extra checks (not part of make test):
+  valgrind --leak-check=full --error-exitcode=1 ./build/test_frame
+  make build/test_frame_tsan && setarch -R ./build/test_frame_tsan
+  make tsan && HOST="setarch -R ./host_tsan" python3 tests/test_host.py
+  HOST="valgrind -q --run-libc-freeres=no --error-exitcode=9 ./host" python3 tests/test_host.py
+(setarch -R switches address randomisation off for that process; without it
+ThreadSanitizer stops at start-up on this kernel.)
+
+NOTE about valgrind and the host: without --run-libc-freeres=no, valgrind
+can hang when the host exits from the receiver thread while the main thread
+is blocked reading stdin (valgrind's clean-up code waits for the stdin lock
+that the blocked thread holds). This is a valgrind behaviour, not a bug in
+the host: the normal and TSan runs exit correctly. See notes/bugs.md.
+
+Try the host by hand with netcat as a fake switch:
+  terminal 1:  nc -l 127.0.0.1 9000 | xxd
+  terminal 2:  ./host 127.0.0.1 9000 02:00:00:00:00:0a
+               send bcast hello       (then: quit)
+
+
+9. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+----------------------------------------------
+Q: Why can't I just call read(fd, buf, 17) once?
+A: TCP is a byte stream; read may return fewer bytes. read_full loops.
+Q: What does read_full return if the connection closes after 5 of 17 bytes?
+A: 5. frame_recv sees 0 < 5 < 17 and returns FR_TRUNC_HDR.
+Q: Difference between FR_EOF and FR_TRUNC_HDR?
+A: EOF with zero bytes of a new frame is a clean disconnect; EOF inside a
+   frame means the host died or was cut off mid-frame.
+Q: Why is a zero-length payload not an error?
+A: The protocol allows length 0..1500; the header alone is a full frame.
+Q: Why check len > 1500 before reading the payload?
+A: A bad length must never decide how much we read (buffer overflow, or
+   waiting forever for bytes that will never come).
+Q: Why not a packed struct for the header?
+A: Padding/alignment/endianness are compiler- and CPU-dependent; the wire
+   format must be identical everywhere, so we copy fields to fixed offsets.
+Q: What is htons for?
+A: Converts to network (big-endian) order so 0x0102 is 01 02 on the wire.
+Q: Why does the host ignore SIGPIPE?
+A: A write to a closed socket would kill the process; with SIG_IGN the write
+   returns EPIPE and we handle it.
+Q: Why does the host have two threads?
+A: One blocks on stdin, the other blocks on the socket; each can wait without
+   stopping the other.
+Q: What is --noread for?
+A: To make a host that never reads, so the switch's output queue for it
+   fills up (the head-of-line blocking test in Part 4).
