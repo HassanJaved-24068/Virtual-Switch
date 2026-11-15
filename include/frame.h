@@ -13,6 +13,7 @@
 #ifndef FRAME_H
 #define FRAME_H
 
+#include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
@@ -83,5 +84,45 @@ int frame_send(int fd, const frame_hdr_t *hdr, const uint8_t *payload);
 
 /* Short text for a frame_rc value, for log and error messages. */
 const char *frame_rc_str(enum frame_rc rc);
+
+/* ------------------------------------------------------------------ */
+/* Reference-counted frame (Part 4)                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+ * One received frame, shared (not copied) between all the output queues
+ * that hold it. wire[] holds the frame exactly as it goes on the wire
+ * (17 header bytes + payload), so a sender can write it with one write_full.
+ * The other fields are the same header values, unpacked for easy use.
+ *
+ * Ownership rule: whoever holds a reference must call frame_unref() once.
+ * The thread that brings the count to 0 frees the frame.
+ */
+typedef struct {
+    pthread_mutex_t ref_lock;      /* protects refcount */
+    int refcount;
+    uint16_t len, vlan;
+    uint8_t src[MAC_LEN], dst[MAC_LEN], prio;
+    uint8_t wire[HDR_LEN + MAX_PAYLOAD];
+} frame_t;
+
+/* New frame with refcount 1 (the creator's own reference). NULL on failure (errno set). */
+frame_t *frame_new(void);
+
+/* Add one reference. */
+void frame_ref(frame_t *f);
+
+/* Drop one reference; frees the frame when the last one is dropped. */
+void frame_unref(frame_t *f);
+
+/* Number of frames allocated and not yet freed (for leak checks in tests). */
+long frame_live_count(void);
+
+/*
+ * Like frame_recv(), but reads straight into f->wire and fills the unpacked
+ * fields of f. Same return values. f->len, vlan, src, dst and prio are
+ * valid when the result is FR_OK, FR_TRUNC_PAYLOAD or FR_PROTO.
+ */
+enum frame_rc frame_recv_f(int fd, frame_t *f);
 
 #endif /* FRAME_H */

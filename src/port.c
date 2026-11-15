@@ -3,10 +3,13 @@
  */
 #include "port.h"
 
+#include "forward.h"
 #include "frame.h"
 #include "log.h"
+#include "stats.h"
 
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 switch_t sw;
@@ -30,6 +33,15 @@ void switch_init(int num_ports)
     CHECK_PT(cond_init_mono(&sw.shutdown_cond));
     atomic_init(&sw.shutting_down, false);
 
+    /* One token per port: every port starts FREE. */
+    CHECK(sem_init(&sw.free_ports, 0, (unsigned)num_ports));
+    sw.port_wait_sec = DEFAULT_PORT_WAIT_SEC;      /* config port_wait_timeout (Part 10) */
+
+    CHECK_PT(pthread_mutex_init(&sw.reaper_lock, NULL));
+    CHECK_PT(cond_init_mono(&sw.reaper_cond));
+    CHECK_PT(pthread_mutex_init(&sw.port_down_lock, NULL));
+    CHECK_PT(cond_init_mono(&sw.port_down_cond));
+
     for (int i = 0; i <= MAX_PORTS; i++) {
         sw.ports[i].id = i;
         sw.ports[i].state = PORT_FREE;
@@ -43,8 +55,8 @@ void port_reset(port_t *p)
     p->wfd = -1;
     p->vlan = DEFAULT_VLAN;
     p->trunk = false;
-    atomic_init(&p->mirror_to, 0);
-    atomic_init(&p->mac_count, 0);
+    atomic_store(&p->mirror_to, 0);          /* atomic: other threads may read these */
+    atomic_store(&p->mac_count, 0);
 }
 
 void switch_wait_ms(long ms)
@@ -70,20 +82,235 @@ port_t *port_alloc(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* Starting a port                                                     */
+/* ------------------------------------------------------------------ */
+
+static bool request_down_locked(port_t *p, enum port_state final_state);
+
+enum port_start_rc port_start(int fd, int *port_id, int *err)
+{
+    enum port_start_rc result = PS_NONE;
+
+    *port_id = 0;
+    *err = 0;
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    port_t *p = port_alloc();                            /* lowest FREE port */
+    if (p != NULL) {
+        *port_id = p->id;
+        result = PS_FAILED;
+        port_reset(p);
+        p->rfd = fd;
+        p->wfd = fd;
+        p->rx_started = false;
+
+        *err = outq_init(&p->q, DEFAULT_QUEUE_CAPACITY);
+        if (*err == 0) {
+            *err = pthread_create(&p->tx, NULL, sender_main, p);
+            if (*err != 0) {
+                outq_destroy(&p->q);                     /* nothing is running yet */
+                port_reset(p);
+            } else {
+                p->state = PORT_UP;                      /* FREE -> UP */
+                *err = pthread_create(&p->rx, NULL, receiver_main, p);
+                if (*err == 0) {
+                    p->rx_started = true;
+                    result = PS_OK;
+                } else {
+                    /* The sender is already running. Let the reaper clean up (it
+                     * joins only threads that exist); it also closes fd and gives
+                     * the token back. We must not join here: no join under a lock. */
+                    request_down_locked(p, PORT_FREE);
+                    result = PS_FAILED_HANDED;
+                }
+            }
+        } else {
+            port_reset(p);
+        }
+    }
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/* Teardown request and the reaper                                     */
+/* ------------------------------------------------------------------ */
+
+/* Caller holds the write lock. Only the first caller finds the port UP. */
+static bool request_down_locked(port_t *p, enum port_state final_state)
+{
+    if (p->state != PORT_UP)
+        return false;                                    /* somebody else won (or not up) */
+
+    p->state = PORT_CLOSING;                             /* UP -> CLOSING */
+    p->final_state = final_state;
+
+    /* Lock order: ports_lock (1) first, then the reaper lock (4). */
+    CHECK_PT(pthread_mutex_lock(&sw.reaper_lock));
+    sw.reaper_q[(sw.reaper_head + sw.reaper_count) % (MAX_PORTS + 1)] = p->id;
+    sw.reaper_count++;
+    CHECK_PT(pthread_cond_signal(&sw.reaper_cond));
+    CHECK_PT(pthread_mutex_unlock(&sw.reaper_lock));
+    return true;
+}
+
+bool port_request_down(port_t *p, enum port_state final_state)
+{
+    bool won;
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    won = request_down_locked(p, final_state);
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    return won;
+}
+
+/*
+ * The teardown of one port, in the order the roadmap gives. Only the reaper
+ * runs this, and only for a port that is CLOSING.
+ */
+static void teardown_port(port_t *p)
+{
+    const int id = p->id;
+    const int fd = p->rfd;
+    const enum port_state final_state = p->final_state;
+    int rc;
+
+    /* 1. The state is already CLOSING: forward_frame skips this port, so
+     *    nothing new is queued for it. */
+
+    /* 2. Wake a sender that is waiting for a frame. */
+    outq_close(&p->q);
+
+    /* 3. Wake a receiver blocked in read() and a sender blocked in write()
+     *    to a frozen host. */
+    if (shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+        log_msg(LOG_WARN, "port %d: shutdown failed: %s", id, strerror(errno));
+
+    /* 4. Join both threads. No lock is held here. */
+    if (p->rx_started) {
+        rc = pthread_join(p->rx, NULL);
+        if (rc != 0)
+            log_msg(LOG_ERR, "port %d: join of receiver failed: %s", id, strerror(rc));
+    }
+    rc = pthread_join(p->tx, NULL);
+    if (rc != 0)
+        log_msg(LOG_ERR, "port %d: join of sender failed: %s", id, strerror(rc));
+
+    /* 5. Release the frames still queued, then free the queue itself. */
+    outq_drain(&p->q);
+    outq_destroy(&p->q);
+
+    /* 6. Part 6 will call mac_flush_port(id) here: forget the MAC addresses
+     *    learned on this port. (No MAC table yet.) */
+
+    /* 7. Close the socket, only now that both threads are gone, so the
+     *    descriptor number cannot be reused while a thread could still use it. */
+    if (close(fd) < 0)
+        log_msg(LOG_WARN, "port %d: close failed: %s", id, strerror(errno));
+
+    /* 8. Reset the slot and set the final state. The state is set BEFORE the
+     *    token is posted: a host that gets the token must find the port FREE. */
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    port_reset(p);
+    p->rx_started = false;
+    p->state = final_state;
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+
+    /* 9. A FREE port gives its token back. A DISABLED port keeps it (it
+     *    stays out of circulation until an admin brings the port up). */
+    if (final_state == PORT_FREE && sem_post(&sw.free_ports) < 0)
+        log_msg(LOG_ERR, "port %d: sem_post failed: %s", id, strerror(errno));
+
+    log_msg(LOG_INFO, "port %d: teardown complete, port is %s", id,
+            final_state == PORT_FREE ? "FREE" : "DISABLED");
+
+    /* Tell whoever waits for this teardown (admin commands, Part 16). */
+    CHECK_PT(pthread_mutex_lock(&sw.port_down_lock));
+    sw.port_down_gen[id]++;
+    CHECK_PT(pthread_cond_broadcast(&sw.port_down_cond));
+    CHECK_PT(pthread_mutex_unlock(&sw.port_down_lock));
+}
+
+void *reaper_main(void *arg)
+{
+    int rc;
+
+    (void)arg;
+    rc = pthread_setname_np(pthread_self(), "reaper");
+    if (rc != 0)
+        log_msg(LOG_WARN, "cannot set reaper thread name: %s", strerror(rc));
+
+    for (;;) {
+        CHECK_PT(pthread_mutex_lock(&sw.reaper_lock));
+        while (sw.reaper_count == 0 && !sw.reaper_stop)          /* while, never if */
+            CHECK_PT(pthread_cond_wait(&sw.reaper_cond, &sw.reaper_lock));
+        if (sw.reaper_count == 0) {                              /* stop requested, queue empty */
+            CHECK_PT(pthread_mutex_unlock(&sw.reaper_lock));
+            break;
+        }
+        int id = sw.reaper_q[sw.reaper_head];
+        sw.reaper_head = (sw.reaper_head + 1) % (MAX_PORTS + 1);
+        sw.reaper_count--;
+        CHECK_PT(pthread_mutex_unlock(&sw.reaper_lock));
+
+        teardown_port(&sw.ports[id]);                            /* no lock held */
+    }
+    return NULL;
+}
+
+void reaper_finish(void)
+{
+    CHECK_PT(pthread_mutex_lock(&sw.reaper_lock));
+    sw.reaper_stop = true;
+    CHECK_PT(pthread_cond_broadcast(&sw.reaper_cond));
+    CHECK_PT(pthread_mutex_unlock(&sw.reaper_lock));
+    CHECK_PT(pthread_join(sw.reaper, NULL));
+}
+
+unsigned long port_down_count(int id)
+{
+    unsigned long n = 0;
+
+    if (id < 0 || id > MAX_PORTS)
+        return 0;
+    CHECK_PT(pthread_mutex_lock(&sw.port_down_lock));
+    n = sw.port_down_gen[id];
+    CHECK_PT(pthread_mutex_unlock(&sw.port_down_lock));
+    return n;
+}
+
+bool port_wait_down(int id, unsigned long since, long timeout_ms)
+{
+    struct timespec deadline = deadline_mono(timeout_ms);
+    bool done;
+    int rc = 0;
+
+    if (id < 0 || id > MAX_PORTS)
+        return false;
+    CHECK_PT(pthread_mutex_lock(&sw.port_down_lock));
+    while (sw.port_down_gen[id] == since && rc == 0)
+        rc = pthread_cond_timedwait(&sw.port_down_cond, &sw.port_down_lock, &deadline);
+    done = (sw.port_down_gen[id] != since);
+    CHECK_PT(pthread_mutex_unlock(&sw.port_down_lock));
+    if (rc != 0 && rc != ETIMEDOUT)
+        log_msg(LOG_ERR, "pthread_cond_timedwait failed: %s", strerror(rc));
+    return done;
+}
+
+/* ------------------------------------------------------------------ */
 /* Receiver thread                                                     */
 /* ------------------------------------------------------------------ */
 
 /*
- * Part 3 behaviour: read frames and log them. When the host leaves or
- * something goes wrong, close the socket and stop. Part 5 replaces this
- * ending with the reaper (port_request_down); the port stays marked UP
- * until then.
+ * Reads frames, counts them, logs them and floods them to the other ports.
+ * It never writes to a socket and never waits for queue space. When the host
+ * is gone or sends something invalid it asks for the teardown and returns:
+ * it never closes or resets its own port (the reaper does) and never joins
+ * anybody.
  */
 void *receiver_main(void *arg)
 {
     port_t *p = arg;
-    uint8_t payload[MAX_PAYLOAD];
-    frame_hdr_t h;
     char name[16];
     int rc;
 
@@ -93,48 +320,96 @@ void *receiver_main(void *arg)
         log_msg(LOG_WARN, "port %d: cannot set thread name: %s", p->id, strerror(rc));
 
     for (;;) {
-        enum frame_rc fr = frame_recv(p->rfd, &h, payload);
+        frame_t *f = frame_new();
+        if (f == NULL) {
+            log_msg(LOG_ERR, "port %d: out of memory for a frame, closing the host", p->id);
+            port_request_down(p, PORT_FREE);
+            return NULL;
+        }
+
+        enum frame_rc fr = frame_recv_f(p->rfd, f);    /* reads straight into f->wire */
 
         if (fr == FR_OK) {
             char src[MAC_STR_LEN], dst[MAC_STR_LEN];
-            mac_format(h.src, src, sizeof src);
-            mac_format(h.dst, dst, sizeof dst);
+
+            stats_inc(p->id, STAT_IN);
+            mac_format(f->src, src, sizeof src);
+            mac_format(f->dst, dst, sizeof dst);
             log_msg(LOG_INFO, "port %d: RX src=%s dst=%s vlan=%u prio=%u len=%u",
-                    p->id, src, dst, h.vlan, h.prio, h.len);
+                    p->id, src, dst, f->vlan, f->prio, f->len);
+            forward_frame(p, f);
+            frame_unref(f);                            /* the receiver's own reference */
             continue;
         }
 
+        /* The reason, as text. Only the thread that starts the teardown logs it:
+         * if the sender already failed, our EOF is just a result of that. */
+        char why[96];
+        enum log_level level = LOG_WARN;
         switch (fr) {
         case FR_EOF:
-            log_msg(LOG_INFO, "port %d: host disconnected", p->id);
+            snprintf(why, sizeof why, "host disconnected");
+            level = LOG_INFO;
             break;
         case FR_ERR:
-            log_msg(LOG_WARN, "port %d: read error: %s", p->id, strerror(errno));
+            snprintf(why, sizeof why, "read error: %s", strerror(errno));
             break;
         case FR_TRUNC_HDR:
-            log_msg(LOG_WARN, "port %d: truncated frame (header cut short), discarded", p->id);
+            snprintf(why, sizeof why, "truncated frame (header cut short), discarded");
             break;
         case FR_TRUNC_PAYLOAD:
-            log_msg(LOG_WARN, "port %d: truncated frame (payload cut short), discarded", p->id);
+            snprintf(why, sizeof why, "truncated frame (payload cut short), discarded");
             break;
         case FR_PROTO:
-            log_msg(LOG_WARN, "port %d: protocol violation: length %u > %d", p->id,
-                    h.len, MAX_PAYLOAD);
+            snprintf(why, sizeof why, "protocol violation: length %u > %d", f->len, MAX_PAYLOAD);
             break;
         default:
-            log_msg(LOG_ERR, "port %d: unexpected frame_recv result %d", p->id, (int)fr);
+            snprintf(why, sizeof why, "unexpected frame_recv result %d", (int)fr);
+            level = LOG_ERR;
             break;
         }
-        break;                                  /* any non-OK result ends this host */
-    }
+        frame_unref(f);                                /* never queued: this frees it */
 
-    /* Close the socket. Only this thread uses it in Part 3. */
-    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
-    int fd = p->rfd;
-    p->rfd = -1;
-    p->wfd = -1;
-    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
-    if (fd >= 0 && close(fd) < 0)
-        log_msg(LOG_WARN, "port %d: close failed: %s", p->id, strerror(errno));
+        if (port_request_down(p, PORT_FREE))           /* UP -> CLOSING, the reaper does the rest */
+            log_msg(level, "port %d: %s", p->id, why);
+        return NULL;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Sender thread                                                       */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Takes frames from this port's queue and writes them to the host. Only this
+ * thread writes to its socket, and no lock is held while it does. On a write
+ * error it asks for the teardown (it never tears down or joins anything
+ * itself). When the queue is closed it simply returns.
+ */
+void *sender_main(void *arg)
+{
+    port_t *p = arg;
+    const int fd = p->wfd;           /* set before this thread was created */
+    char name[16];
+    frame_t *f;
+    int rc;
+
+    snprintf(name, sizeof name, "tx-port%d", p->id);
+    rc = pthread_setname_np(pthread_self(), name);
+    if (rc != 0)
+        log_msg(LOG_WARN, "port %d: cannot set sender thread name: %s", p->id, strerror(rc));
+
+    while (outq_pop(&p->q, &f)) {
+        int wr = write_full(fd, f->wire, (size_t)HDR_LEN + f->len);
+        int err = errno;
+
+        frame_unref(f);              /* our reference from the queue */
+        if (wr < 0) {
+            if (port_request_down(p, PORT_FREE))
+                log_msg(LOG_WARN, "port %d: write failed: %s", p->id, strerror(err));
+            break;
+        }
+        stats_inc(p->id, STAT_OUT);
+    }
     return NULL;
 }

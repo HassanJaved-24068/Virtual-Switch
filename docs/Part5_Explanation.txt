@@ -1,0 +1,316 @@
+=====================================================================
+PART 5 - PORT LIFECYCLE: DISCONNECTS, REAPER, SEMAPHORE WITH TIMEOUT
+=====================================================================
+
+1. WHAT PART 5 IMPLEMENTS
+-------------------------
+Until Part 4 a host that left kept its port forever: the switch accepted at
+most N hosts in its whole life. Now:
+
+  * A host can leave at any moment (also in the middle of a frame) and the
+    port is cleaned up completely and given to the next host.
+  * Only ONE component finishes a teardown: the REAPER thread.
+  * A host that arrives when all ports are used WAITS up to 5 seconds
+    (port_wait_timeout) for a free port. If none appears, the switch sends
+    the fixed "switch full" frame and closes the connection.
+  * A counting semaphore (free_ports) says how many ports are free.
+
+Changed / new code:
+  include/port.h, src/port.c   port_start, port_request_down, reaper_main,
+                               reaper_finish, port_down_count/port_wait_down;
+                               the receiver and sender now only REQUEST a teardown
+  src/switch.c                 accept thread: wait for a token, port_start,
+                               send_switch_full; starts the reaper thread
+  Makefile                     test_port needs port.o and forward.o
+  tests/test_port.c            lifecycle unit test (3730 checks)
+  tests/test_lifecycle.py      lifecycle tests with the real switch (98 checks)
+  tests/test_switch.py         updated: ports are reused now (see section 10)
+  tests/run_all.sh, notes/bugs.md
+
+
+2. PORT STATES AND LIFECYCLE
+----------------------------
+  FREE      enabled, no host
+  UP        a host is attached; its receiver and sender threads are running
+  CLOSING   teardown has been requested; the reaper is cleaning up
+  DISABLED  taken out of use (admin / port security: Parts 6 and 16)
+
+  FREE ----(port_start)----> UP ----(port_request_down)----> CLOSING
+                                                                |
+        +-------------------------------------------------------+
+        v  (the reaper, last step)
+      FREE  or  DISABLED  (the "final state" asked for)
+
+DISABLED -> FREE and FREE -> DISABLED are admin commands (Part 16) and are
+NOT implemented now. The final state DISABLED is supported by the reaper
+(it is what port security will ask for in Part 6) and is tested at unit level.
+
+
+3. WHY A REAPER THREAD? WHY CAN'T A WORKER THREAD JOIN ITSELF?
+--------------------------------------------------------------
+A port has two worker threads: the receiver and the sender. Either one may
+find out first that the host is gone (read returns 0 / write returns EPIPE).
+Cleaning up needs three things the workers cannot do:
+
+  * pthread_join(self) is an error (it would wait for itself forever). And a
+    receiver cannot join the sender "for sure": the sender may be the one
+    that noticed the failure and is also trying to clean up.
+  * The socket may be closed only AFTER both threads have ended; the thread
+    that noticed the failure cannot know that the other one is gone.
+  * If both threads cleaned up on their own, the port would be torn down
+    twice (double close, double join, token posted twice).
+
+So the workers only REQUEST the teardown (port_request_down) and return.
+One dedicated thread, the reaper, does the cleanup from outside, once per
+port. This is also what Part 16 (admin "shutdown") and Part 6 (port
+security) will use: any thread can ask, the reaper does the work.
+
+
+4. port_request_down(p, final_state)
+------------------------------------
+  take the ports_lock WRITE lock
+  if p->state != UP: somebody already asked (or the port is not up): return false
+  p->state = CLOSING; p->final_state = FREE or DISABLED
+  push p->id on the reaper queue (a FIFO of ints with its own mutex and
+      condition variable) and signal the reaper
+  release the lock; return true
+The check and the change happen under ONE write lock, so of any number of
+threads asking at once exactly one sees UP and wins: teardown is scheduled
+once. The test lets 16 threads ask at the same moment (barrier): exactly one
+returns true, the port is torn down once and the token is posted once.
+Because the state is CLOSING from now on, forward_frame (which only pushes
+into UP ports) never touches this port's queue again.
+
+
+5. THE TEARDOWN SEQUENCE (reaper) AND WHY THE ORDER MATTERS
+-----------------------------------------------------------
+reaper_main waits (condition variable, no polling) for a port id, then runs
+teardown_port(port) with NO lock held:
+
+  1. The state is already CLOSING. (Nothing new is queued for the port.)
+  2. outq_close         wakes a sender that sleeps waiting for a frame.
+  3. shutdown(fd, RDWR) makes the receiver's blocked read() return, and makes
+                        a sender stuck in write() (to a frozen host) fail.
+                        Without 2 and 3 the joins in 4 could wait forever.
+  4. pthread_join(receiver) and pthread_join(sender). NO LOCK is held, because
+                        a joined thread may be waiting for a lock that the
+                        joiner would be holding (deadlock).
+  5. outq_drain, outq_destroy   release the frames still queued
+                        (frame_unref each), then free the queue. Only after
+                        step 4, when nobody can use the queue any more.
+  6. (Part 6) mac_flush_port(id) goes HERE: forget the MAC addresses learned
+                        on this port. It is a comment now, there is no MAC table.
+  7. close(fd)          ONLY NOW. If the fd were closed earlier, the number
+                        could be handed to the next accepted host while the old
+                        sender still writes: frames would go to the wrong host
+                        (the "fd reuse race").
+  8. Under the write lock: port_reset(slot) and state = FREE or DISABLED.
+  9. If FREE: sem_post(&free_ports). Step 8 comes BEFORE step 9 on purpose:
+                        whoever gets the new token must find a FREE port.
+Then the reaper logs "port N: teardown complete, port is FREE" and signals
+port_down_cond (section 8).
+
+A teardown cannot be done twice: it starts only from the queue, a port is put
+there only by the one winner of port_request_down, and the state is not UP
+again until step 8 has finished.
+
+
+6. THE RECEIVER AND THE SENDER NOW
+----------------------------------
+Receiver: on EOF, a truncated frame, a protocol error or a read error it calls
+port_request_down(self, FREE) and returns. It never closes the socket, never
+resets the port, never joins. Only the thread that WINS the request logs the
+reason (otherwise "host disconnected" would be logged for a host that was just
+shut down by the reaper after a sender failure).
+Sender: on a write error it frees the frame, calls port_request_down(self,
+FREE) and returns. When its queue is closed it just returns.
+If both fail at the same moment (a connection reset breaks the read and the
+write), both ask; one wins; the other changes nothing.
+The threads are now joinable (Part 4's receiver was detached): the reaper
+joins them.
+
+
+7. THE FREE-PORT SEMAPHORE
+--------------------------
+free_ports is a counting semaphore, initialised to num_ports (all ports FREE).
+INVARIANT:  value of the semaphore + tokens held by the accept thread
+            = number of FREE ports.
+  * Accept thread takes a token (a "wait") BEFORE looking for a port. After
+    the wait the value is one lower, and the accept thread holds that token
+    until it has turned a FREE port into UP: at every moment the equation holds.
+  * port_start (write lock) finds the lowest FREE port, so the token is used up
+    by it: FREE count -1, held tokens -1.
+  * The reaper returns the token with sem_post when a port becomes FREE again
+    (FREE count +1, value +1).
+  * If port_start finds no FREE port (an admin disabled one meanwhile): the
+    host is treated as "full" and NO token is posted back (the port that
+    token stood for is gone).
+  * If port_start fails before the port was changed (cannot create the sender
+    thread): the port is still FREE, so the accept thread posts the token back.
+  * If it fails after the port went UP (cannot create the receiver): the port
+    is handed to the reaper, which closes the socket and posts the token.
+  * A port that ends DISABLED does not post a token: it stays out of
+    circulation.
+The tests check the invariant with sem_getvalue after every step (unit test)
+and by behaviour (after 200 cycles: two hosts connect at once, the third has to
+wait the full time).
+
+
+8. THE ACCEPT THREAD, sem_timedwait AND "SWITCH FULL"
+-----------------------------------------------------
+For every accepted connection (accept4, as in Part 3):
+  1. sem_trywait: if a port is free there is no waiting at all.
+  2. otherwise log "no free port: host waits up to 5 s for one", compute
+        deadline = CLOCK_REALTIME now + port_wait_sec
+     and call sem_timedwait(&free_ports, &deadline). POSIX requires an absolute
+     REALTIME deadline for this call (all other timeouts in the project use the
+     monotonic clock). If a signal interrupts it (EINTR) the call is repeated
+     with the SAME deadline, so the total wait is not extended.
+  3. success: port_start(fd) -> "port N: host connected".
+  4. ETIMEDOUT: send the "switch full" frame, close the connection.
+  The thread handles ONE waiting host at a time (simple and deterministic): the
+  next connection waits in the listen backlog (64) until it is its turn, so a
+  4th host's own 5 seconds start when the 3rd host has been answered.
+  The wait is a sleep on a semaphore, not a busy loop.
+  port_wait_sec is a field of the switch (default 5, DEFAULT_PORT_WAIT_SEC); the
+  config file option port_wait_timeout arrives in Part 10.
+
+The SWITCH FULL reply (send_switch_full in switch.c) is a normal frame built
+with the Part 2 code:
+        src  00:00:00:00:00:00     dst  FF:FF:FF:FF:FF:FF
+        vlan 1     prio 0          payload "switch full" (11 bytes)
+  frame_send packs the 17-byte header (length 0x000B in network order, src, dst,
+  vlan 0x0001, prio 0x00) and writes header + payload with write_full. On the
+  wire (28 bytes):
+     00 0b | 00 00 00 00 00 00 | ff ff ff ff ff ff | 00 01 | 00 | "switch full"
+  The result of the write is ignored (the host may be gone), then close().
+  The host program (Part 2) recognises exactly this frame, prints
+  "SWITCH FULL" and exits with status 2.
+
+
+9. LOCKS AND WHAT THEY PROTECT (global order, roadmap 2.6)
+----------------------------------------------------------
+  1. sw.ports_lock (rwlock)   port table: state, final_state, fds, rx_started.
+                              WRITE: port_start, port_request_down, step 8 of the
+                              teardown. READ: forward_frame.
+  2. port.q.lock              one output queue (Part 4), never two at a time.
+  4. sw.reaper_lock (+cond)   the FIFO of port ids for the reaper. Taken by
+                              port_request_down while it holds ports_lock (1 -> 4).
+  5. frame ref_lock           reference counts.
+  7. stats mutex              counters, always last.
+  leaf: sw.port_down_lock     the per-port "teardowns finished" counters and the
+                              condition variable port_down_cond. Taken by the
+                              reaper after ports_lock was released, never together
+                              with another lock.
+  No lock is held across: pthread_join, sem_timedwait, any read()/write() on a
+  socket, shutdown() or close().
+  Fields written before another thread can see them, with no lock: the socket fd
+  and the queue are set before the threads are created, and the reaper reads
+  them after taking the reaper lock (which orders it after the writer).
+  TSan agrees: no reports in any run.
+
+port_down_cond (for Part 16): port_down_count(id) tells how many teardowns of a
+port have finished; port_wait_down(id, since, timeout_ms) waits (timed wait on
+the condition variable, monotonic clock) until that number differs from `since`.
+An admin command will read the count, request the teardown, and wait. It is
+tested in test_port.c.
+
+reaper_finish(): lets the reaper finish the ports that are queued, then exit,
+and joins it. The unit tests need it now; Part 7 will call it in the shutdown
+sequence.
+
+
+10. TESTS AND ACTUAL RESULTS
+----------------------------
+  make clean && make       no warnings
+  make test                everything below, about 100 seconds
+
+  tests/test_port.c   3730 checks (also under TSan and valgrind)
+     one host comes and goes (UP, FREE, token back, thread and fd counts back
+     to the start); flooding between 2 ports and a host that never reads dies
+     with queued frames (frames alive afterwards = 0); lowest FREE port is
+     reused, also with gaps; no FREE port: PS_NONE, token not posted, fd
+     untouched; 16 threads ask for one teardown: 1 winner, 1 teardown, 1 post;
+     DISABLED final state (no post, skipped by port_start); receiver read error
+     and sender write error at the same time: 300 rounds, exactly one teardown
+     per round; 1000 connect/disconnect cycles; reaper_finish completes the
+     queued teardowns; the notification functions.
+  tests/test_lifecycle.py   98 checks, with the real switch and hosts
+     normal disconnect + reuse of the port; --die-midframe (truncated frame, port
+     reclaimed, others unaffected); a host killed while a flood is forwarded to it;
+     40 rounds of simultaneous read/write failure; 2 ports and 3 hosts where the
+     third waits and gets the freed port (about 0 s wait, no SWITCH FULL); 3rd host
+     with nobody quitting: SWITCH FULL after about 5 s and exit status 2; a 4th host
+     queues behind the 3rd; a waiting host that hangs up; 200 connect/disconnect
+     cycles (thread list and descriptor count unchanged, one teardown per
+     connection) followed by the token check (two hosts connect at once, the third
+     waits the full 5 s).
+  Updated older tests (test_switch.py, 149 checks): the thread list now has the
+     reaper; hosts after a disconnect get the freed port, so the "hostile host"
+     tests expect port 2 every time and wait for "teardown complete"; the
+     port-full test now checks the wait and the exact 28 bytes of the SWITCH FULL
+     frame. test_forward.py (91 checks) needed no change.
+  Synchronisation in the tests uses log lines ("host connected", "teardown
+  complete", "host waits") and port_wait_down, not sleeps. The only real waiting
+  is the 5-second timeout that the feature itself is about.
+  ThreadSanitizer: test_port_tsan (3730 checks, in make test), and with the TSan
+  switch (SWITCH="setarch -R ./switch_tsan"): test_switch.py 149, test_forward.py
+  91, test_lifecycle.py 98 checks: no reports.
+  valgrind: test_port 3730 checks, 0 errors, 0 leaks.
+  (valgrind of the whole switch waits for Part 7: it cannot exit cleanly yet.)
+
+
+11. BUGS
+--------
+  * Latent defect found while preparing for port reuse: port_reset used
+    atomic_init (not atomic) on fields that other threads read atomically.
+    Now atomic_store. (notes/bugs.md, bug 7)
+  * Mistakes in my own tests, fixed: thread counts read right after join (the
+    kernel removes the /proc/self/task entry a moment later; the unit test now
+    waits for the count to settle and measures its baseline once at the start);
+    a test that closed the host's stdin (end of stdin means "quit"); a log match
+    "port 3" that also matched a random TCP port number like 3xxxx.
+  * No bug in the switch code was shown by any test. I checked that the tests can
+    detect a missing "first caller wins" check (removing it made test_port fail)
+    and then restored the code.
+
+
+12. LIMITATIONS (intended: later parts)
+---------------------------------------
+  * The waiting time is fixed at 5 s until the config file exists (Part 10).
+  * The accept thread sleeps in sem_timedwait while a host waits; waking it for
+    shutdown (sem_post + shutting_down) is Part 7. A SIGINT during that wait
+    still kills the process by default today.
+  * No MAC table: step 6 of the teardown is only a marked place (Part 6).
+  * No admin commands and no port security: DISABLED is reachable only by
+    asking port_request_down(p, PORT_DISABLED) (used by tests).
+  * Per-port counters (stats) are not reset when a port is reused.
+  * sem_timedwait uses CLOCK_REALTIME (POSIX), so a big jump of the system clock
+    during the wait can shorten or lengthen it.
+
+
+13. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+-----------------------------------------------
+Q: Why does the receiver not just close its socket when the host leaves?
+A: The sender may still be writing to it; closing could make the fd number be
+   reused by the next host. Only the reaper closes it, after both joins.
+Q: How is it guaranteed that a teardown happens only once?
+A: The change UP -> CLOSING is made under the write lock; only the thread that
+   sees UP queues the port. A CLOSING port is not UP, so nobody else can win.
+Q: Why does the reaper call shutdown() before joining?
+A: To wake a receiver blocked in read() and a sender blocked in write(); otherwise
+   the join could wait forever.
+Q: Why no lock while joining?
+A: The joined thread may be waiting for that very lock: deadlock.
+Q: Why set the state to FREE before sem_post?
+A: The accept thread that gets the token then looks for a FREE port; it must
+   find one.
+Q: State the semaphore invariant.
+A: value + tokens held by the accept thread = number of FREE ports.
+Q: What happens when no port is found after the token wait?
+A: Treated as full, SWITCH FULL, and no token is posted back.
+Q: Why CLOCK_REALTIME for sem_timedwait?
+A: POSIX defines its absolute timeout on CLOCK_REALTIME.
+Q: What does the host see when the switch is full?
+A: One frame (src 0, dst broadcast, vlan 1, prio 0, "switch full"), then EOF;
+   it prints SWITCH FULL and exits with 2.

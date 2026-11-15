@@ -200,10 +200,13 @@ def test_three_hosts():
     rxs = sorted(t for t in names if t.startswith("rx-port"))
     check(rxs == ["rx-port1", "rx-port2", "rx-port3"], "ps -T shows one receiver per host: %s" % rxs)
     check(names.count("accept") == 1, "ps -T shows exactly one accept thread")
-    others = [t for t in names if t != "accept" and not t.startswith("rx-port")]
+    txs = sorted(t for t in names if t.startswith("tx-port"))
+    check(txs == ["tx-port1", "tx-port2", "tx-port3"], "ps -T shows one sender per host: %s" % txs)
+    others = [t for t in names if t not in ("accept", "reaper") and not t.startswith(("rx-port", "tx-port"))]
     # the main thread; the TSan build has one extra runtime thread with the same name
-    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 4 + len(others),
-          "main thread + accept + 3 receivers (+TSan helper), got %s" % names)
+    check(names.count("reaper") == 1, "ps -T shows exactly one reaper thread")
+    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 2 + 6 + len(others),
+          "main + accept + reaper + 3 receivers + 3 senders (+TSan helper), got %s" % names)
 
     d = sw.host(ME[3])
     check(d is not None and "port 4: host connected" in sw.log(), "fourth host -> port 4")
@@ -228,7 +231,7 @@ def test_partial():
 
 
 def test_disconnects():
-    print("switch: disconnects and broken hosts do not hurt others")
+    print("switch: disconnects and broken hosts do not hurt others (ports are reused)")
     sw = Switch(16)
     a = sw.host(ME[0])
     b = sw.host(ME[1])
@@ -238,56 +241,75 @@ def test_disconnects():
 
     send(b, "quit")
     check(sw.wait_log("port 2: host disconnected"), "clean disconnect logged")
-    end = time.time() + 3
-    while time.time() < end and len([t for t in sw.threads() if t.startswith("rx-port")]) != 2:
-        time.sleep(0.05)
+    check(sw.wait_log("port 2: teardown complete, port is FREE"), "the reaper freed port 2")
     check(sorted(t for t in sw.threads() if t.startswith("rx-port")) == ["rx-port1", "rx-port3"],
           "the receiver of port 2 has exited, the others remain")
+    check(sorted(t for t in sw.threads() if t.startswith("tx-port")) == ["tx-port1", "tx-port3"],
+          "and so has its sender")
     send(a, "send bcast still-here")
     send(c, "send bcast me-too")
     check(sw.wait_log(rx(1, ME[0], BCAST, 1, 1, 10)) and sw.wait_log(rx(3, ME[2], BCAST, 1, 1, 6)),
           "other hosts still work after a disconnect")
 
-    d = sw.host(ME[3], "--die-midframe")            # port 4: dies in the middle of a frame
-    check(sw.wait_log("port 4: truncated frame (payload cut short), discarded"),
-          "half a frame -> truncated payload logged, frame discarded")
-    check(sw.count("port 4: RX") == 0, "the half frame was not logged as a frame")
+    # Every host below gets the lowest FREE port, which is port 2 again.
+    n_connect = [1]                              # connections that used port 2 so far
+    n_tear = [1]                                 # teardowns of port 2 so far
+    seen = {}
+
+    def expect(text, what):
+        seen[text] = seen.get(text, 0) + 1
+        ok = sw.wait_log(text, 5, seen[text])
+        n_tear[0] += 1
+        check(ok, what)
+        check(sw.wait_log("port 2: teardown complete, port is FREE", 5, n_tear[0]), what + " -> port 2 is FREE again")
+
+    d = sw.host(ME[3], "--die-midframe")         # port 2: dies in the middle of a frame
+    n_connect[0] += 1
+    check(sw.count("port 2: host connected") == n_connect[0], "the freed port 2 was given to the next host")
+    expect("port 2: truncated frame (payload cut short), discarded", "half a frame -> truncated payload logged")
+    check(sw.count("port 2: RX") == 0, "the half frame was not logged as a frame")
     send(a, "send bcast after-midframe")
     check(sw.wait_log("port 1: RX", 5, 2), "others fine after a mid-frame death")
 
-    # raw hostile connections (each takes the next free port: 5, 6, 7, 8, 9)
-    s = connect(sw)
-    sw.wait_log("port 5: host connected")
-    s.sendall(frame(ME[5], BCAST, 1, 1, b"")[:5])
-    s.close()
-    check(sw.wait_log("port 5: truncated frame (header cut short), discarded"), "truncated header (5 of 17 bytes)")
+    def hostile(action):
+        s = connect(sw)
+        n_connect[0] += 1
+        sw.wait_log("port 2: host connected", 5, n_connect[0])
+        action(s)
 
-    s = connect(sw)
-    sw.wait_log("port 6: host connected")
-    s.sendall(frame(ME[6], BCAST, 1, 1, b"", length=1501))
-    check(sw.wait_log("port 6: protocol violation: length 1501 > 1500"), "length 1501 -> protocol violation")
-    s.close()
+    def trunc_hdr(s):
+        s.sendall(frame(ME[5], BCAST, 1, 1, b"")[:5])
+        s.close()
 
-    s = connect(sw)
-    sw.wait_log("port 7: host connected")
-    s.sendall(frame(ME[7], BCAST, 1, 1, b"", length=65535))
-    check(sw.wait_log("port 7: protocol violation: length 65535 > 1500"), "length 65535 -> protocol violation")
-    s.close()
+    def too_long(s):
+        s.sendall(frame(ME[6], BCAST, 1, 1, b"", length=1501))
 
-    s = connect(sw)
-    sw.wait_log("port 8: host connected")
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    s.close()                                   # RST instead of FIN
-    check(sw.wait_log("port 8: read error: Connection reset by peer"), "TCP reset -> read error logged")
+    def way_too_long(s):
+        s.sendall(frame(ME[7], BCAST, 1, 1, b"", length=65535))
 
-    s = connect(sw)
-    sw.wait_log("port 9: host connected")
-    s.sendall(frame(ME[9], BCAST, 1, 1, b"abc", length=10))     # header says 10, only 3 sent
-    s.close()
-    check(sw.wait_log("port 9: truncated frame (payload cut short), discarded"), "payload shorter than length")
+    def reset(s):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        s.close()                                # RST instead of FIN
+
+    def short_payload(s):
+        s.sendall(frame(ME[9], BCAST, 1, 1, b"abc", length=10))     # header says 10, only 3 sent
+        s.close()
+
+    hostile(trunc_hdr)
+    expect("port 2: truncated frame (header cut short), discarded", "truncated header (5 of 17 bytes)")
+    hostile(too_long)
+    expect("port 2: protocol violation: length 1501 > 1500", "length 1501 -> protocol violation")
+    hostile(way_too_long)
+    expect("port 2: protocol violation: length 65535 > 1500", "length 65535 -> protocol violation")
+    hostile(reset)
+    expect("port 2: read error: Connection reset by peer", "TCP reset -> read error logged")
+    hostile(short_payload)
+    expect("port 2: truncated frame (payload cut short), discarded", "payload shorter than length")
 
     send(a, "send bcast survivor")
     check(sw.wait_log("port 1: RX", 5, 3), "host 1 still works after all the broken hosts")
+    check(sw.count("teardown complete") == sw.count("host connected") - 2,
+          "one teardown per connection that ended (hosts 1 and 3 are still connected)")
     check(sw.p.poll() is None, "switch still running")
     check(sw.stop(), "switch survived to the end")
 
@@ -316,19 +338,32 @@ def test_raw_fields():
 
 
 def test_port_full():
-    print("switch: no free port")
+    print("switch: no free port -> the host waits, then gets the exact SWITCH FULL frame")
     sw = Switch(2)
     a = sw.host(ME[0])
     b = sw.host(ME[1])
     s = connect(sw)
-    s.settimeout(5)
-    check(s.recv(10) == b"", "third connection is closed by the switch")
-    check(sw.wait_log("no free port: connection rejected"), "rejection logged")
+    s.settimeout(15)
+    t0 = time.time()
+    check(sw.wait_log("no free port: host waits up to 5 s for one"), "the third host is told to wait")
+    want = (struct.pack("!H", 11) + bytes(6) + b"\xff" * 6 + struct.pack("!HB", 1, 0) + b"switch full")
+    got = b""
+    while len(got) < len(want):
+        chunk = s.recv(len(want) - len(got))
+        if not chunk:
+            break
+        got += chunk
+    el = time.time() - t0
+    check(got == want, "exactly the documented frame: %s" % got.hex())
+    check(4.5 <= el <= 8.0, "after about 5 s (%.1f s)" % el)
+    check(s.recv(10) == b"", "then the connection is closed")
+    check(sw.wait_log("no free port after 5 s: sending SWITCH FULL"), "timeout logged")
     s.close()
     send(a, "send bcast ok")
     check(sw.wait_log(rx(1, ME[0], BCAST, 1, 1, 2)), "existing hosts unaffected")
     check(sw.count("port 3:") == 0, "no port 3 was ever created")
     check(len([t for t in sw.threads() if t.startswith("rx-port")]) == 2, "still only 2 receivers")
+    check(sw.count("teardown complete") == 0, "the rejected host never had a port, so no teardown")
     sw.stop()
 
 
@@ -387,9 +422,11 @@ def test_reset_before_accept():
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
         s.connect(("127.0.0.1", sw.port))
         s.close()
-    check(sw.wait_log("port 30:", 5) or sw.count("host connected") + sw.count("aborted") >= 25,
-          "all 30 resets processed")
-    time.sleep(0.3)
+    end = time.time() + 15
+    while time.time() < end and sw.count("teardown complete") != sw.count("host connected"):
+        time.sleep(0.02)
+    check(sw.count("host connected") > 0 and sw.count("teardown complete") == sw.count("host connected"),
+          "every connection that was accepted was torn down exactly once (%d)" % sw.count("host connected"))
     check(sw.p.poll() is None, "switch survived 30 reset connections")
     h = sw.host(ME[0])
     check(h is not None, "a normal host can still connect afterwards")
@@ -439,8 +476,9 @@ def test_threads_exit_clean():
         send(h, "quit")
     check(sw.wait_log("host disconnected", 10, 12), "12 disconnects logged")
     end = time.time() + 5
-    while time.time() < end and [t for t in sw.threads() if t.startswith("rx-port")]:
+    while time.time() < end and [t for t in sw.threads() if t.startswith(("rx-port", "tx-port"))]:
         time.sleep(0.05)
+    check([t for t in sw.threads() if t.startswith("tx-port")] == [], "all sender threads have exited too")
     check([t for t in sw.threads() if t.startswith("rx-port")] == [], "all receiver threads have exited (none left over)")
     check(sw.threads().count("accept") == 1 and sw.p.poll() is None, "accept thread and switch still alive")
     nfd = len(os.listdir("/proc/%d/fd" % sw.p.pid))

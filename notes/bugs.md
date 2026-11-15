@@ -46,3 +46,27 @@ One of these goes into the final report.
 - Cause: the first rule in a Makefile becomes the default goal. I had put the
   new line above `all:`, so it became the first rule.
 - Fix: moved the extra-object lines below `all:`/`tsan:`.
+
+## 6. Switch killed by SIGPIPE when a sender wrote to a closed socket (Part 4)
+- Symptom: in tests/test_forward.py the whole switch process died
+  (exit status -13 = SIGPIPE) right after a host that never reads sent an
+  invalid frame; the other hosts were disconnected.
+- Found by: the test "a host that stops reading, then misbehaves"; the switch
+  log simply stopped after "protocol violation", and `poll()` returned -13.
+- Cause: the receiver of that port ends the connection with shutdown(fd,
+  SHUT_RDWR) to wake its sender, which was blocked in write(). The write then
+  fails, and writing to a socket that is shut down raises SIGPIPE, whose
+  default action terminates the process. The roadmap ignores SIGPIPE in Part 7,
+  but Part 4 is where the switch first writes to sockets.
+- Fix: main() now calls sigaction(SIGPIPE, SIG_IGN) before any thread is
+  created, so the write returns EPIPE and the sender handles it.
+
+## 7. `port_reset` used `atomic_init` on fields that other threads read (found in Part 5)
+- Symptom: none seen in any test. Found by reading `port_reset()` before
+  enabling port reuse.
+- Cause: `atomic_init()` is an ordinary (non-atomic) initialisation. It was fine
+  while a slot was reset once at start-up (Parts 3-4), but with Part 5 the reaper
+  resets a slot that other threads may read through the atomic `mirror_to` and
+  `mac_count` fields (Parts 6 and 17). A plain write racing with an atomic
+  read is a data race (undefined behaviour in C11).
+- Fix: `port_reset()` now uses `atomic_store()`.

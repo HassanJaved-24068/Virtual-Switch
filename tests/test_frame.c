@@ -567,6 +567,93 @@ static void test_send(void)
     close(fds[0]);
 }
 
+/* ---- frame_recv_f (Part 4): reads straight into f->wire ---- */
+
+static void test_recv_f(void)
+{
+    printf("frame_recv_f: same results as frame_recv, data lands in wire[]\n");
+    int fds[2];
+    uint8_t buf[HDR_LEN + MAX_PAYLOAD];
+    long base = frame_live_count();
+    frame_t *f = frame_new();
+    CHECK(f == NULL ? -1 : 0);
+    EXPECT(f->refcount == 1);
+
+    /* a normal frame: wire[] is the frame exactly as received */
+    make_pair(fds);
+    raw_hdr(buf, 5, SRC, DST, 10, 2);
+    memcpy(buf + HDR_LEN, "hello", 5);
+    CHECK(write_full(fds[1], buf, HDR_LEN + 5));
+    EXPECT(frame_recv_f(fds[0], f) == FR_OK);
+    EXPECT(f->len == 5 && f->vlan == 10 && f->prio == 2);
+    EXPECT(memcmp(f->src, SRC, 6) == 0 && memcmp(f->dst, DST, 6) == 0);
+    EXPECT(memcmp(f->wire, buf, HDR_LEN + 5) == 0);          /* ready for write_full */
+
+    /* zero length and max length */
+    raw_hdr(buf, 0, DST, SRC, 4094, 0);
+    CHECK(write_full(fds[1], buf, HDR_LEN));
+    EXPECT(frame_recv_f(fds[0], f) == FR_OK && f->len == 0 && f->vlan == 4094);
+    raw_hdr(buf, 1500, SRC, DST, 1, 1);
+    for (int i = 0; i < 1500; i++)
+        buf[HDR_LEN + i] = (uint8_t)(i * 3);
+    CHECK(write_full(fds[1], buf, HDR_LEN + 1500));
+    EXPECT(frame_recv_f(fds[0], f) == FR_OK && f->len == 1500);
+    EXPECT(memcmp(f->wire, buf, HDR_LEN + 1500) == 0);
+
+    /* receive then send again: the bytes in wire[] are a valid frame */
+    int fds2[2];
+    make_pair(fds2);
+    EXPECT(write_full(fds2[1], f->wire, HDR_LEN + f->len) == 0);
+    frame_hdr_t h;
+    uint8_t pay[MAX_PAYLOAD];
+    EXPECT(frame_recv(fds2[0], &h, pay) == FR_OK && h.len == 1500 && memcmp(pay, buf + HDR_LEN, 1500) == 0);
+    close(fds2[0]);
+    close(fds2[1]);
+
+    /* protocol violation: length is still filled in for the log message */
+    raw_hdr(buf, 1501, SRC, DST, 1, 1);
+    CHECK(write_full(fds[1], buf, HDR_LEN));
+    EXPECT(frame_recv_f(fds[0], f) == FR_PROTO && f->len == 1501);
+    close(fds[0]);
+    close(fds[1]);
+
+    /* clean EOF, truncated header, truncated payload, I/O error */
+    make_pair(fds);
+    close(fds[1]);
+    EXPECT(frame_recv_f(fds[0], f) == FR_EOF);
+    close(fds[0]);
+
+    make_pair(fds);
+    raw_hdr(buf, 4, SRC, DST, 1, 1);
+    write_all_close(fds[1], buf, 9);
+    EXPECT(frame_recv_f(fds[0], f) == FR_TRUNC_HDR);
+    close(fds[0]);
+
+    make_pair(fds);
+    raw_hdr(buf, 10, SRC, DST, 1, 1);
+    write_all_close(fds[1], buf, HDR_LEN + 3);
+    EXPECT(frame_recv_f(fds[0], f) == FR_TRUNC_PAYLOAD && f->len == 10);
+    close(fds[0]);
+
+    errno = 0;
+    EXPECT(frame_recv_f(-1, f) == FR_ERR && errno == EBADF);
+
+    /* frames arriving one byte at a time */
+    make_pair(fds);
+    raw_hdr(buf, 9, SRC, DST, 33, 1);
+    memcpy(buf + HDR_LEN, "dribbling", 9);
+    struct writer_args wa = {fds[1], buf, HDR_LEN + 9, 1, 0};
+    pthread_t th;
+    CHECK_PT(pthread_create(&th, NULL, chunk_writer, &wa));
+    EXPECT(frame_recv_f(fds[0], f) == FR_OK && f->len == 9 && memcmp(f->wire + HDR_LEN, "dribbling", 9) == 0);
+    CHECK_PT(pthread_join(th, NULL));
+    close(fds[0]);
+    close(fds[1]);
+
+    frame_unref(f);
+    EXPECT(frame_live_count() == base);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);       /* the program under test does this too */
@@ -579,6 +666,7 @@ int main(void)
     test_recv_ok();
     test_recv_failures();
     test_send();
+    test_recv_f();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     printf(failures == 0 ? "ALL PASSED\n" : "SOME FAILED\n");

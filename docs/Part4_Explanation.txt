@@ -1,0 +1,335 @@
+=====================================================================
+PART 4 - REF-COUNTED FRAMES, BOUNDED QUEUES, SENDER THREADS, FLOODING
+=====================================================================
+
+1. WHAT PART 4 IMPLEMENTS
+-------------------------
+Until Part 3 the switch only READ frames. Now it forwards them:
+
+  * A frame received on port X is sent to EVERY OTHER port that is UP
+    (flooding). The sending port never gets its own frame back.
+  * Each port has its own bounded OUTPUT QUEUE and its own SENDER THREAD.
+    The receiver of port X only puts the frame into the queues; the
+    sender thread of port Y does the actual write() to host Y.
+  * The frame is not copied for each destination. One frame is shared by
+    all queues and a REFERENCE COUNT tells when the last user is done.
+  * If a destination queue is full, the frame is dropped for that
+    destination only, and a counter is incremented.
+
+Result: a host that stops reading (frozen host) can never slow down the
+receiver or the other hosts. That is "no head-of-line blocking".
+
+There is still no MAC table: every frame is flooded, even a unicast whose
+destination is known. (Part 6 adds learning.)
+
+New files:    include/queue.h  src/queue.c      the output queue
+              include/stats.h  src/stats.c      the counters
+              include/forward.h src/forward.c   forward_frame()
+              tests/test_queue.c, tests/test_refcount.c, tests/test_forward.py
+Changed:      include/frame.h, src/frame.c   frame_t, frame_new/ref/unref,
+                                             frame_recv_f
+              include/port.h, src/port.c     queue + sender thread in port_t,
+                                             new receiver, sender_main
+              src/switch.c                   starts queue and sender, ignores SIGPIPE
+              Makefile, tests/run_all.sh, tests/test_frame.c, tests/test_switch.py
+              notes/bugs.md
+
+
+2. FRAME REFERENCE COUNTING AND OWNERSHIP
+-----------------------------------------
+frame_t (frame.h):
+    ref_lock    a mutex that protects refcount
+    refcount    how many owners the frame has
+    len, vlan, src, dst, prio     the header fields, unpacked for easy use
+    wire[17+1500]                 the frame exactly as it goes on the wire
+
+Why wire[]?  The receiver reads the bytes straight into wire[] (the new
+function frame_recv_f does the same steps as frame_recv, but reads the
+header into wire[0..16] and the payload into wire[17...]). The sender later
+writes wire[] with ONE write_full(fd, f->wire, 17 + len). No packing, no
+second buffer, no copy.
+
+frame_new()   allocates the frame, refcount = 1. That 1 is the RECEIVER'S
+              OWN reference. Returns NULL if malloc fails.
+frame_ref(f)  lock; refcount++; unlock.
+frame_unref(f) lock; refcount--; zero = (refcount == 0); unlock;
+              if zero: destroy the mutex and free the frame.
+              The decrement and the test "is it zero?" are in the SAME
+              critical section. Only the thread that saw zero frees, and
+              it does it AFTER unlocking: nobody else owns the frame any
+              more, so nobody else can touch the mutex.
+              (If the test were done after unlocking, two threads could both
+              see 0 -> double free; or one could free while another still
+              reads the count -> use-after-free. I checked that my test
+              really detects this: with the test moved after the unlock,
+              ThreadSanitizer reports a data race in frame_unref.)
+
+THE OWNERSHIP RULE (for forward_frame):
+   count = (number of queues that really hold the frame)
+           + 1 for the receiver while it is still working with it.
+   1. frame_new            count = 1  (receiver)
+   2. for each destination: frame_ref (count+1), then try to push.
+        - push OK:    the queue now owns that reference.
+        - push fails: frame_unref at once (count-1), count a drop.
+   3. when the loop is over the receiver calls frame_unref (its own).
+   4. each sender calls frame_unref after writing the frame.
+   Whoever brings the count to 0 frees the frame (maybe the receiver,
+   maybe the last sender). Because the reference is taken BEFORE the push,
+   a fast sender can never free the frame while the receiver is still
+   pushing it into the next queue.
+
+Why share instead of copy? A broadcast to 63 ports would otherwise copy
+up to 1517 bytes 63 times for every frame. With sharing the data is stored
+once and only a pointer goes into each queue. The frame is never modified
+after it was received, so many threads can read it at the same time without
+a lock (only the counter needs the lock).
+
+frame_live_count() counts frames allocated minus freed. The tests use it:
+after a test it must be back to 0 (no leak, no double free).
+
+
+3. THE BOUNDED OUTPUT QUEUE (queue.c)
+-------------------------------------
+outq_t:  mutex lock, condition variable cond, ring[class] = array of
+         {frame pointer, enqueue time}, head[], tail[], count[], cap, closing.
+         It is a CIRCULAR BUFFER: head = oldest entry, tail = next free slot,
+         count = how many; both indexes wrap around with  (i + 1) % cap.
+         The arrays have 3 entries (for the 3 priority classes of Part 11)
+         but Part 4 uses only class 1 (OUTQ_NORMAL); the other two stay empty.
+         The queue holds 64 frames (DEFAULT_QUEUE_CAPACITY).
+
+outq_init(q, cap)       allocates the ring, initialises mutex + condition
+                        variable (monotonic clock). Returns 0 or an errno value.
+outq_try_push(q, f)     lock; if the queue is not closing AND count < cap:
+                        store {f, now}, advance tail, count++, signal the
+                        condition variable, result true. Otherwise result
+                        false. Unlock. It NEVER WAITS.
+outq_pop(q, &f)         lock; while (count == 0 && !closing) wait on the
+                        condition variable; if closing return false (CLOSED);
+                        else take the oldest frame, unlock, return true.
+outq_close(q)           lock; closing = true; broadcast; unlock. Wakes a
+                        sleeping sender.
+outq_drain(q)           frame_unref every frame still in the queue.
+outq_destroy(q)         free memory (nobody may use the queue afterwards).
+
+"while", not "if", around the wait: a condition-variable wait can return
+without anybody having signalled ("spurious wakeup"), and another thread
+may have taken the frame in the meantime. So after every wake-up the
+condition is checked again.
+
+WHY outq_try_push NEVER BLOCKS: it is called by the RECEIVER thread of the
+sending port. If it waited for space in a slow destination's queue, then
+the receiver would stop reading its own host, and every other destination
+would stop getting frames from it. That is head-of-line blocking: one slow
+host blocks everybody. Instead a full queue just returns false and the
+frame is dropped for that destination. Dropping is the correct behaviour
+for a switch (Ethernet is allowed to lose frames; the hosts can resend).
+
+
+4. THE SENDER THREAD (sender_main in port.c)
+--------------------------------------------
+One per UP port, named "tx-portN" (visible in ps -T):
+    while (outq_pop(&p->q, &f)) {
+        write_full(fd, f->wire, 17 + f->len);      // NO lock held here
+        frame_unref(f);
+        if the write failed: log it and stop      (EPIPE, ECONNRESET, ...)
+        else stats_inc(port, STAT_OUT);
+    }
+Only this thread writes to its socket. A write may take a very long time
+(a frozen host does not read, so the kernel buffer fills and write blocks).
+That only blocks THIS sender: its queue then fills and the frames for this
+host are dropped, while all other ports continue normally. That is how the
+sender threads prevent head-of-line blocking.
+On a write error the sender releases the frame and ends its loop. (Part 5
+will ask a "reaper" to tear the port down; Part 4 does not.)
+
+
+5. FLOODING (forward.c)
+-----------------------
+forward_frame(in_port, f), called by the receiver:
+    take sw.ports_lock for READING
+    for every port i = 1..num_ports:
+        skip the ingress port and every port that is not UP
+        frame_ref(f)
+        if (!outq_try_push(&port[i].q, f)) { frame_unref(f); drop count for i }
+    release the lock
+    log the drop messages (after the lock is released)
+The read lock means "nobody can change the port table while I look at it"
+(accept and later the reaper need the WRITE lock), many receivers can hold
+it at the same time. It is never held while sleeping: try_push never waits.
+The same frame pointer goes to all queues: no copying.
+
+
+6. HOW QUEUE-FULL DROPS ARE COUNTED
+-----------------------------------
+When try_push fails, forward_frame calls stats_inc(i, STAT_DROP) where i is
+the DESTINATION port whose queue was full. The new value is returned; the
+first drop of a port and then every 1000th are logged:
+    port 3: output queue full, 1000 frames dropped so far
+(so the log is not flooded). stats.c keeps the counters:
+STAT_IN (receiver, per frame read), STAT_OUT (sender, per frame written),
+STAT_DROP (destination, queue full), STAT_MIRROR (Part 17). It is a heap
+array protected by one mutex; Part 14 moves it into shared memory with the
+same functions.
+
+
+7. THE RECEIVER, NOW (receiver_main in port.c)
+----------------------------------------------
+    loop:  f = frame_new()
+           result = frame_recv_f(rfd, f)      // straight into f->wire
+           FR_OK:   stats_inc IN; log the frame; forward_frame; frame_unref(f)
+           other:   log the reason (EOF, error, truncated, protocol);
+                    frame_unref(f) (frees it: it was never queued); stop
+    then end_connection(p).
+It never writes to another socket and never waits for queue space.
+
+end_connection (needed now because a port has a sender thread):
+    1. shutdown(fd, SHUT_RDWR)  wakes a sender stuck in write() to a frozen host
+    2. outq_close               wakes a sender waiting for a frame
+    3. pthread_join(sender)     (no lock held)
+    4. outq_drain               frame_unref the frames still queued
+    5. set rfd = wfd = -1 (write lock), then close(fd)
+The fd is closed LAST, after the sender is gone. If it were closed first,
+the number could be reused by the next accepted host and the old sender
+could write to the wrong host. The port still stays marked UP afterwards
+(Part 5 will make it FREE again and reuse it), and frames flooded to it are
+counted as drops because its queue is closed.
+
+
+8. WHICH LOCK PROTECTS WHAT (global order, roadmap 2.6)
+-------------------------------------------------------
+  1. sw.ports_lock (rwlock)  the port table: state, fds. Write: accept (new host),
+                             end_connection (clears fds). Read: forward_frame.
+  2. port.q.lock             that queue's ring, count, closing. One at a time.
+  5. f->ref_lock             that frame's refcount.
+  7. stats mutex             the counters. Always last; log_msg is never
+                             called while holding it.
+Order used in the code: ports_lock -> q.lock -> ref_lock -> stats. For example
+forward_frame holds ports_lock (read); frame_ref takes ref_lock (briefly);
+outq_try_push takes q.lock (briefly); stats_inc takes the stats mutex after
+the queue lock was released. outq_drain holds q.lock while frame_unref takes
+ref_lock (2 then 5: the right order). No lock is held during read() or
+write() on a socket, or during pthread_join.
+Data without a lock: a frame's header fields and wire[] are written before
+the frame is shared and never changed afterwards (read-only while shared).
+The socket fd inside port_t is written before the threads are created.
+
+
+9. SIGPIPE (a bug found by the tests)
+-------------------------------------
+The switch now writes to sockets. Writing to a socket that is closed or shut
+down raises SIGPIPE, which kills the whole process by default. main() now
+ignores SIGPIPE (sigaction) so the write just fails with EPIPE and the
+sender handles it. See notes/bugs.md, bug 6. (The roadmap does this in
+Part 7 together with the signal thread; the rest of Part 7 is not started.)
+
+
+10. TESTS AND RESULTS
+---------------------
+  make clean && make       no warnings
+  make test                runs everything below (about 40 seconds)
+
+  tests/test_frame.c      108 checks  (Part 2's 91 + 17 for frame_recv_f: same
+                          results as frame_recv for good frames, 0 and 1500
+                          bytes, EOF, truncation, protocol error, I/O error)
+  tests/test_queue.c      72 checks   FIFO order, full queue returns false at
+                          once, wrap-around (1000 rounds), capacity 1, init
+                          errors, close/drain (frames freed, frames shared
+                          with the caller kept), pop sleeps until a frame
+                          arrives and is woken by close, 4 producers + 1
+                          consumer, stats counters (8 threads, no lost updates)
+  tests/test_refcount.c   24 checks   frame_ref/unref: single thread, 8 threads
+                          on one frame (400,000 pairs), 8 threads dropping the
+                          last references of 20,000 frames, one "receiver"
+                          flooding 8 queues with 8 consumers (30,000 frames).
+                          Frames alive at the end = 0 each time.
+  tests/test_forward.py   91 checks   with the real switch and real hosts:
+     - 4 hosts: each frame reaches the other 3 exactly once and never the
+       sender; unicast to an unknown MAC and to a host's own MAC is flooded
+       too; vlan 4094 / prio 2 / empty / 1500-byte frames arrive unchanged;
+       a burst of 200 arrives in order; ps -T shows 4 rx-port and 4 tx-port
+       threads.
+     - 4 hosts sending 300 frames each at the same time.
+     - a full queue drops without blocking the receiver (10,000 frames of
+       1400 bytes from A to a host that never reads: A's receiver reads all
+       of them).
+     - a host that stops reading and then sends an invalid frame: its stuck
+       sender thread is woken by shutdown() and both threads end, the fd is
+       closed, the switch lives on.
+     - a reading host killed with kill -9 during a flood.
+     - head-of-line test with the real host --flood 100000 and with 1000-byte
+       payloads (see results).
+  Regression: test_util 95, test_host 109, wire_bytes, test_switch 134
+  (it needed one change: the thread count now includes the senders).
+
+Measured head-of-line results (typical, this machine; 100,000 frames, host
+C never reads; B and D are --quiet hosts):
+    small frames (host --flood):  without C 2.5 s, B=79,329 D=77,162
+                                  with C    3.7 s, B=77,139 D=80,873
+                                  C's drop counter reached 17,000
+    1000-byte frames:             without C 2.3 s, B=81,394 D=86,412
+                                  with C    2.2 s, B=80,122 D=84,001
+                                  C's drop counter reached 97,000
+B and D receive about the same with or without C. B and D do NOT get 100%
+in either case: when the receiver is faster than the host's reader the
+64-frame queue is full and frames are dropped, as designed. With C the flood
+of small frames took up to about 1.5 times longer (one more queue to feed),
+not "blocked": A's receiver always read all 100,000 frames.
+
+ThreadSanitizer: test_refcount_tsan and test_queue_tsan are part of make
+test. Also run by hand:
+  make tsan
+  SWITCH="setarch -R ./switch_tsan" python3 tests/test_forward.py   91 checks, no reports
+  SWITCH="setarch -R ./switch_tsan" python3 tests/test_switch.py   134 checks, no reports
+valgrind: test_queue and test_refcount clean (0 errors, 0 leaks). The switch
+was run under valgrind with traffic (flooding, a stuck host, a killed host):
+no valgrind messages. (Leak checking of the switch itself needs a clean exit,
+which Part 7 adds.)
+
+
+11. BUGS FOUND AND FIXED
+------------------------
+  * SIGPIPE killed the switch (notes/bugs.md, bug 6): explained in section 9.
+  * (Test mistakes only, no switch bug) I first required 90% of the frames
+    at B and D, but a bounded queue drops frames in any case; the test now
+    compares with the run without the frozen host.
+
+LIMITATIONS (all intended, belong to later parts)
+  * Ports are still not reused after a host leaves (Part 5).
+  * No MAC learning: unicast is flooded as well (Part 6).
+  * One queue class only; priorities and rate limit come in Parts 11-12.
+  * The counters are only visible through the drop messages in the log; the
+    swctl tool and shared memory are Parts 14-15.
+  * A sender that gets a write error just stops; Part 5 will tear the port down.
+
+
+12. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+-----------------------------------------------
+Q: Why a reference count and not a copy per destination?
+A: One copy is shared by all queues; the count tells when the last user is
+   done, and that user frees it.
+Q: Why frame_ref BEFORE the push, not after?
+A: Once the frame is in the queue a sender may take, write and unref it at
+   once; if the receiver had not reference-counted yet, the frame could be
+   freed under its hands.
+Q: Why must the decrement and the zero test be in one critical section?
+A: Otherwise two threads could both see zero (double free) or one could free
+   while the other still reads the counter.
+Q: What happens if the queue is full?
+A: try_push returns false, the caller drops its reference, the destination's
+   drop counter goes up. Nobody waits.
+Q: Why must try_push not block?
+A: It runs in the receiver of the SENDING port; blocking would stop that port
+   reading and delay all other destinations (head-of-line blocking).
+Q: Why does the sender not hold a lock while writing?
+A: write() can take very long (frozen host); a held lock would block others.
+Q: Why a sender thread per port?
+A: A slow host blocks only its own sender.
+Q: Why close the fd only after joining the sender?
+A: Otherwise the fd number could be reused by a new host and the old sender
+   would write to the wrong host.
+Q: Why shutdown() before joining the sender?
+A: A sender stuck in write() to a frozen host would never return; shutdown
+   makes the write fail so the sender can end.
+Q: Why while and not if around pthread_cond_wait?
+A: Spurious wake-ups and other threads taking the item.

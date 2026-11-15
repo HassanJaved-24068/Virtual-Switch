@@ -5,6 +5,8 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdatomic.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -99,10 +101,13 @@ void frame_unpack(const uint8_t *bytes, frame_hdr_t *hdr)
 /* Receive / send a whole frame                                        */
 /* ------------------------------------------------------------------ */
 
-enum frame_rc frame_recv(int fd, frame_hdr_t *hdr, uint8_t *payload)
+/*
+ * Shared body of frame_recv and frame_recv_f. raw receives the 17 header
+ * bytes and payload receives the payload bytes (the caller chooses where
+ * they go: separate buffers, or inside f->wire).
+ */
+static enum frame_rc recv_into(int fd, uint8_t *raw, frame_hdr_t *hdr, uint8_t *payload)
 {
-    uint8_t raw[HDR_LEN];
-
     /* Step 1: the 17 header bytes. */
     ssize_t r = read_full(fd, raw, HDR_LEN);
     if (r < 0)
@@ -129,6 +134,27 @@ enum frame_rc frame_recv(int fd, frame_hdr_t *hdr, uint8_t *payload)
     return FR_OK;
 }
 
+enum frame_rc frame_recv(int fd, frame_hdr_t *hdr, uint8_t *payload)
+{
+    uint8_t raw[HDR_LEN];
+
+    return recv_into(fd, raw, hdr, payload);
+}
+
+enum frame_rc frame_recv_f(int fd, frame_t *f)
+{
+    frame_hdr_t h;
+
+    memset(&h, 0, sizeof h);
+    enum frame_rc rc = recv_into(fd, f->wire, &h, f->wire + HDR_LEN);
+    f->len = h.len;
+    f->vlan = h.vlan;
+    f->prio = h.prio;
+    memcpy(f->src, h.src, MAC_LEN);
+    memcpy(f->dst, h.dst, MAC_LEN);
+    return rc;
+}
+
 int frame_send(int fd, const frame_hdr_t *hdr, const uint8_t *payload)
 {
     uint8_t buf[HDR_LEN + MAX_PAYLOAD];
@@ -150,4 +176,70 @@ const char *frame_rc_str(enum frame_rc rc)
     case FR_PROTO:         return "protocol violation (length > 1500)";
     }
     return "unknown";
+}
+
+/* ------------------------------------------------------------------ */
+/* Reference-counted frames                                            */
+/* ------------------------------------------------------------------ */
+
+static _Atomic long live_frames;
+
+frame_t *frame_new(void)
+{
+    frame_t *f = malloc(sizeof *f);
+    if (f == NULL)
+        return NULL;                       /* errno = ENOMEM */
+
+    int rc = pthread_mutex_init(&f->ref_lock, NULL);
+    if (rc != 0) {
+        free(f);
+        errno = rc;
+        return NULL;
+    }
+    f->refcount = 1;                       /* the creator's reference */
+    f->len = 0;
+    f->vlan = 0;
+    f->prio = 0;
+    memset(f->src, 0, MAC_LEN);
+    memset(f->dst, 0, MAC_LEN);
+    atomic_fetch_add(&live_frames, 1);
+    return f;
+}
+
+void frame_ref(frame_t *f)
+{
+    CHECK_PT(pthread_mutex_lock(&f->ref_lock));
+    f->refcount++;
+    CHECK_PT(pthread_mutex_unlock(&f->ref_lock));
+}
+
+/*
+ * The decrement and the "is it zero?" test happen in the same critical
+ * section. Only the thread that saw zero frees the frame, and it does so
+ * after unlocking (nobody else holds a reference any more, so nobody else
+ * can touch the mutex).
+ */
+void frame_unref(frame_t *f)
+{
+    bool zero;
+
+    CHECK_PT(pthread_mutex_lock(&f->ref_lock));
+    f->refcount--;
+    if (f->refcount < 0) {                 /* more unrefs than refs: a bug */
+        fprintf(stderr, "frame_unref: refcount went negative\n");
+        abort();
+    }
+    zero = (f->refcount == 0);
+    CHECK_PT(pthread_mutex_unlock(&f->ref_lock));
+
+    if (zero) {
+        CHECK_PT(pthread_mutex_destroy(&f->ref_lock));
+        atomic_fetch_sub(&live_frames, 1);
+        free(f);
+    }
+}
+
+long frame_live_count(void)
+{
+    return atomic_load(&live_frames);
 }
