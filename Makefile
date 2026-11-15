@@ -19,6 +19,10 @@ TSAN_OBJ   = $(patsubst src/%.c,$(TSAN_DIR)/%.o,$(COMMON_SRC))
 all: $(PROGRAMS)
 tsan: $(TSAN_PROGRAMS)
 
+# Extra objects that only the switch needs.
+switch: $(OBJ_DIR)/port.o
+switch_tsan: $(TSAN_DIR)/port.o
+
 # ---- normal build ----
 $(PROGRAMS): %: $(OBJ_DIR)/%.o $(COMMON_OBJ)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)

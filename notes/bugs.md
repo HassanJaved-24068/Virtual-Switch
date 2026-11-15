@@ -38,3 +38,11 @@ One of these goes into the final report.
 - The test closed the host's stdin before the host had noticed the switch
   hanging up (race): finish(wait_first=True) now waits for the host first.
 (Both were bugs in the tests, not in the host.)
+
+## 5. `make` stopped building after `switch` (Part 3)
+- Symptom: after adding `switch: $(OBJ_DIR)/port.o` to the Makefile, plain
+  `make` built only `./switch`; `host` and `swctl` were missing.
+- Found by: `ls host swctl` after the build.
+- Cause: the first rule in a Makefile becomes the default goal. I had put the
+  new line above `all:`, so it became the first rule.
+- Fix: moved the extra-object lines below `all:`/`tsan:`.

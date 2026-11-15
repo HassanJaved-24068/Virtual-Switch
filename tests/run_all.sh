@@ -13,5 +13,6 @@ run ./build/test_util          # Part 1: MAC and time helpers, CHECK, log
 run ./build/test_frame         # Part 2: wire protocol unit tests
 run python3 tests/test_host.py # Part 2: host program against a fake switch
 run tests/wire_bytes.sh        # Part 2: byte order seen with xxd
+run python3 tests/test_switch.py # Part 3: listener, port table, receiver threads
 
 echo "All tests passed."

@@ -1,0 +1,276 @@
+=====================================================================
+PART 3 - SWITCH SKELETON: LISTENER, PORT TABLE, RECEIVER THREADS
+=====================================================================
+
+1. WHAT PART 3 IMPLEMENTS
+-------------------------
+The switch program now runs as a TCP server:
+
+    ./switch <tcp_port> <num_ports> [-c <config>]
+
+  * It listens on a TCP port.
+  * Every host that connects gets the lowest free switch port (1, 2, 3, ...).
+  * Every connected host gets its own receiver thread, which reads frames
+    with the Part 2 function frame_recv() and writes one log line per frame.
+  * There is NO forwarding yet: frames are only read and logged.
+
+New / changed files:
+  include/port.h   switch_t, port_t, port states, function declarations
+  src/port.c       the global switch "sw", port table set-up, port_alloc(),
+                   switch_wait_ms(), receiver_main()
+  src/switch.c     replaces the stub: argument checks, listening socket,
+                   accept thread, main()
+  Makefile         switch is now linked with port.o as well
+  tests/test_switch.py   end-to-end tests of the switch (132 checks)
+  tests/run_all.sh       runs the new test too
+  notes/bugs.md, docs/Part3_Explanation.txt
+
+
+2. THE FILES IN DETAIL
+----------------------
+include/port.h
+  enum port_state { PORT_FREE, PORT_UP, PORT_CLOSING, PORT_DISABLED }
+      FREE      enabled, no host
+      UP        a host is attached, its receiver thread runs
+      CLOSING   teardown in progress                (Part 5)
+      DISABLED  shut by admin or port security      (Parts 6 and 16)
+  port_t   one switch port: id, state, rfd/wfd (the socket; the same number
+           for a TCP host), vlan, trunk, mirror_to, mac_count, rx (thread id).
+  switch_t everything global: ports_lock (read-write lock), the port array
+           ports[MAX_PORTS+1], num_ports, listen_fd, wake_efd, shutting_down,
+           shutdown_lock + shutdown_cond, config_path.
+  Parts of the roadmap structure that are not here yet because their types
+  do not exist yet: the sender thread and output queue (Part 4), the
+  free-port semaphore (Part 5), admin_down_requested (Part 16).
+
+src/port.c
+  switch_init(n)    sets up the rwlock, the mutex, the condition variable
+                    and the port slots (ids 0..64, all FREE).
+  port_reset(p)     puts the per-connection fields back to defaults.
+  port_alloc()      returns the lowest-numbered FREE port in 1..num_ports,
+                    or NULL. The caller must hold the write lock.
+  switch_wait_ms()  waits up to N ms on shutdown_cond (a timed wait). It is
+                    used instead of sleep() when a loop must pause.
+  receiver_main()   the receiver thread (section 6).
+
+src/switch.c
+  main()            parses and validates the arguments, builds everything,
+                    starts the accept thread, then waits for it.
+  make_listener()   the listening socket (section 3).
+  accept_main()     the accept thread (section 4).
+  attach_host()     gives an accepted socket to a port (section 5).
+
+
+3. THE TCP LISTENER
+-------------------
+  socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC)
+  setsockopt(SO_REUSEADDR)      lets us restart the switch at once; without it
+                                bind() can fail for a minute after a restart
+                                because old connections are in TIME_WAIT.
+  bind(INADDR_ANY, port)        accept connections on every network interface.
+  listen(fd, 64)                the kernel may queue up to 64 waiting
+                                connections.
+The listening socket is NON-blocking, so accept4() on it never hangs even if
+the waiting connection disappeared. Start-up errors (bad arguments, port
+already in use) print a message on stderr and exit with code 1.
+Argument rules: tcp_port 1..65535, num_ports 1..64 (MAX_PORTS), and
+optionally "-c <file>". Anything else prints the usage line and exits 1.
+The -c file name is stored and logged only; it is read in Part 10.
+
+
+4. THE ACCEPT THREAD: poll() AND accept4() TOGETHER
+---------------------------------------------------
+The loop:
+   1. poll() on two descriptors:
+        - listen_fd  becomes readable when a host is waiting to connect
+        - wake_efd   an eventfd; becomes readable when someone writes to it
+      poll(..., -1) sleeps until one of them is ready (no busy waiting).
+   2. If listen_fd is ready: accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC).
+   3. Give the new socket to a port (section 5) and go back to 1.
+
+Why poll() with an eventfd and not just a blocking accept()? A thread that
+is blocked in accept() is hard to stop cleanly. With poll() we can wake the
+thread by writing one number to wake_efd. In Part 3 nobody writes to it; in
+Part 7 the shutdown code will, to stop the accept thread. It already exists
+now so the loop does not have to be rewritten later. (If it ever fires
+without a shutdown, the thread reads it empty so that poll() sleeps again.)
+
+Why accept4() and not accept()? It sets flags in the same call:
+  SOCK_CLOEXEC   the descriptor is closed automatically if the program
+                 later starts another program (no leaked descriptors).
+  We deliberately do NOT pass SOCK_NONBLOCK: the accepted socket must be
+  BLOCKING because frame_recv() / read_full() simply wait for data.
+(The tests check these flags in /proc/<pid>/fdinfo.)
+
+Errors in the loop never end the thread:
+  EINTR                       interrupted by a signal: try again.
+  EAGAIN / EWOULDBLOCK        the connection disappeared between poll() and
+                              accept4() (the host reset it): nothing to
+                              accept, go back to poll().
+  ECONNABORTED and similar    the connection died while waiting: logged, go on.
+  EMFILE, ENFILE, ENOBUFS,    the process is out of descriptors or memory.
+  ENOMEM                      The waiting connection stays in the queue, so
+                              poll() would return again at once = a busy
+                              loop. To avoid that, the thread waits 100 ms
+                              on shutdown_cond (switch_wait_ms) before
+                              polling again. The problem is logged once, not
+                              every 100 ms. As soon as a descriptor is free,
+                              accepting continues.
+  anything else               logged, wait 100 ms, continue.
+A poll() failure is handled in the same way (log, wait 100 ms).
+Not even a pthread_create() failure ends the program: that host is closed
+and the port goes back to FREE.
+
+
+5. HOW A HOST GETS A PORT
+-------------------------
+attach_host(fd), called by the accept thread:
+   1. Take the WRITE lock on ports_lock.
+   2. port_alloc(): the lowest FREE port. If there is none, release the lock,
+      log "no free port: connection rejected" and close(fd). (The proper
+      "switch full" reply and the waiting time come in Part 5.)
+   3. port_reset(p); p->rfd = p->wfd = fd; p->state = PORT_UP (FREE -> UP).
+   4. pthread_create(receiver_main, p); pthread_detach(...).
+   5. Release the lock, then log "port N: host connected".
+The write lock is needed because state and fd change, and later parts (the
+forwarding code) read the whole port table under the read lock.
+Only one transition is implemented in this part: FREE -> UP. All the others
+(UP -> CLOSING, CLOSING -> FREE/DISABLED, DISABLED -> FREE, FREE -> DISABLED)
+belong to Parts 5, 6 and 16.
+
+
+6. THE RECEIVER THREAD AND frame_recv()
+---------------------------------------
+receiver_main(void *arg): arg is the port_t * of "its" port. The thread is
+named "rx-portN" (pthread_setname_np) so that  ps -T -p <pid>  shows one
+rx-port line per connected host.
+
+Loop:  fr = frame_recv(p->rfd, &hdr, payload);
+  FR_OK              log "port N: RX src=.. dst=.. vlan=.. prio=.. len=.."
+                     and continue. (A zero-length payload is a normal frame.)
+  FR_EOF             "host disconnected" (clean leave between frames)
+  FR_ERR             "read error: <strerror>", e.g. Connection reset by peer
+  FR_TRUNC_HDR       "truncated frame (header cut short), discarded"
+  FR_TRUNC_PAYLOAD   "truncated frame (payload cut short), discarded"
+  FR_PROTO           "protocol violation: length N > 1500"
+Every result except FR_OK ends the loop. Then the thread takes the write lock
+only to set rfd/wfd to -1, closes the socket (close() is checked), and
+returns. Nothing else in the switch is touched, so other hosts are not
+affected: each host's reading is completely independent.
+
+frame_recv() already deals with partial reads (a host sending one byte at a
+time with --partial just takes longer) and with several frames arriving in
+one TCP segment, so the receiver needs no special code for either case.
+
+Why one thread per host? A read on a socket blocks until data arrives. With
+one thread per host, a silent or slow host blocks only its own thread. One
+thread for all hosts would stop everybody whenever one host stalled in the
+middle of a frame.
+
+Why detached? Nobody joins the receivers in this part, and a finished
+non-detached thread would keep its stack until it is joined. Detached
+threads are cleaned up by the system when they end (the test checks that the
+rx-port threads disappear after the hosts leave and no descriptors leak).
+
+
+7. WHY THE PORT TABLE IS STATIC
+-------------------------------
+sw.ports[MAX_PORTS+1] is an ordinary array inside the global "sw". The slots
+are never allocated with malloc, never freed and never moved. Receiver
+threads get a pointer to their slot (port_t *). If slots could be freed or
+moved (a growing array, realloc), a thread could be left with a pointer to
+memory that is gone. With a static array the pointer is always valid; only
+the per-connection fields inside the slot (fd, state, ...) are reset when a
+host leaves. Slot 0 is never given to a host; it is reserved for the bonus
+pipe trunk (roadmap). Hosts use ports 1..num_ports.
+
+ports_lock is a read-write lock created "writer-preferring"
+(PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP): many readers (the future
+forwarding code) at the same time, but a waiting writer (accept, teardown)
+is not starved by a stream of readers.
+
+
+8. WHAT IS INTENTIONALLY POSTPONED
+----------------------------------
+Part 4  forwarding (flooding), ref-counted frames, output queues, sender
+        threads, counters. Part 3 only reads and logs.
+Part 5  the reaper (the only code that tears a port down), the free-port
+        semaphore with the 5-second wait, the "switch full" reply frame.
+        IMPORTANT LIMITATION until then: when a host leaves, its receiver
+        closes the socket and exits, but the port stays marked UP and is
+        NOT given to the next host. So a switch with N ports accepts at
+        most N hosts over its whole life. Part 5 fixes this.
+Part 6  MAC learning table, aging, port security.
+Part 7  the signal thread and the clean shutdown sequence. Until then the
+        switch is stopped by the default action of SIGINT/SIGTERM (the
+        process is simply killed). wake_efd is never written, and
+        shutting_down is never set. main() just waits for the accept thread.
+        (valgrind runs of the switch start in Part 7 for this reason.)
+Part 10 reading the -c config file (the name is only stored now).
+
+
+9. HOW TO COMPILE AND TEST
+--------------------------
+  make clean && make       # no warnings (-Werror)
+  make test                # runs all tests of Parts 1, 2 and 3
+
+Try it by hand (three terminals):
+  ./switch 9000 8
+  ./host 127.0.0.1 9000 02:00:00:00:00:0a      then type:  send bcast hello
+  ./host 127.0.0.1 9000 02:00:00:00:00:0b
+The switch log shows, for example:
+  [INFO] port 1: host connected
+  [INFO] port 2: host connected
+  [INFO] port 1: RX src=02:00:00:00:00:0a dst=ff:ff:ff:ff:ff:ff vlan=1 prio=1 len=5
+Look at the threads:   ps -T -p $(pgrep -x switch) -o spid,comm
+  you see "accept" and one "rx-portN" per host.
+
+tests/test_switch.py (starts a real ./switch, log read from a file):
+  * argument checks: 15 wrong command lines (exit code 1, message), port in
+    use, valid boundaries (1 and 64 ports), -c file.
+  * three hosts get ports 1, 2, 3; frames from each are logged with the
+    right fields (vlan 10 prio 2, broadcast, zero length, 1500 bytes);
+    ps -T shows exactly one rx-port thread per host plus one accept thread;
+    a 4th host gets port 4.
+  * a --partial host: frames logged correctly and once; others unaffected.
+  * disconnects: a leaving host is logged and its thread exits; a
+    --die-midframe host, a truncated header, lengths 1501 and 65535, a TCP
+    reset, and a payload shorter than its length are each logged correctly
+    and the other hosts keep working.
+  * exact fields from raw sockets (3 frames in one write, frame split in 3
+    pieces, vlan 4094, prio 2).
+  * no free port: the 3rd host of a 2-port switch is closed; others fine.
+  * 3000 frames from one host, all logged exactly once.
+  * socket flags: listener non-blocking; accepted sockets blocking; both
+    close-on-exec; bound to 0.0.0.0.
+  * 30 connections reset right after connect: the switch survives.
+  * EMFILE (descriptor limit 12): logged once, no busy loop (CPU measured),
+    and accepting resumes when descriptors are free.
+  * 12 hosts come and go: all receiver threads exit, no descriptor leak.
+Extra run (ThreadSanitizer):
+  make tsan && SWITCH="setarch -R ./switch_tsan" python3 tests/test_switch.py
+
+
+10. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+-----------------------------------------------
+Q: Why is the listening socket non-blocking but the accepted ones are not?
+A: accept4 on a non-blocking listener never hangs if the connection vanished.
+   Accepted sockets are used by frame_recv, which waits for data, so they
+   must block.
+Q: Why poll() before accept4()?
+A: poll can wait on two things at once (new connection or wake-up by
+   eventfd) without busy waiting; the eventfd lets Part 7 stop this thread.
+Q: What does EAGAIN from accept4 mean after poll said "readable"?
+A: The connection was reset before we accepted it. Not an error; poll again.
+Q: What happens on EMFILE and why wait 100 ms?
+A: No descriptor is free; the waiting connection stays queued so poll()
+   returns at once forever. The 100 ms timed wait stops a busy loop.
+Q: Why does each host have its own receiver thread?
+A: A blocking read from one slow host must not stop the others.
+Q: Why a static port array?
+A: Threads hold port_t pointers; slots must never be freed or moved.
+Q: Who changes a port's state and under which lock?
+A: The accept thread, under the write lock (FREE -> UP). Others come later.
+Q: What does the receiver do when a host leaves?
+A: Logs the reason, closes the socket, exits. (Part 5 will let a reaper free
+   the port.)
