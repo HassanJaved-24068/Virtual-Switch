@@ -2,8 +2,9 @@
 # Runs every test. Each part adds its scripts here.
 cd "$(dirname "$0")/.." || exit 1
 
-make -s all build/test_util build/test_frame build/test_queue build/test_refcount \
-        build/test_port build/test_queue_tsan build/test_refcount_tsan build/test_port_tsan || exit 1
+make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
+        build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
+        build/test_port_tsan build/test_mactable_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -27,5 +28,8 @@ run python3 tests/test_forward.py  # Part 4: flooding, head-of-line blocking
 run ./build/test_port          # Part 5: port lifecycle, reaper, semaphore (unit level)
 run $NOASLR ./build/test_port_tsan      # Part 5: the same under ThreadSanitizer
 run python3 tests/test_lifecycle.py   # Part 5: lifecycle with the real switch and hosts
+run ./build/test_mactable      # Part 6: MAC table unit tests, 8-thread stress, real ports
+run $NOASLR ./build/test_mactable_tsan  # Part 6: the same under ThreadSanitizer
+run python3 tests/test_mac.py  # Part 6: learning, unicast, aging, LRU, port security (real switch)
 
 echo "All tests passed."

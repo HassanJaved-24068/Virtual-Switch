@@ -70,3 +70,33 @@ One of these goes into the final report.
   `mac_count` fields (Parts 6 and 17). A plain write racing with an atomic
   read is a data race (undefined behaviour in C11).
 - Fix: `port_reset()` now uses `atomic_store()`.
+
+## 8. The reaper did not flush a port's MAC entries (Part 6)
+- Symptom: `tests/test_mactable.c` ("real ports": receiver + reaper + MAC table)
+  failed: after a host left, `mac_check_counts` reported "port 2: mac_count is 0 but
+  the table has 1 entries". A dump of the table showed every entry still present.
+- How it was found: the unit test. The first version of the integration test in
+  `tests/test_mac.py` did NOT notice: a stale entry that points at a port that is no
+  longer UP makes `forward_frame` flood, which is the same visible result as "unknown MAC".
+- Cause: the call `mac_flush_port(id)` was never added to `teardown_port()`. My edit
+  script replaced the old comment with a string that did not match the file's wording,
+  and `str.replace` fails silently when nothing matches. (The `#include` edit did match,
+  so the file looked changed.) `port_reset()` still zeroed `mac_count`, hiding the
+  mismatch until `mac_check_counts` compared it with the table.
+- Danger if it had stayed: a new host that gets the freed port would receive the unicast
+  traffic of the previous host (stale MAC -> port entry).
+- Fix: `mac_flush_port(id)` is called in step 6 of the teardown. The integration test
+  now connects a NEW host to the freed port and checks that traffic for the old MAC is
+  flooded, not delivered to the new host; I verified that this test fails when the call
+  is removed. All the other edits of that script were checked with grep afterwards.
+
+## 9. Test fixes in Part 6 (no switch bug)
+- The LRU test ran on the 3-second-aging switch with sleeps between probes, so entries
+  could legitimately expire during the test (flaky). It now uses a flooded marker frame
+  after each probe instead of sleeping.
+- The 100,000-frame head-of-line test compared timings with bounds that were tighter than
+  the machine's run-to-run noise. Measured: the committed Part 4+5 switch took 3.3-6.3 s
+  for the same flood (median 3.58 s), Part 6 took 3.4-7.0 s (median 3.89 s), about 9%
+  more in the median. The bounds are now 2.5x + 2 s for the time and 0.6x for the counts.
+- "30 connections reset after connect" (Part 5 test) read its counters before a slow
+  (TSan) switch had accepted anything; it now waits until the counts are stable.

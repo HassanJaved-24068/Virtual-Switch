@@ -1,0 +1,351 @@
+=====================================================================
+PART 6 - THE CONCURRENT MAC TABLE
+=====================================================================
+
+1. WHAT PART 6 IMPLEMENTS
+-------------------------
+Until Part 5 the switch was a hub: every frame went to every other port. Now it
+is a switch: it LEARNS which MAC address lives behind which port and sends a
+frame only where it has to go.
+
+  * LEARNING   the source MAC of every frame is stored with the port it came in on.
+  * UNICAST    a frame for a known MAC goes to that port only.
+  * FLOODING   unknown destinations, broadcast and multicast go to all other UP ports.
+  * FILTERING  a frame for a MAC that lives behind the ingress port is dropped.
+  * AGING      entries not seen for T seconds are removed (an aging thread, every second).
+  * LRU        when the table is full the entry seen longest ago is evicted.
+  * MOVES      a MAC that appears on another port moves; "MAC moved: ..." is logged.
+  * SECURITY   a port that learns more than M MACs is shut down (state DISABLED).
+
+New files:    include/mactable.h  src/mactable.c     the table, aging thread
+              tests/test_mactable.c                  unit tests (351 checks)
+              tests/test_mac.py                      tests with the real switch (92 checks)
+Changed:      src/forward.c, include/forward.h       the forwarding decision
+              src/port.c, include/port.h             receiver (port security), reaper (flush), settings
+              src/switch.c                           builds the table, starts the aging thread
+              include/common.h                       defaults can be overridden at compile time
+              Makefile                               mactable.o, the switch_small test build
+              tests/run_all.sh, test_switch.py, test_forward.py, notes/bugs.md
+
+
+2. LEARNING AND UNICAST FORWARDING (forward_frame)
+--------------------------------------------------
+The receiver calls forward_frame(in_port, f). Under the ports_lock READ lock:
+
+  1. source is the broadcast address            -> drop the frame (nobody may send from it)
+  2. source is not multicast                    -> mac_learn_ex(vlan, src, in_port)
+        (a multicast source is forwarded but never learned)
+        result LEARN_VIOLATION                  -> drop the frame, return it (section 9)
+  3. destination is broadcast or multicast      -> flood
+  4. otherwise p = mac_lookup(vlan, dst):
+        p == ingress port                       -> drop (filter)
+        p is a port that is UP                  -> push to that port only
+        unknown, or p is not UP (closing, free) -> flood
+  Flooding = every UP port except the ingress port, exactly as in Part 4.
+
+The frame is still shared, never copied: frame_ref before each push, frame_unref if
+the push fails, the Part 4 drop counters, non-blocking queue insertion. Nothing in
+the Part 4/5 ownership rules changed.
+
+Why learn from the SOURCE: the source address of a frame tells where a host is
+reachable. The destination tells nothing about location, so a lookup never changes
+the table. (A host that only receives is never learned: its frames are flooded.)
+
+Example (the public test): A sends to C before C has sent anything: C is unknown,
+so the frame is flooded (C gets it, but so do B and D). C sends once: the switch
+learns "C is on port 3". Now A -> C goes to port 3 only.
+
+
+3. WHY STRIPED LOCKS
+--------------------
+Every receiver thread learns and looks up for every frame, so the table is the
+busiest shared structure of the switch.
+  * ONE lock for the table: every frame of every port would wait for the others.
+  * ONE LOCK PER ENTRY: too much memory and more complicated.
+  * STRIPED: the table has nbuckets (256) buckets, each with its own mutex. A key
+    belongs to exactly one bucket, so two threads only wait for each other when
+    they touch the same bucket (about 1 in 256). This is the middle way.
+A bucket lock protects the entries and chain links of that bucket. The rule
+"never hold two bucket locks at the same time" makes deadlock between buckets
+impossible (a thread never waits for a second bucket while owning one).
+
+
+4. THE MEMORY LAYOUT (shared-memory ready)
+------------------------------------------
+One contiguous region:
+
+   [ mactable_t header ][ mac_bucket_t bucket[nbuckets] ][ mac_entry_t entry[K] ]
+
+   header:  magic, K, nbuckets, pool_lock, free_head, count
+   bucket:  lock (mutex), first (index of the first entry in the chain, -1 = empty)
+   entry:   mac[6], vlan, port, next, last_seen (monotonic clock), used
+
+THERE ARE NO POINTERS INSIDE: chains and the free list use INDEXES into the entry
+array. A pointer is only valid in the process that wrote it; an index is valid in
+every process that maps the same memory. That is what the bonus (Part 20, table in
+shared memory for a supervisor) needs. Now the region comes from malloc (mac_init
+gets a pointer to memory, it does not allocate); mac_region_size(K, nbuckets) says
+how many bytes are needed.
+The mutexes are created PROCESS_SHARED and ROBUST (both work in ordinary memory).
+Robust: if a thread/process dies while holding the lock, the next locker gets
+EOWNERDEAD instead of waiting forever; the helper lock_robust() then calls
+pthread_mutex_consistent() and goes on (used for the bucket locks and pool_lock).
+The unit test kills a lock owner and checks that the table keeps working.
+
+
+5. HASHING AND COLLISION CHAINS
+-------------------------------
+Key = (vlan, mac), 8 bytes: 2 vlan bytes (big endian) and 6 MAC bytes.
+Hash = FNV-1a (32 bit): h = 2166136261; for each byte: h ^= byte; h *= 16777619.
+Bucket = h & (nbuckets - 1). The AND is only a correct "modulo" if nbuckets is a
+power of two, so mac_init rejects other sizes (and K < 1).
+Different keys can land in the same bucket (a COLLISION). All entries of a
+bucket form a singly linked chain (bucket.first -> entry.next -> ...). A
+search walks the chain comparing vlan and MAC. New entries are inserted at the
+head of the chain. With 1024 entries in 256 buckets the chains are about 4 long.
+The vlan is part of the key: the same MAC in two vlans is two entries.
+The unit test computes FNV-1a itself and checks every entry sits in that bucket.
+
+
+6. THE FREE LIST (pool_get / pool_put)
+--------------------------------------
+Entries that are not used are kept on a free list: free_head is the index of the
+first free entry and each free entry's `next` is the next free one. At start all
+K entries are on the list (0 -> 1 -> ... -> K-1).
+  pool_get(): lock pool_lock; take free_head; free_head = entry.next; mark it used;
+              count++; unlock. Returns -1 if the list is empty.
+  pool_put(i): lock pool_lock; mark unused; entry.next = free_head; free_head = i;
+              count--; unlock.
+pool_lock protects free_head, the list links, the used flags and count.
+Both functions are called while the caller holds the bucket lock of that entry,
+and take pool_lock themselves: the order is always BUCKET -> POOL. Nobody ever
+waits for a bucket lock while holding pool_lock (the pool functions never take a
+bucket lock), so the two kinds of locks cannot deadlock.
+Invariant: count + (number of entries on the free list) = K.
+
+
+7. LEARNING IN DETAIL, MOVES
+----------------------------
+mac_learn_ex(vlan, mac, port): up to 4 rounds:
+  lock the bucket; search the chain
+  - found on the same port: last_seen = now. Done.
+  - found on ANOTHER port: this is a MOVE. entry.port = new port, last_seen = now,
+    mac_count[old]--, mac_count[new]++ (atomics). It is reported (mv->moved) and
+    logged as   MAC moved: <mac> vlan V port A -> B
+  - not found: e = pool_get(); fill it; insert at the head; mac_count[port]++
+    (still under the bucket lock, so a removal can never run before this increment);
+    unlock. If the port's count is now > M and the port is not a trunk -> LEARN_VIOLATION.
+  - not found and the pool is empty: UNLOCK the bucket, call mac_evict_lru(), and
+    start again from the search (another thread may have inserted the same MAC or
+    taken the freed entry). After 3 evictions without success the frame is simply
+    not learned (LEARN_SKIPPED) but still forwarded.
+Eviction is never done while holding the bucket lock (it needs other bucket locks).
+mac_learn() (used when the caller holds no lock) logs the move itself.
+forward_frame uses mac_learn_ex and logs the move AFTER releasing ports_lock,
+because log_msg writes to stderr and no lock should be held across a write.
+A move into a port is not a "new insertion", so it does not trigger port security.
+(The same MAC on two hosts at the same time makes the entry jump between ports.)
+When a host leaves, the reaper removes its entries (step 6 of the teardown,
+mac_flush_port), so a host that reconnects does not cause a "moved" message and no
+stale entry can send traffic to the next host that gets the port.
+
+
+8. LRU EVICTION (no global list)
+--------------------------------
+"Least recently used" here means: the entry whose last_seen is oldest (last_seen is
+refreshed whenever the MAC is seen as a SOURCE, never by a lookup).
+A global LRU list would need one lock for every frame, which is what the striped
+design avoids. So eviction is rare and O(K) instead:
+  1. for each bucket: lock it, look at its chain, remember the oldest entry
+     (key and last_seen), unlock. (One bucket lock at a time.)
+  2. take the oldest of these candidates.
+  3. lock THAT bucket again; check that the entry is still there with the same key
+     AND the same last_seen. If yes: unlink it, mac_count[its port]--, pool_put it.
+  4. if it changed meanwhile (another thread refreshed or removed it), scan once
+     more; if it changes again, give up (the caller retries learning).
+Eviction runs only when the table is full, so its cost does not matter for normal traffic.
+
+
+9. AGING
+--------
+aging_main is a thread started by main(). Every second it calls mac_age(T) with
+T = sw.mac_aging_sec (default 300): it walks the buckets ONE AT A TIME (lock the
+bucket, remove the entries with now - last_seen > T, mac_count--, pool_put, unlock,
+next bucket).
+It waits with pthread_cond_timedwait on the shared shutdown_cond until an absolute
+deadline that moves forward by exactly 1000 ms each round (no drift, no sleep()).
+The same wait ends at once when shutdown starts (Part 7 will set shutting_down and
+broadcast), and the thread then exits. A unit test checks that it stops within
+milliseconds, not after the next tick.
+Because entries are removed only at the ticks, an entry disappears between T and
+T + 1 s after its last frame (test: T = 3 s -> 3-4 s). A lookup does not refresh
+last_seen: probing a MAC does not keep it alive.
+mac_flush_port(p) and mac_clear() use the same walk, so all three removals follow the
+same rules: one bucket lock at a time, pool_put under it, counts decremented.
+
+
+10. PORT SECURITY AND THE DEADLOCK CORRECTION
+---------------------------------------------
+Each port may learn at most M MACs (default 16). After a NEW insertion, if the
+port's mac_count > M (and it is not a trunk, a flag that already exists in port_t;
+trunk configuration itself is Part 13) the learn returns LEARN_VIOLATION. The entry
+has been inserted; it disappears with the port's flush.
+
+THE DEADLOCK: forward_frame runs while the receiver holds the ports_lock READ lock.
+port_request_down() needs the ports_lock WRITE lock. A read-lock holder asking for
+the write lock of the same rwlock waits for itself: deadlock. (The roadmap text
+said to call port_request_down "after releasing the bucket lock"; that is still
+inside forward_frame, so it is not enough.)
+
+THE FIX (as in Roadmap v2):
+  1. forward_frame detects the violation, DROPS the frame and RETURNS LEARN_VIOLATION
+     after releasing ports_lock. No lock is held when it returns.
+  2. the receiver logs   port N shut down: MAC flooding
+  3. the receiver calls port_request_down(self, PORT_DISABLED)
+  4. the receiver returns (it ends its loop)
+The reaper then tears the port down with final state DISABLED: sockets closed, the
+port's MACs flushed, state DISABLED, and NO sem_post (the port stays out of use;
+an admin "up" in Part 16 will bring it back). The tests show that the port is not
+handed to the next host, that a 4th host has to wait for a port, that the switch
+stays alive (also with three offenders at once while another host floods), and the
+unit test checks with a writer lock that ports_lock is free after the violation.
+
+
+11. LOCK ORDER AND WHAT EACH LOCK PROTECTS
+------------------------------------------
+Global order (roadmap 2.6):
+   1. sw.ports_lock     the port table (state, fds). forward_frame holds it for READING.
+   2. port queue lock   one output queue. Never together with a bucket lock.
+   3. bucket lock       one bucket: its chain and the entries in it. ONE at a time.
+   4. (reaper lock)
+   5. frame ref_lock
+   7. stats mutex       always last
+   pool_lock            the free list, used flags, count. Taken only inside a bucket
+                        lock (bucket -> pool), never held while waiting for a bucket.
+   Paths:  learn:  ports_lock(r) -> bucket -> pool_lock
+           lookup: ports_lock(r) -> bucket
+           evict:  one bucket at a time (scan), then victim bucket -> pool_lock
+           aging / flush / clear: bucket i -> pool_lock, released before bucket i+1
+   mac_count is an atomic int per port (no lock); it is changed while the entry's
+   bucket lock is held, so an insert and its removal are ordered.
+   mac_foreach copies a bucket's entries under its lock and calls the callback after
+   unlocking, so a callback may call any mac_* function.
+   Not done while holding a lock: socket I/O, logging of moves, pthread_join,
+   port_request_down.
+
+
+12. CONFIGURATION FOR THE TESTS (switch_small)
+----------------------------------------------
+The roadmap's completion tests need T = 3 s, K = 4 and M = 3, but the config file
+is Part 10. The defaults in common.h can therefore be overridden at compile time,
+and "make switch_small" builds the same sources into ./switch_small with
+K = 4 (4 buckets), aging 3 s and M = 3. The settings live in the switch_t structure
+(mac_table_size, mac_buckets, mac_aging_sec and max_macs_per_port, the last two
+atomic because Part 10 reloads them). Part 10 will read them from the config file.
+
+
+13. TESTS AND ACTUAL RESULTS
+----------------------------
+  make clean && make       no warnings
+  make test                everything below (about 2.5 minutes)
+
+  tests/test_mactable.c    351 checks (also under TSan and valgrind)
+    init validation, layout; learn/lookup/refresh, key = (vlan, mac), moves, bad ports;
+    independent FNV-1a bucket check, one long chain, removal inside a chain; LRU
+    eviction order with controlled timestamps (also K = 1); aging boundaries; flush
+    and clear (counts and free list restored); foreach with re-entrant callback, dump;
+    port security (exactly M, M + 1, existing MACs, moves, trunk exempt, flush);
+    robust mutexes (a thread dies holding a bucket lock and the pool lock);
+    mac_check_counts detects 5 kinds of damage; aging thread (periodic, stops at
+    once on shutdown); 8 threads doing random learn / lookup / age / flush / evict /
+    foreach on a 64-entry table for 2 seconds (about 1,000,000 operations natively,
+    100,000-170,000 under TSan), then mac_check_counts must be exact;
+    forward_frame decisions without sockets (flood, unicast, filter, closing port,
+    broadcast source, multicast source, vlan key, port security violation with the
+    ports_lock released); real ports with the real receiver and reaper (learning from
+    live frames, unicast delivery, flush when a host leaves, DISABLED after the 4th MAC,
+    semaphore value, frames released).
+  mac_check_counts(): every port's mac_count equals the number of its entries, and
+    count + free entries = K (plus: chains and free list have no cycles, entries are
+    in the right bucket). It must be called while nothing changes the table.
+  tests/test_mac.py        92 checks with the real switch and hosts
+    1 A -> C before C spoke: flooded; C speaks; A -> C only to C; unknown MAC flooded;
+      broadcast and multicast flooded; payload and header intact
+    filter (MAC behind the ingress port), broadcast source dropped, multicast source
+      forwarded but not learned, vlan as key
+    MAC moved port 1 -> 3 and back (log lines), traffic follows; a host leaving flushes
+      (a NEW host on the freed port does not get the old host's traffic)
+    T = 3 s: the entry disappears after 4.35 s measured from just before the first probe
+      (= 3-4 s after the last frame plus the 0.25 s probe interval); an active MAC is not aged
+      (7 s of traffic)
+    K = 4 and six hosts: the oldest entries are evicted in order, a refreshed entry survives
+    M = 3: 4th MAC -> "port 2 shut down: MAC flooding" -> DISABLED, connection closed,
+      frame dropped, port not reused, 4th host waits (token not returned); multicast sources
+      and a repeated MAC do not count; the same MAC in a 2nd vlan does; three offenders
+      at once while another host floods: no deadlock; the normal switch allows 16 MACs, the
+      17th shuts the port down
+  Regression: test_util 95, test_frame 108, test_host 109, wire_bytes PASS, test_switch 150,
+    test_queue 72, test_refcount 24, test_forward 90, test_port 3730, test_lifecycle 98.
+    (test_switch and test_forward needed small updates: an extra thread named "aging";
+    a unicast to a learned host no longer reaches the other hosts.)
+  ThreadSanitizer: test_mactable_tsan, test_port_tsan, test_queue_tsan, test_refcount_tsan in
+    make test; with the TSan switch (SWITCH="setarch -R ./switch_tsan") test_mac 92,
+    test_switch 150, test_forward 90, test_lifecycle 98 checks: no reports.
+  valgrind: test_mactable 351 checks, 0 errors, 0 leaks.
+  Checks that the tests can find bugs: I planted three bugs one at a time and all were
+    detected: lookup refreshing last_seen (unit test), pool_get without pool_lock (crash/hang
+    natively, data race reported by TSan), eviction not decrementing mac_count (mac_check_counts).
+  Speed: forwarding now costs about 9% more per frame (median of 6 alternating runs of a
+    100,000-frame flood: 3.58 s for the committed Part 4+5 switch, 3.89 s for Part 6).
+
+
+14. BUGS ENCOUNTERED
+--------------------
+  * The reaper never called mac_flush_port (a silently failed edit). Found by the "real
+    ports" unit test; fixed; the integration test was strengthened (notes/bugs.md, bug 8).
+  * Test problems fixed (notes/bugs.md, bug 9): a flaky LRU test (3 s aging vs sleeps), timing
+    bounds of the head-of-line test tighter than the machine's noise, and a counter read too
+    early in a Part 5 test under the slow TSan switch.
+
+
+15. LIMITATIONS (intended: later parts)
+---------------------------------------
+  * T, K, M, the number of buckets and port_wait are fixed defaults until the config file
+    (Part 10); switch_small exists only for the tests.
+  * No VLAN filtering and no trunk configuration (Part 13); the vlan is only part of the key.
+  * The aging thread is not joined (Part 7 does the shutdown) and mac_dump/mac_foreach are not
+    connected to any command yet (Parts 10 and 15).
+  * The table is in ordinary heap memory; the shared-memory deployment is Part 20.
+  * mac_check_counts is exact only while nothing changes the table.
+  * A port that is DISABLED stays disabled (no admin "up" until Part 16).
+  * If a lock owner dies (EOWNERDEAD) the lock is recovered but the data it protected is not
+    repaired (the bonus supervisor rebuilds the counts, Part 20).
+
+
+16. VIVA QUESTIONS YOU SHOULD BE ABLE TO ANSWER
+-----------------------------------------------
+Q: Why learn from the source and not the destination address?
+A: The source tells where a host is. The destination does not say where it is.
+Q: What happens to a frame for an unknown MAC?
+A: It is flooded to all other UP ports, like a hub.
+Q: Why striped locks?
+A: One global lock serialises all receivers; one lock per bucket lets different
+   buckets run in parallel and still keeps the code simple.
+Q: Why is it safe to hold only one bucket lock at a time?
+A: A thread never waits for a second bucket while owning one, so there is no cycle.
+Q: Why indices and not pointers in the table?
+A: Indices stay valid in every process that maps the region (needed for shared memory).
+Q: Why must nbuckets be a power of two?
+A: hash & (nbuckets - 1) equals hash % nbuckets only then, and it is faster.
+Q: Why must eviction not run under the bucket lock of the learn?
+A: It takes other bucket locks; holding two bucket locks could deadlock.
+Q: Why does lookup not refresh last_seen?
+A: Aging means "time since the MAC last SENT a frame"; asking for it as a destination
+   must not keep an unused entry alive.
+Q: Why is port_request_down not called inside forward_frame?
+A: forward_frame holds the ports_lock read lock; port_request_down needs the write lock:
+   the thread would wait for itself. The receiver calls it after forward_frame returned.
+Q: What does a DISABLED port do with the semaphore token?
+A: Nothing: it is not returned, so the port stays out of use until an admin brings it up.
+Q: What is the invariant checked by mac_check_counts?
+A: per port, mac_count = number of entries; and count + free entries = K.

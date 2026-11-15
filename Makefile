@@ -9,8 +9,12 @@ COMMON_SRC = src/util.c src/log.c src/frame.c src/queue.c src/stats.c
 PROGRAMS      = switch host swctl
 TSAN_PROGRAMS = switch_tsan host_tsan
 
-OBJ_DIR  = build/obj
-TSAN_DIR = build/tsan
+# Objects that only the switch (and the tests of its internals) need.
+SWITCH_NAMES = port forward mactable
+
+OBJ_DIR   = build/obj
+TSAN_DIR  = build/tsan
+SMALL_DIR = build/small
 
 COMMON_OBJ = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(COMMON_SRC))
 TSAN_OBJ   = $(patsubst src/%.c,$(TSAN_DIR)/%.o,$(COMMON_SRC))
@@ -20,8 +24,8 @@ all: $(PROGRAMS)
 tsan: $(TSAN_PROGRAMS)
 
 # Extra objects that only the switch needs.
-switch: $(OBJ_DIR)/port.o $(OBJ_DIR)/forward.o
-switch_tsan: $(TSAN_DIR)/port.o $(TSAN_DIR)/forward.o
+switch: $(patsubst %,$(OBJ_DIR)/%.o,$(SWITCH_NAMES))
+switch_tsan: $(patsubst %,$(TSAN_DIR)/%.o,$(SWITCH_NAMES))
 
 # ---- normal build ----
 $(PROGRAMS): %: $(OBJ_DIR)/%.o $(COMMON_OBJ)
@@ -39,10 +43,25 @@ $(TSAN_DIR)/%.o: src/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fsanitize=thread -MMD -MP -c -o $@ $<
 
+# ---- switch_small: a switch for the tests with a tiny MAC table (K=4, 4 buckets),
+# aging after 3 s and at most 3 MACs per port. It is the same source; only the
+# defaults differ. (Until the config file exists in Part 10 these cannot be set at run time.)
+SMALL_FLAGS = -DDEFAULT_MAC_TABLE_SIZE=4 -DDEFAULT_MAC_BUCKETS=4 -DDEFAULT_MAC_AGING_SEC=3 \
+              -DDEFAULT_MAX_MACS_PER_PORT=3
+SMALL_OBJ = $(patsubst src/%.c,$(SMALL_DIR)/%.o,$(COMMON_SRC)) \
+            $(patsubst %,$(SMALL_DIR)/%.o,switch $(SWITCH_NAMES))
+
+switch_small: $(SMALL_OBJ)
+	$(CC) $(CFLAGS) $(SMALL_FLAGS) -o $@ $^ $(LDLIBS)
+
+$(SMALL_DIR)/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(SMALL_FLAGS) -MMD -MP -c -o $@ $<
+
 # ---- unit tests (tests/test_NAME.c -> build/test_NAME) ----
-# test_port needs the switch-only objects too
-build/test_port: $(OBJ_DIR)/port.o $(OBJ_DIR)/forward.o
-build/test_port_tsan: $(TSAN_DIR)/port.o $(TSAN_DIR)/forward.o
+# tests of the switch internals need the switch-only objects too
+build/test_port build/test_mactable: $(patsubst %,$(OBJ_DIR)/%.o,$(SWITCH_NAMES))
+build/test_port_tsan build/test_mactable_tsan: $(patsubst %,$(TSAN_DIR)/%.o,$(SWITCH_NAMES))
 
 build/test_%_tsan: tests/test_%.c $(TSAN_OBJ)
 	@mkdir -p build
@@ -56,6 +75,6 @@ test:
 	./tests/run_all.sh
 
 clean:
-	rm -rf build $(PROGRAMS) $(TSAN_PROGRAMS)
+	rm -rf build $(PROGRAMS) $(TSAN_PROGRAMS) switch_small
 
--include $(wildcard $(OBJ_DIR)/*.d $(TSAN_DIR)/*.d build/*.d)
+-include $(wildcard $(OBJ_DIR)/*.d $(TSAN_DIR)/*.d $(SMALL_DIR)/*.d build/*.d)

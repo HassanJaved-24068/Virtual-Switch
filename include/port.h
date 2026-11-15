@@ -81,6 +81,14 @@ typedef struct {
     pthread_mutex_t shutdown_lock;
     pthread_cond_t shutdown_cond;  /* monotonic clock; timed waits wake early on shutdown */
 
+    /* MAC table settings (config options in Part 10). The two reloadable ones are atomic. */
+    int mac_table_size;            /* K */
+    int mac_buckets;               /* power of two */
+    _Atomic long mac_aging_sec;    /* T */
+    _Atomic int max_macs_per_port; /* M */
+    void *mac_region;              /* memory of the MAC table (heap now, shared memory in Part 20) */
+    pthread_t aging;               /* aging thread */
+
     const char *config_path;       /* from -c, parsed in Part 10 */
 } switch_t;
 

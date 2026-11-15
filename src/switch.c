@@ -8,12 +8,16 @@
  * Part 4: every port also gets an output queue and a sender thread, and
  * frames are flooded to all other UP ports.
  * Part 5: a reaper thread tears ports down so they can be reused, and a host
- * waits (up to port_wait_timeout) for a free port or gets "switch full". Shutdown on SIGINT is added in Part 7; until then the
- * process is stopped by the default signal action.
+ * waits (up to port_wait_timeout) for a free port or gets "switch full".
+ * Part 6: a MAC table (learning, aging, LRU, port security) and an aging thread.
+ *
+ * Shutdown on SIGINT is added in Part 7; until then the process is stopped
+ * by the default signal action.
  */
 #include "common.h"
 #include "frame.h"
 #include "log.h"
+#include "mactable.h"
 #include "port.h"
 #include "stats.h"
 
@@ -311,7 +315,20 @@ int main(int argc, char **argv)
     if (config != NULL)
         log_msg(LOG_INFO, "config file: %s (not used until Part 10)", config);
 
+    /* The MAC table lives in one region (heap now; shared memory in the bonus Part 20). */
+    size_t mac_size = mac_region_size(sw.mac_table_size, sw.mac_buckets);
+    sw.mac_region = malloc(mac_size);
+    if (sw.mac_region == NULL) {
+        fprintf(stderr, "switch: cannot allocate the MAC table\n");
+        return EXIT_FAILURE;
+    }
+    CHECK_PT(mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets));
+    log_msg(LOG_INFO, "MAC table: %d entries, %d buckets, aging %lds, at most %d MACs per port",
+            sw.mac_table_size, sw.mac_buckets, atomic_load(&sw.mac_aging_sec),
+            atomic_load(&sw.max_macs_per_port));
+
     CHECK_PT(pthread_create(&sw.reaper, NULL, reaper_main, NULL));   /* before any host can connect */
+    CHECK_PT(pthread_create(&sw.aging, NULL, aging_main, NULL));
 
     pthread_t accept_thread;
     CHECK_PT(pthread_create(&accept_thread, NULL, accept_main, NULL));

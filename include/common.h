@@ -19,13 +19,30 @@
 #define MAX_PAYLOAD 1500      /* largest allowed payload in bytes */
 #define HDR_LEN 17            /* frame header is always 17 bytes */
 
-/* ---- Default settings (these become config options in later parts) ---- */
+/*
+ * ---- Default settings (these become config options in Part 10) ----
+ * They can be overridden at compile time (-DNAME=value). The Makefile uses this
+ * to build `switch_small`, a switch with a tiny MAC table and short aging time,
+ * for the tests, until the config file exists.
+ */
+#ifndef DEFAULT_QUEUE_CAPACITY
 #define DEFAULT_QUEUE_CAPACITY 64     /* frames per priority class */
+#endif
+#ifndef DEFAULT_MAC_AGING_SEC
 #define DEFAULT_MAC_AGING_SEC 300     /* MAC aging time T */
+#endif
+#ifndef DEFAULT_MAC_TABLE_SIZE
 #define DEFAULT_MAC_TABLE_SIZE 1024   /* MAC table entries K */
+#endif
+#ifndef DEFAULT_MAC_BUCKETS
 #define DEFAULT_MAC_BUCKETS 256       /* hash buckets (power of 2) */
+#endif
+#ifndef DEFAULT_MAX_MACS_PER_PORT
 #define DEFAULT_MAX_MACS_PER_PORT 16  /* port security limit M */
+#endif
+#ifndef DEFAULT_PORT_WAIT_SEC
 #define DEFAULT_PORT_WAIT_SEC 5       /* wait time for a free port */
+#endif
 #define DEFAULT_PRIO_AGING_MS 200     /* low-priority aging */
 #define DEFAULT_VLAN 1
 

@@ -6,6 +6,7 @@
 #include "forward.h"
 #include "frame.h"
 #include "log.h"
+#include "mactable.h"
 #include "stats.h"
 
 #include <string.h>
@@ -36,6 +37,11 @@ void switch_init(int num_ports)
     /* One token per port: every port starts FREE. */
     CHECK(sem_init(&sw.free_ports, 0, (unsigned)num_ports));
     sw.port_wait_sec = DEFAULT_PORT_WAIT_SEC;      /* config port_wait_timeout (Part 10) */
+
+    sw.mac_table_size = DEFAULT_MAC_TABLE_SIZE;
+    sw.mac_buckets = DEFAULT_MAC_BUCKETS;
+    atomic_init(&sw.mac_aging_sec, DEFAULT_MAC_AGING_SEC);
+    atomic_init(&sw.max_macs_per_port, DEFAULT_MAX_MACS_PER_PORT);
 
     CHECK_PT(pthread_mutex_init(&sw.reaper_lock, NULL));
     CHECK_PT(cond_init_mono(&sw.reaper_cond));
@@ -200,8 +206,9 @@ static void teardown_port(port_t *p)
     outq_drain(&p->q);
     outq_destroy(&p->q);
 
-    /* 6. Part 6 will call mac_flush_port(id) here: forget the MAC addresses
-     *    learned on this port. (No MAC table yet.) */
+    /* 6. Forget the MAC addresses learned on this port. Its receiver is gone, so
+     *    nothing can learn on it any more; no lock is held. */
+    mac_flush_port(id);
 
     /* 7. Close the socket, only now that both threads are gone, so the
      *    descriptor number cannot be reused while a thread could still use it. */
@@ -337,8 +344,17 @@ void *receiver_main(void *arg)
             mac_format(f->dst, dst, sizeof dst);
             log_msg(LOG_INFO, "port %d: RX src=%s dst=%s vlan=%u prio=%u len=%u",
                     p->id, src, dst, f->vlan, f->prio, f->len);
-            forward_frame(p, f);
+            enum learn_rc lr = forward_frame(p, f);    /* returns with no lock held */
             frame_unref(f);                            /* the receiver's own reference */
+            if (lr == LEARN_VIOLATION) {
+                /* Port security: this port has learned more than M MACs. The frame was
+                 * dropped. We ask for the shutdown HERE, after forward_frame released
+                 * ports_lock: asking inside it would need the write lock while this thread
+                 * holds the read lock (self-deadlock). */
+                log_msg(LOG_WARN, "port %d shut down: MAC flooding", p->id);
+                port_request_down(p, PORT_DISABLED);
+                return NULL;
+            }
             continue;
         }
 
