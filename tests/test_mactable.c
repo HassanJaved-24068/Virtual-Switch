@@ -878,7 +878,8 @@ static frame_t *mkframe(unsigned src, unsigned dst_n, bool dst_bcast, bool dst_m
 static int queued(int port)
 {
     CHECK_PT(pthread_mutex_lock(&sw.ports[port].q.lock));
-    int n = sw.ports[port].q.count[OUTQ_NORMAL];
+    /* frames queued for the port, in whatever class (since Part 11 the frame's priority chooses the ring) */
+    int n = sw.ports[port].q.count[0] + sw.ports[port].q.count[1] + sw.ports[port].q.count[2];
     CHECK_PT(pthread_mutex_unlock(&sw.ports[port].q.lock));
     return n;
 }

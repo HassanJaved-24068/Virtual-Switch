@@ -208,7 +208,7 @@ def test_sighup_invalid():
 
 
 def test_sighup_startup_only():
-    print("4. SIGHUP: startup-only keys are 'ignored until restart'; port settings are stored, not applied")
+    print("4. SIGHUP: startup-only keys are 'ignored until restart'; per-port settings are stored, not applied; weights and aging are applied (Part 11)")
     path = conf("mac_aging_seconds = 50\n")
     sw = ts.Switch(4, extra=["-c", path])
     ok = reload_and_wait(sw, path, "mac_aging_seconds = 60\nmac_table_size = 2048\nqueue_capacity = 8\ntrunk_port = 2\n"
@@ -224,8 +224,14 @@ def test_sighup_startup_only():
           "reload: port_wait_timeout 5 -> 9" in log, "the reloadable keys with an effect now are applied and reported")
     check("port.3.vlan 0 -> 20 (stored; VLANs are not applied until Part 13)" in log, "port.3.vlan is stored, and the log says that it is not applied yet")
     check("port.3.rate -1 -> 100 (stored; rate limiting is not applied until Part 12)" in log, "port.3.rate likewise")
-    check("rate_limit 0 -> 500 (stored" in log and "wrr_weights 5,3,1 -> 6,4,2 (stored" in log and "prio_aging_ms 200 -> 150 (stored" in log,
-          "rate_limit, wrr_weights and prio_aging_ms are stored and reported as not used yet")
+    check("rate_limit 0 -> 500 (stored; no effect until the rate limiting of Part 12)" in log,
+          "rate_limit is stored and reported as not used yet (Part 12)")
+    # Part 11 made these two effective: the log must say that they are applied, not 'stored'
+    check("wrr_weights 5,3,1 -> 6,4,2 (applies at the next scheduling round of every port)" in log and
+          "prio_aging_ms 200 -> 150 (applies to the next frame picked)" in log,
+          "wrr_weights and prio_aging_ms are applied to the priority queues (Part 11)")
+    check("wrr_weights 5,3,1 -> 6,4,2 (stored" not in log and "prio_aging_ms 200 -> 150 (stored" not in log,
+          "...and no longer reported as 'stored'")
     # the same file again: the startup-only keys are reported again (they are still not in force), nothing else changes
     n = sw.count("ignored until restart")
     hup(sw)

@@ -66,6 +66,7 @@ void port_reset(port_t *p)
     p->trunk = false;
     atomic_store(&p->mirror_to, 0);          /* atomic: other threads may read these */
     atomic_store(&p->mac_count, 0);
+    atomic_store(&p->bad_prio, 0);
 }
 
 void switch_wait_ms(long ms)
@@ -236,6 +237,11 @@ static void teardown_port(port_t *p)
     /* 5. Release the frames still queued, then free the queue itself. */
     outq_drain(&p->q);
     outq_destroy(&p->q);
+
+    /* Part 11: say how many frames of this host had a priority above 2 (the first one was logged when it came). */
+    if (atomic_load(&p->bad_prio) != 0)
+        log_msg(LOG_INFO, "port %d: bad_prio: %lu frame%s with a priority above 2 were queued as low priority", id,
+                atomic_load(&p->bad_prio), atomic_load(&p->bad_prio) == 1 ? "" : "s");
 
     /* 6. Forget the MAC addresses learned on this port. Its receiver is gone, so
      *    nothing can learn on it any more; no lock is held. */

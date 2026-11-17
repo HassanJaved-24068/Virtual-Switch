@@ -1,10 +1,10 @@
 #!/bin/bash
-# Parts 1-10 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-11 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
-        build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan || exit 1
+        build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -60,4 +60,13 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_mactable
 fi
 
-echo "Parts 1-10 unit and regression tests passed."
+run ./build/test_qos                      # Part 11: priority queues: 5:3:1 order, per-class fullness, aging, concurrent producers
+run $NOASLR ./build/test_qos_tsan         # Part 11: the same under ThreadSanitizer
+run python3 tests/test_qos.py             # Part 11: priority order through a congested port, SIGHUP weights, bad_prio
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_qos.py tsan     # Part 11: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_qos.py valgrind                                 # Part 11: no errors, no leaks, no descriptor left open
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_qos
+fi
+
+echo "Parts 1-11 unit and regression tests passed."

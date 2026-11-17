@@ -1,15 +1,15 @@
 #!/bin/bash
 # run_all.sh - the Tier 1 checkpoint (Part 8).
 #
-#   ./tests/run_all.sh                     normal variant: Parts 1-10 suite + the ten integration scripts
+#   ./tests/run_all.sh                     normal variant: Parts 1-11 suite + the ten integration scripts
 #   VARIANT=valgrind ./tests/run_all.sh    the ten scripts with the switch under valgrind
 #   VARIANT=tsan ./tests/run_all.sh        the ten scripts with the ThreadSanitizer build of the switch
-#   ./tests/run_all.sh forward mac_move    only the named scripts (no Parts 1-10 suite)
+#   ./tests/run_all.sh forward mac_move    only the named scripts (no Parts 1-11 suite)
 #
 # Variables: VARIANT (normal|valgrind|tsan), TMO (seconds for each command and wait inside a
 # script, default 30), SCRIPT_TIMEOUT (seconds for one whole script, default 300; a script
 # can legitimately take longer than one command: port_full and many_hosts wait for the 5 s
-# port timeout), LEGACY=0 (skip the Parts 1-10 suite in the normal variant).
+# port timeout), LEGACY=0 (skip the Parts 1-11 suite in the normal variant).
 # Exit status: 0 only if everything passed. The failed scripts are listed at the end.
 cd "$(dirname "$0")/.." || exit 1
 
@@ -32,8 +32,8 @@ failed=()
 passed=()
 
 if [ "$VARIANT" = normal ] && [ "${LEGACY:-1}" != 0 ] && [ $# -eq 0 ]; then
-    echo "################ Parts 1-10 unit and regression tests ################"
-    if timeout 3000 ./tests/run_unit.sh; then passed+=(parts-1-10); else failed+=(parts-1-10); fi
+    echo "################ Parts 1-11 unit and regression tests ################"
+    if timeout 3000 ./tests/run_unit.sh; then passed+=(parts-1-11); else failed+=(parts-1-11); fi
 fi
 
 echo "################ Part 8 integration scripts, VARIANT=$VARIANT ################"

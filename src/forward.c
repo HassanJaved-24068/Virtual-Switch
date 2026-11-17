@@ -1,6 +1,8 @@
 /*
  * forward.c - forwarding decision.
  * Part 4: flooding. Part 6: MAC learning and unicast forwarding.
+ * Part 11: the priority of a frame chooses the ring of every output queue (queue.c); a priority above 2
+ * is queued as low priority and counted per ingress port (bad_prio), with one log line per port.
  */
 #include "forward.h"
 
@@ -18,6 +20,7 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
     unsigned long long drops[MAX_PORTS + 1];     /* counts worth logging, 0 = nothing */
     struct mac_move move;
     enum learn_rc lr = LEARN_OK;
+    bool first_bad_prio = false;
 
     memset(drops, 0, sizeof drops);
     move.moved = false;
@@ -37,6 +40,11 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
         CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
         return LEARN_VIOLATION;
     }
+
+    /* A priority above 2 is not valid: queue.c treats it as 2 (low). Count it on the ingress port; the
+     * first one is logged (after the lock is released), the rest only counted. The frame itself is not changed. */
+    if (f->prio > OUTQ_LOW)
+        first_bad_prio = atomic_fetch_add(&in_port->bad_prio, 1) == 0;
 
     /* Decide where it goes: one port (target) or every other UP port (target = 0). */
     int target = 0;
@@ -70,9 +78,12 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
     }
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
 
-    /* Logging writes to stderr, so it is done after the lock is released. */
+    /* Logging is done after the lock is released. */
     if (move.moved)
         mac_log_move(&move);
+    if (first_bad_prio)
+        log_msg(LOG_WARN, "port %d: bad_prio: a frame with priority %u (valid: 0-2) is queued as low priority; "
+                "further ones are only counted", in_port->id, (unsigned)f->prio);
     for (int i = 1; i <= sw.num_ports; i++)
         if (drops[i] != 0)
             log_msg(LOG_WARN, "port %d: output queue full, %llu frames dropped so far", i, drops[i]);

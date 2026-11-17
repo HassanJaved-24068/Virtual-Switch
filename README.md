@@ -4,8 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 10** (configuration file, `SIGHUP` reload, `SIGUSR1` MAC dump).
-Features of later parts (priority queues, rate limiting, VLAN switching, the admin socket, shared-memory
+This README describes the switch as of **Part 11** (priority queues and weighted round robin; before it the
+configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
+Features of later parts (rate limiting, VLAN switching, the admin socket, shared-memory
 statistics, port mirroring) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
@@ -63,10 +64,10 @@ port.3.rate       = 100      # reloadable, overrides rate_limit
 | `mac_aging_seconds` | a MAC entry not seen for this long is removed (the aging thread scans every second) | 1 ... 86400 | 300 | yes, takes effect at the next scan |
 | `mac_table_size` | number of MAC table entries (K); buckets = 256, or the largest power of two <= K for a small table | 1 ... 65536 | 1024 | no: "ignored until restart" |
 | `max_macs_per_port` | port security: a port that learns more MACs than this is shut down (state DISABLED) | 1 ... 65536 | 16 | yes, applies to the next learned MAC |
-| `queue_capacity` | frames per output queue (per priority class) | 1 ... 65536 | 64 | no: "ignored until restart" |
+| `queue_capacity` | frames per output queue, **per priority class** (a port has three queues) | 1 ... 65536 | 64 | no: "ignored until restart" |
 | `port_wait_timeout` | seconds a host waits for a free port before "switch full" | 0 ... 3600 | 5 | yes, applies to the next waiting host |
-| `wrr_weights` | weighted round robin weights `high,medium,low`, exactly three numbers | each 1 ... 1000 | 5,3,1 | yes (*) |
-| `prio_aging_ms` | aging time of low priority frames (Part 11) | 1 ... 60000 | 200 | yes (*) |
+| `wrr_weights` | weighted round robin weights `high,medium,low`, exactly three numbers | each 1 ... 1000 | 5,3,1 | yes, applies at the next scheduling round |
+| `prio_aging_ms` | a frame at the head of the low (then the normal) queue that has waited longer than this is sent next | 1 ... 60000 | 200 | yes, applies to the next frame picked |
 | `rate_limit` | frames per second for every port, 0 = unlimited (Part 12) | 0 ... 1000000 | 0 | yes (*) |
 | `trunk_port` | trunk port number, 0 = none (Part 13) | 0 ... `num_ports` | 0 | no: "ignored until restart" (*) |
 | `log_file` | the log file (opened with `O_APPEND`) | a file name | `switch.log` | no: "ignored until restart" |
@@ -75,8 +76,8 @@ port.3.rate       = 100      # reloadable, overrides rate_limit
 | `port.N.rate` | frames per second of port N, overrides `rate_limit`; 0 = unlimited (Part 12) | N = 1 ... `num_ports`; 0 ... 1000000 | not set | yes (*) |
 
 (*) **These settings are validated, kept in the live configuration and logged when they change, but they have
-no effect yet**: the priority queues (Part 11), rate limiting (Part 12) and VLAN switching (Part 13) are not
-implemented. The log says so ("stored; ... not applied until Part N") instead of pretending.
+no effect yet**: rate limiting (Part 12) and VLAN switching (Part 13) are not implemented. The log says so
+("stored; ... not applied until Part N") instead of pretending.
 
 A key that the file does not mention has its default. The file is checked completely: an unknown key, a
 value that is not a plain decimal number, a value out of range, a duplicate key, a line without `=`, a missing
@@ -89,6 +90,21 @@ switch: configuration file 'v.conf': line 2: unknown key 'bogus'; line 4: wrr_we
 
 An environment variable `VSWITCH_LOG_FILE`, if set, overrides `log_file` (the tests use it to give every
 switch its own log file).
+
+## Priorities (QoS)
+
+Every frame carries a priority (`0` high, `1` normal, `2` low; the `host` command `sendx <dst> <vlan> <prio> <text>`
+sets it, `send` uses 1). Each port has **three output queues**, one per priority, each with room for `queue_capacity`
+frames. A frame goes to the queue of its priority; a priority above 2 is not valid and is queued as low priority
+(the frame itself is forwarded unchanged), counted per port, with **one** `bad_prio` log line per port and a count
+when the port closes.
+
+The sender of a port takes the next frame by **weighted round robin** with the weights `wrr_weights` (default 5,3,1:
+with all three queues busy one round sends H H H H H N N N L), plus an **aging override** against starvation: if the
+frame at the head of the low queue (then of the normal queue) has waited longer than `prio_aging_ms`, it is sent
+next, so a low-priority frame is still sent within about `prio_aging_ms` plus one write even under continuous
+high-priority traffic. Fullness is checked per class: a full low queue drops low frames only (counted, logged as
+`output queue full`); high and normal frames of the same port are still accepted. The receiver never blocks.
 
 ## Signals
 
@@ -147,6 +163,8 @@ make test                       # ./tests/run_all.sh: the unit and regression te
 VARIANT=valgrind ./tests/run_all.sh    # the integration scripts with the switch under valgrind
 VARIANT=tsan ./tests/run_all.sh        # ... with ThreadSanitizer
 python3 tests/test_config_signals.py [tsan|valgrind]   # configuration, SIGHUP, SIGUSR1 (Part 10)
+./build/test_qos                # the priority queue scheduler (after `make build/test_qos`)
+python3 tests/test_qos.py [tsan|valgrind]              # priorities through a congested port (Part 11)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 

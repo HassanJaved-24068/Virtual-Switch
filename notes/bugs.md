@@ -250,3 +250,47 @@ program that ignores SIGINT.
 - test_config_signals.py: a result tuple used with `%` raised TypeError (fixed with `str()`); a draft had checks that could not fail
   (`... or True`) and a missing precondition (B must send a VLAN 1 frame for the expected four entries): removed / fixed before the
   first complete run.
+
+## 21. Mistakes in the first versions of the Part 11 tests (no switch bug)
+- "output queue full" in the log does not prove that the sender thread of the port is blocked in write(). With the default socket buffers (a few MB on
+  loopback, even with a small SO_RCVBUF on the receiving side) the switch accepted the whole first flood of ~1,000 frames, the rings drained again when
+  the sender stopped, and the marked frames left in arrival order (n1 h1 n2 h2 ...). The order check passed once by luck and failed in other runs.
+  Fix: the receiving host has a 4 KB SO_RCVBUF, the flood is 17 MB (far more than any buffer), the test asserts that thousands of frames were dropped, and
+  only then sends the marked frames. 5 of 5 normal runs, 2 of 2 TSan runs and a valgrind run passed afterwards.
+- The unit test hung when I mutated the queue to ignore priorities: the random-order test asked for a pop that the queue could not give (the model thought
+  frames were queued that the mutated queue had refused) and outq_pop sleeps on an empty queue. A failing test must fail, not hang: test pops now check
+  the queue first (-2 = empty) and `alarm(300)` is a backstop. With the mutation the test now reports 479 failed checks and ends.
+- The bad_prio assertion looked for the text "priority 3 " only, so a switch that logged a line for EVERY bad frame (priority 3, 9, 255) still passed. Found by
+  the mutation check; the test now counts all bad_prio lines of the port and requires exactly one.
+- Existing fixtures assumed one class: test_queue.c `mk()` (frame_new() has priority 0, now the high ring; fixture sets prio 1) and test_mactable.c `queued()`
+  (counted the normal ring only; now sums the three). test_config_signals.py asserted "stored" for wrr_weights/prio_aging_ms, now applied. All adapted without
+  loosening any assertion (docs/Part11_Explanation.txt section 7).
+
+## 22. tests/test_forward.py failed on a busy machine: four weak checks (test-side; found from the user's `make test` output)
+- Symptom: the user's `make test` (Parts 1-11) failed only in `tests/test_forward.py`: 8 "host N: ... intact" checks and "B kept receiving (961
+  frames)". The head-of-line test took 7.78 s instead of ~2.3 s: the machine was loaded (my own Valgrind stress loop with busy-loop CPU hogs overlapped
+  the start of that run). A quiet re-run passed everything.
+- Reproduced on demand: with 4 busy loops on the 2 cores the UNFIXED test failed in 3 of 4 runs (once with the same 9 failures as the user's file).
+- Not a switch defect. Four checks measured the speed of the machine or an ordering the switch no longer promises:
+  1. "vlan 4094 prio 2 / zero-length / 1500-byte payload intact": three frames of priorities 2, 0, 1 were expected to arrive in the order they were
+     sent. Since Part 11 the sender takes high before normal before low, so when the three are queued together (slow machine) they leave reordered.
+     Fix: each frame must arrive exactly once and intact (all fields), matched by content; the last three frames must be exactly these three; the order
+     between different priorities is no longer asserted (it is tested in test_qos.c / test_qos.py).
+  2. "B kept receiving: >= 2000 frames" after a host died: a count that only measures how fast the machine is. Fix: B prints its frames, and a marker frame
+     sent after the death, in the HIGH priority queue (B's normal queue is full of flood frames and would drop a normal one), must arrive; and B's received
+     count must have grown.
+  3. Head-of-line test: "B and D got about as many frames as in the run without C" compared the counts of two runs made one after the other, i.e.
+     under different load (13,150 vs 32,548 frames), and also differs by design: with the frozen host the switch has less to do, A floods faster (3.0 s
+     against 5.5 s) and B's and D's own queues overflow more. Fix: both scenarios run AT THE SAME TIME on two switches; the check compares the COMBINED RATE
+     (frames per second) of B and D with a lenient bound (0.25). Per host is too noisy: identical hosts of the same run received 8,342 and 29,964 frames
+     because one host process was starved of the CPU. Real head-of-line blocking stops the fast hosts (a few percent) or stalls A's flood (the time check).
+  4. "B and D received at least 10 % of the frames" (my own floor from Part 9): 8.2 % on a busy machine. It is now a 1 % sanity floor; the comparison above is
+     the real check.
+- Results under the same load (4 busy loops on 2 cores), runs passing: unfixed 1 of 4; after fixes 1-2 and 3 (counts, concurrent): 6 of 8; after fix 4: 10 of 12
+  (the remaining failures were the per-run count comparison: counts depend on A's speed); rates: 11 of 14 (per-host noise); combined rate: 16 of 16. Quiet machine:
+  103 checks, 0 failures every time (it was 99 checks; +4 from the new checks).
+- The fixed checks still catch real faults (mutation check, sources restored): a queue that drops high-priority frames fails the "intact", "exactly these three"
+  and "received the special frames" checks; a queue that waits for space instead of dropping (head-of-line blocking) fails "A's receiver processed all 100000
+  frames" and the switch does not shut down.
+- Left as it is: test_dropped_frames_are_counted_and_released asserts a drop counter >= 1000 after 10,000 frames of 1400 bytes to a host that never reads; that
+  depends on how much the kernel buffers (a few MB), not on the load. It passed in every run.

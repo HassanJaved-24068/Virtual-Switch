@@ -9,6 +9,7 @@
 #include "log.h"
 #include "mactable.h"
 #include "port.h"
+#include "queue.h"
 
 void config_install(const config_t *cfg)
 {
@@ -20,6 +21,7 @@ void config_install(const config_t *cfg)
     sw.mac_table_size = cfg->mac_table_size;
     sw.mac_buckets = config_mac_buckets(cfg->mac_table_size);
     sw.queue_capacity = cfg->queue_capacity;
+    outq_set_sched(cfg->wrr_weights, cfg->prio_aging_ms);     /* Part 11: the queue scheduler (atomics, no lock) */
     CHECK_PT(pthread_mutex_unlock(&sw.config_lock));
 }
 
@@ -84,6 +86,7 @@ int reload_config(void)
     atomic_store(&sw.mac_aging_sec, fresh.mac_aging_sec);               /* read by the aging thread, once per cycle */
     atomic_store(&sw.max_macs_per_port, fresh.max_macs_per_port);       /* read by every learn */
     atomic_store(&sw.port_wait_sec, fresh.port_wait_sec);               /* read by the accept thread */
+    outq_set_sched(fresh.wrr_weights, fresh.prio_aging_ms);             /* read by every sender (Part 11) */
     CHECK_PT(pthread_mutex_unlock(&sw.config_lock));
 
     /* 3. Report. Logging happens with the lock released. */
@@ -91,12 +94,12 @@ int reload_config(void)
     changes += report_int("max_macs_per_port", old.max_macs_per_port, fresh.max_macs_per_port, "(applies to the next learned MAC)");
     changes += report_int("port_wait_timeout", old.port_wait_sec, fresh.port_wait_sec, "(applies to the next waiting host)");
     if (memcmp(old.wrr_weights, fresh.wrr_weights, sizeof old.wrr_weights) != 0) {
-        log_msg(LOG_INFO, "reload: wrr_weights %d,%d,%d -> %d,%d,%d (stored; no effect until the priority queues of Part 11)",
+        log_msg(LOG_INFO, "reload: wrr_weights %d,%d,%d -> %d,%d,%d (applies at the next scheduling round of every port)",
                 old.wrr_weights[0], old.wrr_weights[1], old.wrr_weights[2],
                 fresh.wrr_weights[0], fresh.wrr_weights[1], fresh.wrr_weights[2]);
         changes++;
     }
-    changes += report_int("prio_aging_ms", old.prio_aging_ms, fresh.prio_aging_ms, "(stored; no effect until Part 11)");
+    changes += report_int("prio_aging_ms", old.prio_aging_ms, fresh.prio_aging_ms, "(applies to the next frame picked)");
     changes += report_int("rate_limit", old.rate_limit, fresh.rate_limit, "(stored; no effect until the rate limiting of Part 12)");
     if (strcmp(old.mac_dump_file, fresh.mac_dump_file) != 0) {
         log_msg(LOG_INFO, "reload: mac_dump_file '%s' -> '%s'", old.mac_dump_file, fresh.mac_dump_file);

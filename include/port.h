@@ -45,6 +45,7 @@ typedef struct port {
     bool trunk;
     _Atomic int mirror_to;     /* used from Part 17 */
     _Atomic int mac_count;     /* used from Part 6 */
+    _Atomic unsigned long bad_prio;  /* Part 11: frames received with a priority above 2 (queued as low) */
     pthread_t rx;              /* receiver thread: reads frames and forwards them */
     pthread_t tx;              /* sender thread: writes queued frames to the host */
     bool rx_started;           /* is rx a real thread that must be joined? */

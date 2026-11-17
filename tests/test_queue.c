@@ -22,6 +22,8 @@ static frame_t *mk(uint16_t tag)
     frame_t *f = frame_new();
     CHECK(f == NULL ? -1 : 0);
     f->len = tag;
+    f->prio = 1;                   /* normal priority: these Part 4 tests are about ONE class (index OUTQ_NORMAL); since
+                                    * Part 11 the priority chooses the ring and frame_new() gives 0 (high) */
     return f;
 }
 
