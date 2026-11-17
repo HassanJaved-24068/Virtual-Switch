@@ -44,6 +44,12 @@
 #define DEFAULT_PORT_WAIT_SEC 5       /* wait time for a free port */
 #endif
 #define DEFAULT_PRIO_AGING_MS 200     /* low-priority aging */
+#define DEFAULT_WRR_HIGH 5            /* weighted round robin weights (Part 11) */
+#define DEFAULT_WRR_MEDIUM 3
+#define DEFAULT_WRR_LOW 1
+#define DEFAULT_RATE_LIMIT 0          /* frames per second per port, 0 = unlimited (Part 12) */
+#define DEFAULT_TRUNK_PORT 0          /* 0 = none (Part 13) */
+#define DEFAULT_MAC_DUMP_FILE "mac_dump.txt"
 #define DEFAULT_VLAN 1
 #define DEFAULT_LOG_FILE "switch.log" /* config log_file (Part 10); until then the environment
                                        * variable VSWITCH_LOG_FILE may name another file */

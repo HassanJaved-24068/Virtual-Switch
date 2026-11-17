@@ -6,6 +6,7 @@
 #include "common.h"
 #include "log.h"
 #include "port.h"
+#include "reload.h"
 
 #include <signal.h>
 #include <stdint.h>
@@ -92,11 +93,13 @@ void *signal_main(void *arg)
             log_msg(LOG_INFO, "%s received: shutting down", sig == SIGINT ? "SIGINT" : "SIGTERM");
             request_shutdown();
             return NULL;
-        case SIGHUP:
-            log_msg(LOG_INFO, "SIGHUP received: not yet implemented");     /* Part 10 */
+        case SIGHUP:                                   /* Part 10: reload the configuration file */
+            log_msg(LOG_INFO, "SIGHUP received: reloading the configuration");
+            (void)reload_config();                      /* logs its own result; a failure keeps the old config */
             break;
-        case SIGUSR1:
-            log_msg(LOG_INFO, "SIGUSR1 received: not yet implemented");    /* Part 10 */
+        case SIGUSR1:                                  /* Part 10: dump the MAC table */
+            log_msg(LOG_INFO, "SIGUSR1 received: dumping the MAC table");
+            (void)dump_mac_table();
             break;
         default:
             log_msg(LOG_WARN, "unexpected signal %d ignored", sig);

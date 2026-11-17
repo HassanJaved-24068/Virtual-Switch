@@ -36,12 +36,15 @@ void switch_init(int num_ports)
 
     /* One token per port: every port starts FREE. */
     CHECK(sem_init(&sw.free_ports, 0, (unsigned)num_ports));
-    sw.port_wait_sec = DEFAULT_PORT_WAIT_SEC;      /* config port_wait_timeout (Part 10) */
-
-    sw.mac_table_size = DEFAULT_MAC_TABLE_SIZE;
+    /* The live configuration starts as the defaults; main() replaces it with the file's (config_install). */
+    CHECK_PT(pthread_mutex_init(&sw.config_lock, NULL));
+    config_defaults(&sw.cfg, num_ports);
+    atomic_init(&sw.port_wait_sec, sw.cfg.port_wait_sec);
+    sw.mac_table_size = sw.cfg.mac_table_size;
     sw.mac_buckets = DEFAULT_MAC_BUCKETS;
-    atomic_init(&sw.mac_aging_sec, DEFAULT_MAC_AGING_SEC);
-    atomic_init(&sw.max_macs_per_port, DEFAULT_MAX_MACS_PER_PORT);
+    sw.queue_capacity = sw.cfg.queue_capacity;
+    atomic_init(&sw.mac_aging_sec, sw.cfg.mac_aging_sec);
+    atomic_init(&sw.max_macs_per_port, sw.cfg.max_macs_per_port);
 
     CHECK_PT(pthread_mutex_init(&sw.reaper_lock, NULL));
     CHECK_PT(cond_init_mono(&sw.reaper_cond));
@@ -93,6 +96,7 @@ void switch_destroy(void)
     destroy_failed("destroy reaper_cond", pthread_cond_destroy(&sw.reaper_cond));
     destroy_failed("destroy reaper_lock", pthread_mutex_destroy(&sw.reaper_lock));
     destroy_failed("destroy free_ports", sem_destroy(&sw.free_ports) < 0 ? errno : 0);
+    destroy_failed("destroy config_lock", pthread_mutex_destroy(&sw.config_lock));
     destroy_failed("destroy shutdown_cond", pthread_cond_destroy(&sw.shutdown_cond));
     destroy_failed("destroy shutdown_lock", pthread_mutex_destroy(&sw.shutdown_lock));
     destroy_failed("destroy ports_lock", pthread_rwlock_destroy(&sw.ports_lock));
@@ -137,7 +141,7 @@ enum port_start_rc port_start(int fd, int *port_id, int *err)
         p->wfd = fd;
         p->rx_started = false;
 
-        *err = outq_init(&p->q, DEFAULT_QUEUE_CAPACITY);
+        *err = outq_init(&p->q, sw.queue_capacity);
         if (*err == 0) {
             *err = pthread_create(&p->tx, NULL, sender_main, p);
             if (*err != 0) {

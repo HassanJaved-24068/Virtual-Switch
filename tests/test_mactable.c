@@ -435,6 +435,160 @@ static void test_foreach_dump(void)
     cleanup();
 }
 
+/* ---- 7b. the SIGUSR1 dump to a file (Part 10) ---- */
+struct dump_stats {
+    int header, entries, bad, duplicates;
+    bool seen[3][400];                              /* [vlan][id] */
+};
+
+/* Parse a dump file: 2 header lines "# ...", then "vlan mac port age_s". Counts what is wrong. */
+static void parse_dump(const char *path, struct dump_stats *d)
+{
+    FILE *fp = fopen(path, "r");
+    char line[200];
+
+    memset(d, 0, sizeof *d);
+    CHECK(fp == NULL ? -1 : 0);
+    while (fgets(line, sizeof line, fp) != NULL) {
+        unsigned vlan;
+        char mac[32];
+        int port;
+        long age;
+        char extra;
+
+        if (line[0] == '#') {
+            d->header++;
+            continue;
+        }
+        if (sscanf(line, "%u %31s %d %ld%c", &vlan, mac, &port, &age, &extra) == 5 && extra == '\n' && strlen(mac) == 17 &&
+            strncmp(mac, "02:00:00:00:", 12) == 0 && vlan >= 1 && vlan <= 2 && port >= 1 && port <= 8 && age >= 0) {
+            unsigned hi, lo;
+
+            if (sscanf(mac + 12, "%2x:%2x", &hi, &lo) == 2 && hi * 256 + lo < 400) {
+                d->entries++;
+                if (d->seen[vlan][hi * 256 + lo])
+                    d->duplicates++;
+                d->seen[vlan][hi * 256 + lo] = true;
+                continue;
+            }
+        }
+        d->bad++;
+        if (d->bad <= 3)
+            printf("  bad dump line: %s", line);        /* shows what is wrong */
+    }
+    fclose(fp);
+}
+
+static atomic_bool dump_stop;
+
+static void *dump_churn(void *arg)
+{
+    unsigned x = 12345u + (unsigned)(uintptr_t)arg * 7919u;
+
+    while (!atomic_load(&dump_stop)) {
+        x = x * 1103515245u + 12345u;
+        unsigned id = (x >> 8) % 300;
+        uint16_t vlan = (uint16_t)(1 + (x >> 20) % 2);
+
+        learn(vlan, id, 1 + (int)(id % 4));
+        if (x % 61 == 0)
+            mac_age(0);                              /* removes (almost) everything: the table is emptied and refilled */
+        if (x % 997 == 0)
+            mac_flush_port(1 + (int)(id % 4));
+    }
+    return NULL;
+}
+
+static void test_dump_file(void)
+{
+    printf("mac_dump_file: format, mode w, errors, 4 threads learning and aging while dumping\n");
+    char path[] = "/tmp/test_dump_XXXXXX";
+    int fd = mkstemp(path);
+    struct dump_stats d;
+
+    CHECK(fd);
+    CHECK(close(fd));
+    setup(512, 64);
+
+    EXPECT(mac_dump_file(path) == 0);                       /* an empty table: only the header */
+    parse_dump(path, &d);
+    EXPECT(d.header == 2 && d.entries == 0 && d.bad == 0);
+
+    for (unsigned n = 1; n <= 10; n++)
+        learn((uint16_t)(n % 2 + 1), n, (int)(n % 4 + 1));
+    age_entry(1, 2, 7500);                                  /* vlan 1 = even n? n%2+1: n=2 -> vlan 1 */
+    age_entry(2, 3, 12999);
+    EXPECT(mac_dump_file(path) == 10);
+    parse_dump(path, &d);
+    EXPECT(d.header == 2 && d.entries == 10 && d.bad == 0 && d.duplicates == 0);
+
+    /* exact values of two entries: vlan, mac, port, age in whole seconds (7500 ms -> 7, 12999 ms -> 12) */
+    FILE *fp = fopen(path, "r");
+    char line[200];
+    int saw_first = 0, saw_second = 0, saw_header_time = 0;
+
+    CHECK(fp == NULL ? -1 : 0);
+    while (fgets(line, sizeof line, fp) != NULL) {
+        unsigned y, mo, dd, h, mi, sec;
+
+        if (sscanf(line, "# MAC table dump, %u-%u-%u %u:%u:%u", &y, &mo, &dd, &h, &mi, &sec) == 6 && y >= 2024)
+            saw_header_time = 1;
+        if (strncmp(line, "1 02:00:00:00:00:02 3 7\n", 24) == 0 || (strncmp(line, "1 02:00:00:00:00:02 3 8\n", 24) == 0))
+            saw_first = 1;
+        if (strncmp(line, "2 02:00:00:00:00:03 4 12\n", 25) == 0 || strncmp(line, "2 02:00:00:00:00:03 4 13\n", 25) == 0)
+            saw_second = 1;
+    }
+    fclose(fp);
+    EXPECT(saw_header_time && saw_first && saw_second);
+
+    /* mode "w": a longer old content is gone */
+    fp = fopen(path, "w");
+    CHECK(fp == NULL ? -1 : 0);
+    for (int i = 0; i < 300; i++)
+        fputs("junk junk junk junk junk\n", fp);
+    fclose(fp);
+    EXPECT(mac_dump_file(path) == 10);
+    parse_dump(path, &d);
+    EXPECT(d.header == 2 && d.entries == 10 && d.bad == 0);
+
+    /* errors: no directory, a directory, a full device */
+    errno = 0;
+    EXPECT(mac_dump_file("/nonexistent-dir/dump.txt") == -1 && errno == ENOENT);
+    errno = 0;
+    EXPECT(mac_dump_file("/tmp") == -1 && errno == EISDIR);
+    if (access("/dev/full", W_OK) == 0) {
+        errno = 0;
+        EXPECT(mac_dump_file("/dev/full") == -1 && errno == ENOSPC);   /* a write error is reported, not ignored */
+    }
+    EXPECT(check_ok());
+
+    /* 4 threads learn, age and flush while the main thread dumps 60 times: every dump is whole */
+    mac_clear();
+    atomic_store(&dump_stop, false);
+    pthread_t th[4];
+    for (intptr_t i = 0; i < 4; i++)
+        CHECK_PT(pthread_create(&th[i], NULL, dump_churn, (void *)i));
+    int whole = 0, max_entries = 0;
+    for (int i = 0; i < 60; i++) {
+        int n = mac_dump_file(path);
+
+        parse_dump(path, &d);
+        if (n >= 0 && d.header == 2 && d.bad == 0 && d.duplicates == 0 && d.entries == n)
+            whole++;
+        if (d.entries > max_entries)
+            max_entries = d.entries;
+    }
+    atomic_store(&dump_stop, true);
+    for (int i = 0; i < 4; i++)
+        CHECK_PT(pthread_join(th[i], NULL));
+    EXPECT(whole == 60);                                    /* each dump: header, whole lines, no entry twice, count = lines */
+    EXPECT(max_entries > 0);                                /* the dumps really saw a table that was changing */
+    EXPECT(check_ok());                                     /* and the table is still consistent */
+
+    unlink(path);
+    cleanup();
+}
+
 /* ---- 8. port security ---- */
 static void test_port_security(void)
 {
@@ -1011,6 +1165,7 @@ int main(void)
     test_aging();
     test_flush_clear();
     test_foreach_dump();
+    test_dump_file();
     test_port_security();
     test_robust();
     test_check_counts();

@@ -21,6 +21,7 @@
 #include "log.h"
 #include "mactable.h"
 #include "port.h"
+#include "reload.h"
 #include "sig.h"
 #include "stats.h"
 
@@ -402,7 +403,22 @@ int main(int argc, char **argv)
     if (argc == 5)
         config = argv[4];
 
+    /*
+     * The configuration (Part 10): the defaults, then the file given with -c. A file with ANY bad line is a
+     * start-up error (exit status 1, every bad line is named); nothing has been created yet.
+     */
+    config_t cfg;
+    config_error_t cerr;
+
+    config_defaults(&cfg, (int)num_ports);
+    if (config != NULL && config_load(config, &cfg, &cerr) != 0) {
+        fprintf(stderr, "switch: configuration file '%s': %s (%d error%s)\n", config, cerr.msg, cerr.count,
+                cerr.count == 1 ? "" : "s");
+        return EXIT_FAILURE;
+    }
+
     switch_init((int)num_ports);
+    config_install(&cfg);                  /* the live configuration; no other thread exists yet */
     rc = stats_init(MAX_PORTS);
     if (rc != 0) {
         fprintf(stderr, "switch: cannot allocate counters: %s\n", strerror(rc));
@@ -413,10 +429,11 @@ int main(int argc, char **argv)
     CHECK(sw.wake_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
 
     /* The logger: from here on log_msg() is queued and written to the log file by its own thread.
-     * (Part 10 takes the file name from the config; until then switch.log, or $VSWITCH_LOG_FILE.) */
+     * The file is log_file of the configuration (default switch.log); the environment variable
+     * VSWITCH_LOG_FILE, if set, overrides it (the tests give every switch its own file that way). */
     const char *log_path = getenv("VSWITCH_LOG_FILE");
     if (log_path == NULL || *log_path == '\0')
-        log_path = DEFAULT_LOG_FILE;
+        log_path = cfg.log_file;
     rc = log_start(log_path);
     if (rc != 0) {
         fprintf(stderr, "switch: cannot open the log file '%s': %s\n", log_path, strerror(rc));
@@ -425,7 +442,9 @@ int main(int argc, char **argv)
 
     log_msg(LOG_INFO, "switch listening on TCP port %ld with %ld ports", tcp_port, num_ports);
     if (config != NULL)
-        log_msg(LOG_INFO, "config file: %s (not used until Part 10)", config);
+        log_msg(LOG_INFO, "configuration file: %s (SIGHUP reloads it)", config);
+    else
+        log_msg(LOG_INFO, "no configuration file: using the defaults");
 
     /* The MAC table lives in one region (heap now; shared memory in the bonus Part 20). */
     size_t mac_size = mac_region_size(sw.mac_table_size, sw.mac_buckets);

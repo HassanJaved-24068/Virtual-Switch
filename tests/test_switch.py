@@ -182,9 +182,17 @@ def test_arguments():
         check(sw.p.poll() is None, "%s port(s) accepted" % ports)
         check(("with %s ports" % ports) in sw.log(), "log says %s ports" % ports)
         sw.stop()
-    sw = Switch(4, extra=["-c", "some.conf"])
-    check("config file: some.conf" in sw.log(), "-c <config> accepted and noted")
+    # Part 10: -c names a real configuration file (a missing one is a start-up error, see tests/test_config_signals.py)
+    cf = tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False)
+    cf.write("# a valid configuration\nmac_aging_seconds = 120\n")
+    cf.close()
+    sw = Switch(4, extra=["-c", cf.name])
+    check(("configuration file: %s" % cf.name) in sw.log(), "-c <config> accepted and noted")
+    check("aging 120s" in sw.log(), "the value from the file is in use")
     sw.stop()
+    os.unlink(cf.name)
+    p = subprocess.run(shlex.split(SWITCH) + [str(free_port()), "4", "-c", "/nonexistent/some.conf"], capture_output=True, timeout=20)
+    check(p.returncode == 1 and b"cannot open" in p.stderr, "-c with a missing file -> exit 1 and a message (rc=%r)" % p.returncode)
 
 
 def test_three_hosts():

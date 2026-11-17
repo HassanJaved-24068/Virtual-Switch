@@ -123,6 +123,18 @@ int mac_foreach(void (*cb)(const mac_info_t *info, void *arg), void *arg);
 /* Write a header line and one line per entry to fp. Returns the number of entries. */
 int mac_dump(FILE *fp);
 
+/*
+ * SIGUSR1 dump (Part 10): create/truncate `path` (mode "w") and write
+ *     # MAC table dump, YYYY-MM-DD HH:MM:SS
+ *     # vlan mac port age_s
+ *     <vlan> <mac> <port> <age_s>          one line per entry, age in whole seconds since last seen
+ * The buckets are visited one at a time (mac_foreach): each bucket's entries are copied under its lock and
+ * written after the lock is released, so no MAC lock is held during file I/O. The result is a consistent
+ * copy of every bucket, not one atomic snapshot of the whole table (the table keeps changing meanwhile).
+ * Returns the number of entries written, or -1 with errno set (cannot open, write error, no memory).
+ */
+int mac_dump_file(const char *path);
+
 /* Entries in use. */
 int mac_size(void);
 

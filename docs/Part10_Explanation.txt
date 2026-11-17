@@ -1,0 +1,251 @@
+=====================================================================
+PART 10 - CONFIG FILE, SIGHUP RELOAD, SIGUSR1 MAC DUMP
+=====================================================================
+
+1. WHAT PART 10 IMPLEMENTS
+--------------------------
+   * ./switch <tcp_port> <num_ports> [-c vswitch.conf]: the settings come from a configuration file (or the defaults of
+     roadmap 2.3 when there is none). A file with ANY bad line is a start-up error (exit status 1, every bad line named).
+   * SIGHUP (the signal thread, sigwait; no handlers): the file is reloaded without a restart. A broken file changes
+     nothing ("reload failed, line N").
+   * SIGUSR1: the MAC table is written to mac_dump_file ("w"): a header with the time, then "vlan mac port age_s".
+   * Settings of later parts (priority queue weights, rate limits, per-port VLAN and rate) are validated, kept in the live
+     configuration and logged when they change, but are NOT applied: those parts do not exist yet (section 5).
+
+Files created:   include/config.h, src/config.c        the pure parser (no globals, no logging)
+                 include/reload.h, src/reload.c        the live configuration, SIGHUP reload, SIGUSR1 handler
+                 tests/test_config.c                   parser unit tests
+                 tests/test_config_signals.py          end-to-end tests (normal, TSan, valgrind)
+                 docs/Part10_Explanation.txt, README.md (the configuration format and usage), notes/bugs.md
+Files modified:  src/switch.c   command line, config load at start-up, log file name
+                 src/sig.c      SIGHUP and SIGUSR1 call reload_config() / dump_mac_table()
+                 src/port.c, include/port.h   config_lock, the live config_t, queue_capacity from the config
+                 src/mactable.c, include/mactable.h   mac_dump_file(); a fix in mac_foreach (section 9)
+                 include/common.h   defaults of the new keys;  Makefile   config and reload objects, test_config rules
+                 tests/test_switch.py, tests/test_shutdown.py  (the two tests that expected the Part 7 placeholders, section 8)
+                 tests/test_mactable.c  a unit test of mac_dump_file;  tests/run_unit.sh, tests/run_all.sh  the new tests
+
+
+2. THE CONFIGURATION ARCHITECTURE
+---------------------------------
+   config.c (pure)
+     config_defaults(&cfg, num_ports)        the defaults of roadmap 2.3 (compile-time overridable like before)
+     config_load(path, &cfg, &err)           the file -> cfg. cfg is changed ONLY if the whole file is good
+     config_mac_buckets(K)                   256, or the largest power of two <= K for a small table
+   The parser knows nothing about the switch: no globals, no threads, no log_msg. That is why it can be unit tested alone
+   (tests/test_config.c, 270 checks) and why a failed load cannot leave anything half done: it works on a private copy
+   (config_t tmp = *cfg) and copies back as the very last step, on success.
+
+   reload.c (the switch side)
+     sw.cfg           the LIVE configuration (config_t in switch_t), protected by sw.config_lock
+     config_install() main(), once, before any other thread: sw.cfg = file's values; publishes the mirrors below
+     config_snapshot() a copy of sw.cfg; the lock is held only while copying
+     reload_config()  SIGHUP        dump_mac_table()  SIGUSR1
+   config_lock is a LEAF lock (roadmap leaf rule): nobody holds it while doing I/O, logging, joining or taking another
+   lock. Readers copy the fields they need and release it. It is initialised in switch_init() and destroyed in
+   switch_destroy() (each exactly once).
+
+   The mirrors. The values that the hot paths read for every frame or every cycle are also published as atomics, as before
+   Part 10: sw.mac_aging_sec (the aging thread reads it once per cycle), sw.max_macs_per_port (every learn), sw.port_wait_sec
+   (the accept thread). A reload writes sw.cfg and these TOGETHER under config_lock. This keeps the Part 6 code and its tests
+   as they were and avoids taking a mutex for every received frame. Everything that is not hot (the dump file name) is read
+   with config_snapshot().
+
+   Start-up order (main): argument check -> config_defaults -> config_load (a bad file exits 1 here: nothing exists yet)
+   -> switch_init -> config_install -> listener -> eventfd -> log_start(log file) -> MAC table of K entries and
+   config_mac_buckets(K) buckets -> threads. The log file is log_file of the configuration; the environment variable
+   VSWITCH_LOG_FILE, if set, overrides it (decision for you in section 12). queue_capacity now comes from the configuration
+   (port_start used a constant), mac_table_size sizes the MAC table.
+
+   Reloadable and startup-only keys (roadmap):
+     reloadable    mac_aging_seconds, max_macs_per_port, port_wait_timeout, wrr_weights, prio_aging_ms, rate_limit,
+                   port.N.vlan, port.N.rate, and mac_dump_file (read at dump time)
+     startup only  mac_table_size, queue_capacity, trunk_port, and log_file (the logger opens it once)
+
+
+3. PARSING (config.c)
+---------------------
+   fgets (512-byte buffer) -> cut at '#' -> trim (also '\r') -> split at the FIRST '=' -> trim key and value -> check the value.
+   Numbers: strtol with errno = 0 before, endptr must be at the end of the string, ERANGE and the allowed range are checked;
+   the text must start with a digit (or '-', which then fails the range), so "30s", "0x10", "1e3", "+7", "3.5" and "99999999999999999999"
+   are all rejected. wrr_weights: split at ',' by hand, so an empty piece ("5,,1") is an error, exactly three weights.
+   A line longer than 510 characters is an error and is skipped to its end, so the line numbers after it stay right.
+   Everything is checked: after an error the parser goes on and collects up to 16 errors (the rest are counted), so one run shows
+   all the bad lines: "line 3: ...; line 7: ...". The error is returned in config_error_t, the caller decides how to log it.
+   The ranges and these rules are MY decisions (the roadmap gives the keys and the format only); they are in the README.
+     mac_aging_seconds 1..86400   mac_table_size 1..65536     max_macs_per_port 1..65536   queue_capacity 1..65536
+     port_wait_timeout 0..3600    prio_aging_ms 1..60000      rate_limit 0..1000000        trunk_port 0..num_ports
+     wrr_weights 3 x 1..1000      port.N.vlan 1..4094         port.N.rate 0..1000000       N in 1..num_ports
+   Also rejected: unknown keys (case sensitive), duplicate keys, a missing '=', a missing key or value, control characters in
+   a file name, a name of 256 characters or more.
+
+
+4. SIGHUP: HOW THE RELOAD WORKS (reload_config, in the signal thread)
+---------------------------------------------------------------------
+   1. No -c: log "nothing to reload", return.
+   2. config_defaults + config_load into a temporary struct (no lock, file I/O). If it fails: log
+      "[ERR] reload failed, line N: ... (K errors); the previous configuration stays in force" and return. NOTHING of the file is
+      applied, not even the lines before the bad one.
+   3. Lock config_lock: copy the old config, copy the reloadable fields of the new one into sw.cfg, store the three atomics,
+      unlock. The startup-only fields of sw.cfg keep their running values.
+   4. With the lock released: log every change ("reload: mac_aging_seconds 300 -> 5 ..."), then every startup-only key that the
+      file now says differently: "reload: mac_table_size = 2048 in the file, running with 1024: ignored until restart"
+      (also queue_capacity, trunk_port, and log_file: "it was 'x' at start"). They are reported again at every reload while
+      the file differs, because they are still not in force. Last line: "configuration reloaded from 'f': N settings changed
+      (mac aging Ts)".
+   Keys that the file no longer mentions return to their defaults (the file is the whole configuration).
+   What takes effect NOW: mac_aging_seconds (the aging thread reads it at its next cycle), max_macs_per_port (the next learn),
+   port_wait_timeout (the next waiting host), mac_dump_file (the next dump).
+
+
+5. WHAT IS NOT APPLIED (and says so)
+------------------------------------
+   The roadmap says VLAN changes go through port_set_vlan() and rate changes through outq_set_rate(), "written fully in" Parts
+   11-13/16. They do not exist yet, and nothing was invented to fill the gap: wrr_weights, prio_aging_ms, rate_limit, port.N.vlan and
+   port.N.rate are validated and stored in the live configuration (so those parts can read them) and each change is logged with
+   "(stored; ... not applied until Part N)". trunk_port is validated and stored; port_t.trunk is not set from it (Part 13).
+   Tests check that the log says "stored", not "applied".
+
+
+6. SIGUSR1: HOW THE MAC DUMP WORKS (dump_mac_table -> mac_dump_file)
+--------------------------------------------------------------------
+   dump_mac_table copies the file name with config_snapshot() (lock released), calls mac_dump_file(path), logs the result.
+   mac_dump_file: fopen(path, "w"), header "# MAC table dump, YYYY-MM-DD HH:MM:SS" and "# vlan mac port age_s", then mac_foreach:
+   for each bucket in turn it takes the bucket lock, copies that bucket's entries, releases the lock, and only THEN calls the callback
+   that writes the lines. So only one MAC lock is held at a time and none during file I/O. Every write error is checked
+   (ferror, fflush, fclose; ENOMEM from mac_foreach): the function returns -1 with errno set, the handler logs
+   "[ERR] SIGUSR1: cannot write the MAC table to 'f': <reason>" and the switch goes on.
+   Consistency: each entry is exact, no entry appears twice (a key lives in one bucket), but the dump is not one atomic snapshot of
+   the whole table: other threads keep changing it while later buckets are copied. This is what the roadmap asks ("buckets are locked one
+   at a time"). The age is in whole seconds (floor of the milliseconds).
+   The Part 6 function mac_dump(FILE *) (labelled format, used by its unit test) is left as it was; mac_dump_file is the Part 10 one.
+
+
+7. LOCKING AND THE SIGNAL THREAD
+--------------------------------
+   Lock order (roadmap 2.6) is unchanged: ports_lock, queue locks, bucket locks, reaper lock, ref lock, logger lock, stats mutex.
+   config_lock is a leaf: it is taken alone, only to copy or swap. reload_config logs after unlocking (log_msg takes the logger
+   lock); dump_mac_table takes bucket locks (one at a time, through mac_foreach) without config_lock. No lock is held across
+   a pthread_join, poll, sem_timedwait or file I/O.
+   The signal thread does the work. While it parses a file or writes a dump it is not in sigwait(); other signals stay pending
+   (identical ones are merged by the kernel: a burst of SIGHUPs is one or a few reloads, and the last state of the file wins).
+   SIGINT during a reload is handled right after it (milliseconds).
+
+
+8. CHANGES TO EXISTING TESTS (not weakened)
+-------------------------------------------
+   * tests/test_shutdown.py test 7 checked that SIGHUP/SIGUSR1 log "not yet implemented" and do not stop the switch (the Part 7
+     placeholders, which the roadmap says Part 10 replaces). It now starts the switch with a configuration and checks that SIGHUP
+     reloads it, SIGUSR1 dumps the table, the switch keeps running, new hosts still connect and traffic is still forwarded (+2 checks).
+   * tests/test_switch.py passed "-c some.conf" with a file that does not exist; that is now a start-up error (as required). The test uses a
+     real file, still checks that -c is accepted and noted, checks that the file's value is in use, and checks that a missing file exits 1.
+   Nothing else was changed: the unit test of the Part 6 mac_dump(FILE *) and all other tests are as they were.
+
+
+9. BUGS FOUND
+-------------
+   * mac_foreach (the walk used by the dump) read the clock ONCE before visiting the buckets. An entry refreshed by traffic while
+     the walk was still on later buckets has a last_seen after that timestamp: the dump printed NEGATIVE ages (-1 ... -11 seconds
+     under valgrind, in the new unit test with 4 threads changing the table). Now the clock is read after each bucket is locked: all
+     entries of that bucket were last seen before that moment (learners refresh last_seen under the same lock), so an age cannot be
+     negative. notes/bugs.md item 19.
+   * No other defect in Parts 1-9 was found. Mistakes in my own tests are listed in notes/bugs.md.
+
+
+10. TESTS (methodology)
+-----------------------
+   tests/test_config.c (270 checks; normal, TSan, valgrind): defaults; the roadmap's example file with every key; comments, tabs,
+     CRLF, no final newline, '=' inside a value; missing file and a directory; 11 bad numbers; lowest and highest value and one outside
+     for every numeric key; 17 unknown or malformed lines; duplicate keys; 16 bad wrr_weights and 2 good; port.N.* (bad port, bad value,
+     duplicates); several bad lines (all reported, right line numbers; 100 bad lines: counted, message never overflows); a failed load
+     never changes the config (valid lines before the bad one included); long lines and exact line-length limits.
+   tests/test_mactable.c, test_dump_file: format and header time, exact vlan/mac/port/age of entries, an empty table, mode "w"
+     (200 junk lines are gone), errors (ENOENT, EISDIR, ENOSPC on /dev/full), and 4 threads learning, aging and flushing while the main
+     thread dumps 60 times: every dump has its header, only whole lines, no entry twice, count = lines; the table is consistent after.
+   tests/test_config_signals.py (end to end with the real switch):
+     1 start-up: the file's values in use (aging, M, K and buckets); no file = defaults; 6 kinds of bad files exit 1 naming the lines and
+       the switch does not start; missing file, directory, "-c" without a name, unknown option, trunk_port above num_ports
+     2 SIGHUP aging: with T = 300 an entry survives 4.5 s of probing; after the reload to T = 3 it ages out and a probe is flooded (the
+       new time is in force without a restart); and the other way (3 -> 300)
+     3 broken file: "reload failed, line 3" and "line 4" named, 2 errors, nothing of the file applied (valid lines before the error neither),
+       T = 3 still in force (behaviour checked), a vanished file ("cannot open"), a fixed file reloads, an empty file = defaults
+     4 startup-only keys: exactly 4 "ignored until restart"; reloadable keys applied; port.N.vlan/rate, rate_limit, wrr_weights,
+       prio_aging_ms reported as "stored ... not applied"; the same file again reports them again and "0 settings changed"
+     5 SIGHUP without -c
+     6 SIGHUP STORM: valid and invalid files alternate every 30 ms while 60,000 frames flow: the flood completes, the last file wins,
+       the only error lines are "reload failed", no torn log line, exit 0
+     7 SIGUSR1: two header lines (the time is checked), the exact entries (vlan 1 and vlan 100 of the same MAC are two entries), ports,
+       ages (whole seconds, growing by 2 s between dumps), mode "w", forwarding still correct afterwards
+     8 unwritable file: error with the reason and the switch lives; a SIGHUP repairs it; default name mac_dump.txt in the working directory
+     9 SIGUSR1 DURING A FLOOD: sequential dumps while 60,000 frames flow: every dump whole, no entry twice, right VLAN, the flooding
+       source's entry stays fresh; exit 0 (no deadlock)
+     10 (valgrind) config + good and bad SIGHUP + SIGUSR1 + traffic + SIGINT: 0 errors, 0 bytes in use, nothing lost, no descriptor open
+     tsan mode: tests 3, 6, 7 and 9 with ./switch_tsan.
+   Mutation check (the tests must be able to fail): SIGHUP that does not publish the aging time (test 2 failed 2 checks); a parser that
+   changes the config on error (test_config failed 3 checks); a dump opened in append mode (test 7 failed 2 checks). Sources restored.
+
+
+11. ACTUAL RESULTS
+------------------
+All numbers below were measured on this machine (Linux 7.0, gcc, valgrind 3.26, ThreadSanitizer with setarch -R).
+
+Build:   make clean && make && make tsan: 0 errors, 0 warnings (-std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread).
+         No sleep()/usleep() in the switch sources; every system and library call that can fail is checked.
+
+make clean && make && make test  (one run on the final files): exit status 0, "All tests passed", 11 of 11:
+   the Parts 1-10 suite (tests/run_unit.sh) and the ten integration scripts of Part 8 (normal variant).
+   Unit and regression tests, all with 0 failures:
+     test_util 95, test_frame 108, test_host 109, test_switch 167 (+2: the -c checks), queue 72, refcount 24 (+ TSan 72 / 24),
+     test_forward 99, test_port 3730 (+ TSan 3730), test_lifecycle 107, test_mactable 366 (+ TSan 366; +14: test_dump_file),
+     test_mac 102, test_shutdown 160 (+2) / 41 (tsan) / 11 (valgrind), test_log 37 (+ TSan 37, + valgrind 37),
+     test_logger 54 / 27 (tsan) / 9 (valgrind)
+   Part 10 tests, all with 0 failures:
+     test_config (parser)                  270 checks   normal, ThreadSanitizer, and valgrind --leak-check=full --track-fds=yes
+                                                        (0 errors, 0 bytes in use at exit, no descriptor open)
+     test_mactable / test_dump_file        366 checks   normal, TSan (15 extra runs each), valgrind (0 errors, 0 leaks)
+     test_config_signals.py                134 checks   normal;  60 checks tsan mode;  13 checks valgrind mode
+   Ten integration scripts (Part 8) with the Part 10 switch, checks passed / 0 failed:
+     variant   forward broadcast slow_host partial midframe_disc. port_full mac_aging mac_move port_security many_hosts
+     normal       24       33        15        9         11           15        10        12         13          19
+     valgrind     28       37        23       13         15           19        14        16         17          27
+     tsan         25       34        17       10         12           16        11        13         14          21
+   (VARIANT=valgrind and VARIANT=tsan ./tests/run_all.sh: rc 0, "All tests passed", 10 of 10 each.)
+   The machine was suspended for about 50 minutes during this run, so no durations are given.
+
+Roadmap completion criteria for Part 10, each tested:
+   * "Edit mac_aging_seconds and send kill -HUP: the log shows the reload and the new aging time takes effect":
+       test 2 of test_config_signals.py: with T = 300 an entry survives 4.5 s of probing; after the reload "mac_aging_seconds 300 -> 3"
+       (and the summary "(mac aging 3s)") the entry ages out and the next probe is flooded; then 3 -> 300 stops the aging again.
+   * "A broken file gives 'reload failed, line N' and no change":
+       test 3: "reload failed, line 3: unknown key 'bogus_key'" (and line 4), "the previous configuration stays in force"; no setting of the broken file
+       is applied, T = 3 is still in force (behaviour), a vanished file is "cannot open", a fixed file reloads.
+   * "kill -USR1 produces a correct dump while traffic flows":
+       tests 7 and 9: header with the time, exact "vlan mac port age_s" lines, sequential dumps during a flood of 60,000 frames (every dump
+       whole, no entry twice), no deadlock, exit 0.
+   * "Clean under TSan": test_config_tsan, test_mactable_tsan (4 threads changing the table while 60 dumps), test_config_signals.py tsan
+       (SIGHUP storm and dumps under traffic): no ThreadSanitizer report.
+   Also tested as requested: valid/missing file, comments and white space, invalid numbers, out-of-range values, unknown keys, malformed
+   wrr_weights, invalid port settings, several invalid lines, a failed load never changes the config (parser and live switch);
+   repeated reloads under traffic; startup-only keys logged "ignored until restart"; valgrind for memory and descriptors.
+
+Mutation check: SIGHUP that did not publish the aging time (2 checks failed), a parser that changed the config on error (3 failed), a dump
+   opened with mode "a" (2 failed); each restored (diff clean).
+Cleanup: after the run: 0 switch/host processes, 0 test directories or FIFOs in /tmp, 0 vgdb pipes, no switch.log or mac_dump.txt in the
+   repository. (Stale processes and temp files left by my own interrupted runs earlier today were killed and removed.)
+
+
+12. LIMITATIONS AND DECISIONS FOR THE USER
+------------------------------------------
+   * Part 10's roadmap completion criteria are verified (section 11): reload with a new aging time takes effect; a broken file gives
+     "reload failed, line N" and no change; SIGUSR1 gives a correct dump while traffic flows; clean under TSan.
+   * The value ranges, the rejection of duplicate keys, "all errors are reported" and "keys not in the file go back to their
+     defaults on reload" are my decisions (section 3, 4). Change them if the course material says otherwise.
+   * VSWITCH_LOG_FILE (from Part 9) is kept and overrides log_file. The tests need it (and the shell scripts of Part 8 do not use a
+     configuration file). Remove it if you do not want an environment variable.
+   * log_file and mac_dump_file are not marked in the roadmap's example. log_file is startup-only (the logger opens it once);
+     mac_dump_file is reloadable (it is read when a dump is made).
+   * Per-port VLAN and rate, rate_limit, wrr_weights, prio_aging_ms and trunk_port have no effect yet (section 5).
+   * A file name cannot contain '#' (it starts a comment) and lines are limited to 510 characters.
+   * A reload reads the file while a test or an operator may be editing it; write it atomically (write a temporary file, then rename) to
+     avoid reading a half written file (which would be rejected as invalid, never half applied).
+   * A dump of a very large table takes the signal thread for a moment (SIGINT waits for it).

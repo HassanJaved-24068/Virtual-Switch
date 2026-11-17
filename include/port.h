@@ -15,6 +15,7 @@
 #include <stdint.h>
 
 #include "common.h"
+#include "config.h"
 #include "queue.h"
 
 /*
@@ -62,7 +63,7 @@ typedef struct {
     /* Free-port semaphore. Invariant: its value + the tokens held by the accept
      * thread = the number of FREE ports. */
     sem_t free_ports;
-    long port_wait_sec;            /* port_wait_timeout: how long a host waits for a port */
+    _Atomic long port_wait_sec;    /* port_wait_timeout: how long a host waits for a port (reloadable) */
 
     /* Reaper queue: FIFO of port ids waiting for teardown (lock order rank 4). */
     pthread_mutex_t reaper_lock;
@@ -86,15 +87,23 @@ typedef struct {
     pthread_mutex_t shutdown_lock;
     pthread_cond_t shutdown_cond;  /* monotonic clock; timed waits wake early on shutdown */
 
-    /* MAC table settings (config options in Part 10). The two reloadable ones are atomic. */
-    int mac_table_size;            /* K */
-    int mac_buckets;               /* power of two */
-    _Atomic long mac_aging_sec;    /* T */
-    _Atomic int max_macs_per_port; /* M */
+    /*
+     * Configuration (Part 10). `cfg` is the live configuration; it is protected by config_lock, a LEAF lock:
+     * readers copy what they need (config_snapshot) and release it at once; nobody does I/O, logging or takes
+     * another lock while holding it. The settings that the hot paths read for every frame or every cycle are
+     * also published as atomics below; a reload writes cfg and these together under config_lock.
+     */
+    pthread_mutex_t config_lock;
+    config_t cfg;
+    int mac_table_size;            /* K          (startup only) */
+    int mac_buckets;               /* power of two, derived from K */
+    int queue_capacity;            /* frames per priority class (startup only) */
+    _Atomic long mac_aging_sec;    /* T          (reloadable) */
+    _Atomic int max_macs_per_port; /* M          (reloadable) */
     void *mac_region;              /* memory of the MAC table (heap now, shared memory in Part 20) */
     pthread_t aging;               /* aging thread */
 
-    const char *config_path;       /* from -c, parsed in Part 10 */
+    const char *config_path;       /* from -c; NULL = no file (the defaults) */
 } switch_t;
 
 extern switch_t sw;

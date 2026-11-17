@@ -486,16 +486,21 @@ int mac_foreach(void (*cb)(const mac_info_t *info, void *arg), void *arg)
         return 0;
 
     mac_entry_t *ents = entries(mt);
-    struct timespec now = now_mono();
     int visited = 0;
 
     for (int i = 0; i < mt->nbuckets; i++) {
         mac_bucket_t *b = &buckets(mt)[i];
         mac_info_t *copy;
+        struct timespec now;
         int n = 0, len = 0;
 
         /* Copy the chain under the lock, call the callback after unlocking. */
         bucket_lock(b);
+        /* "Now" is read AFTER the bucket is locked, once per bucket. A learner refreshes last_seen under this
+         * same lock, so every entry in the bucket was last seen before this moment and its age cannot be
+         * negative. (One timestamp taken before the whole walk gave negative ages: an entry refreshed
+         * while later buckets were still being copied has last_seen later than that timestamp.) */
+        now = now_mono();
         for (int32_t j = b->first; j >= 0; j = ents[j].next)
             len++;
         if (len == 0) {
@@ -536,6 +541,45 @@ int mac_dump(FILE *fp)
 {
     fprintf(fp, "# MAC table: vlan, mac, port, seconds since last seen\n");
     return mac_foreach(dump_line, fp);
+}
+
+/* One line of the Part 10 dump: "vlan mac port age_s". The callback runs with no MAC lock held. */
+static void dump_entry(const mac_info_t *m, void *arg)
+{
+    char text[MAC_STR_LEN];
+
+    mac_format(m->mac, text, sizeof text);
+    fprintf((FILE *)arg, "%u %s %d %ld\n", m->vlan, text, m->port, m->age_ms / 1000);
+}
+
+int mac_dump_file(const char *path)
+{
+    FILE *fp = fopen(path, "w");
+    struct timespec ts;
+    struct tm tm;
+    char when[32] = "unknown-time";
+    int n, err = 0;
+
+    if (fp == NULL)
+        return -1;                                   /* errno is set by fopen */
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0 && localtime_r(&ts.tv_sec, &tm) != NULL)
+        strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
+    fprintf(fp, "# MAC table dump, %s\n# vlan mac port age_s\n", when);
+
+    n = mac_foreach(dump_entry, fp);                 /* one bucket at a time */
+    if (n < 0)
+        err = ENOMEM;
+    if (fflush(fp) != 0 && err == 0)
+        err = errno != 0 ? errno : EIO;
+    if (ferror(fp) && err == 0)
+        err = EIO;
+    if (fclose(fp) != 0 && err == 0)
+        err = errno != 0 ? errno : EIO;
+    if (err != 0) {
+        errno = err;
+        return -1;
+    }
+    return n;
 }
 
 int mac_size(void)

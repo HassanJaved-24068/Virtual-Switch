@@ -216,13 +216,20 @@ def test_sigterm():
 
 
 def test_other_signals():
-    print("7. SIGHUP and SIGUSR1 do not stop the switch")
-    sw = ts.Switch(2)
+    print("7. SIGHUP and SIGUSR1 do not stop the switch (Part 10: they reload the configuration / dump the MAC table)")
+    tmp = tempfile.mkdtemp(prefix="vswsig.")
+    conf = os.path.join(tmp, "v.conf")
+    with open(conf, "w") as f:
+        f.write("mac_dump_file = %s\n" % os.path.join(tmp, "dump.txt"))          # keep the dump out of the repository
+    sw = ts.Switch(2, extra=["-c", conf])
     h = tf.H(sw, ME[0])
-    for sig, name in ((signal.SIGHUP, "SIGHUP"), (signal.SIGUSR1, "SIGUSR1")):
+    for sig, name, text in ((signal.SIGHUP, "SIGHUP", "SIGHUP received: reloading the configuration"),
+                            (signal.SIGUSR1, "SIGUSR1", "SIGUSR1 received: dumping the MAC table")):
         sw.p.send_signal(sig)
-        check(sw.wait_log("%s received: not yet implemented" % name, 5), name + " logged 'not yet implemented'")
+        check(sw.wait_log(text, 5), name + " was handled: '%s'" % text)
         check(sw.p.poll() is None, name + ": switch still running")
+    check(sw.wait_log("configuration reloaded from", 5), "SIGHUP reloaded the configuration")
+    check(sw.wait_log("MAC table dumped to", 5), "SIGUSR1 dumped the MAC table")
     h.say("send bcast still-alive")
     h2 = tf.H(sw, ME[1])
     check(h2.ok, "a new host can still connect")
@@ -232,6 +239,7 @@ def test_other_signals():
     sw.stop()
     h.quit(5)
     h2.quit(5)
+    subprocess.run(["rm", "-rf", tmp])
 
 
 def test_repeated(rounds=40):

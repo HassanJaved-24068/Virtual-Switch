@@ -10,7 +10,7 @@ PROGRAMS      = switch host swctl
 TSAN_PROGRAMS = switch_tsan host_tsan
 
 # Objects that only the switch (and the tests of its internals) need.
-SWITCH_NAMES = port forward mactable sig
+SWITCH_NAMES = port forward mactable sig config reload
 
 OBJ_DIR   = build/obj
 TSAN_DIR  = build/tsan
@@ -74,6 +74,10 @@ $(SMALL_TSAN_DIR)/%.o: src/%.c
 # tests of the switch internals need the switch-only objects too
 build/test_port build/test_mactable: $(patsubst %,$(OBJ_DIR)/%.o,$(SWITCH_NAMES))
 build/test_port_tsan build/test_mactable_tsan: $(patsubst %,$(TSAN_DIR)/%.o,$(SWITCH_NAMES))
+
+# test_config tests the pure parser: it needs only config.o
+build/test_config: $(OBJ_DIR)/config.o
+build/test_config_tsan: $(TSAN_DIR)/config.o
 
 build/test_%_tsan: tests/test_%.c $(TSAN_OBJ)
 	@mkdir -p build

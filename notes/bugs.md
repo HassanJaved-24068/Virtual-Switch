@@ -226,3 +226,27 @@ program that ignores SIGINT.
   the assertion failed; over 5 later runs the baseline dropped 0, 761, 2887, 3129, 5329. Removed; the number is only reported. What
   the requirement needs is still asserted: written + dropped >= frames sent, the stalled-sink run is not slower, and the stalled run
   reports drops in every variant.
+
+## 19. mac_foreach reported negative ages (found by the Part 10 dump test)
+- Symptom: the new `test_dump_file` in tests/test_mactable.c (4 threads learning/aging while the main thread dumps 60 times) failed
+  under valgrind: dump lines like `2 02:00:00:00:00:38 1 -1`, ages from -1 to -11 seconds. It passed under the normal and TSan builds
+  (they are fast enough that the clock does not move far during a walk).
+- Cause: `mac_foreach` (the walk used by `mac_dump_file`, the SIGUSR1 dump) read `now_mono()` ONCE before visiting the buckets. An entry
+  that traffic refreshed while the walk was still copying later buckets has `last_seen` later than that timestamp, so
+  `age_ms = now - last_seen` was negative. On a real switch the dump takes milliseconds, so the error is small, but a negative age
+  is wrong whenever it happens.
+- Fix (src/mactable.c): the clock is read after each bucket's lock is taken, once per bucket. Learners refresh `last_seen` under that same
+  lock, so every entry of the bucket was last seen before that moment and its age cannot be negative. No clamping (a clamp would hide a
+  real ordering error). Existing users of mac_foreach are unaffected.
+- Verification: test_mactable under valgrind (`--track-fds=yes --error-exitcode=1`): 366 checks, 0 failures, 0 errors (it failed 1 of 366 before);
+  normal 15/15 and TSan 15/15 runs clean.
+
+## 20. Mistakes in the first versions of the Part 10 tests (no switch bug)
+- test_config.c built long strings with memset and then called strlen without writing a terminating NUL (undefined behaviour in the test);
+  replaced by a `fill()` helper that always terminates. One expectation was off by one: an unterminated last line of 511 characters is
+  correctly "line too long" (the limit is 510); the test now checks both sides of the exact boundary.
+- test_config.c: for trunk_port the value 9 on an 8-port switch is inside the key's table range but above the port count: it has its own
+  message ("only 8 ports"), the range test now expects that one.
+- test_config_signals.py: a result tuple used with `%` raised TypeError (fixed with `str()`); a draft had checks that could not fail
+  (`... or True`) and a missing precondition (B must send a VLAN 1 frame for the expected four entries): removed / fixed before the
+  first complete run.
