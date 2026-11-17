@@ -39,6 +39,7 @@ fi
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/vswitch.$SCRIPT.XXXXXX") || exit 2
 SWPID=""
 SWLOG=""
+SWERR=""
 PORT=0
 declare -A HPID HFD HRC RFD
 PASS=0
@@ -119,8 +120,9 @@ sw_start() { # sw_start NPORTS [small]  (small = K=4 entries, aging 3 s, at most
     local n=$1 bin=$SW_BIN
     [ "${2:-}" = small ] && bin=$SMALL_BIN
     PORT=$(T python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    SWLOG=$TMPD/switch.$PORT.log
-    "${SW_PRE[@]}" "$bin" "$PORT" "$n" 2>"$SWLOG" &
+    SWLOG=$TMPD/switch.$PORT.log          # the switch's log file (the logger thread writes it)
+    SWERR=$TMPD/switch.$PORT.err          # its stderr: valgrind / ThreadSanitizer reports
+    VSWITCH_LOG_FILE="$SWLOG" "${SW_PRE[@]}" "$bin" "$PORT" "$n" 2>"$SWERR" &
     SWPID=$!
     if ! wait_file "$SWLOG" "listening on TCP port $PORT"; then
         bad "the switch did not start"
@@ -157,16 +159,17 @@ sw_stop() {
     check "the switch exited with status 0 after SIGINT (got $rc)" test "$rc" -eq 0
     check "the log ends with 'shutdown: complete'" test "$(cnt "$SWLOG" 'shutdown: complete')" -eq 1
     check "no [ERR] line in the switch log" test "$(cnt "$SWLOG" '[ERR]')" -eq 0
+    check "nothing on the switch's stderr (the log goes to the log file)" test "$(cnt "$SWERR" '[INFO]')$(cnt "$SWERR" '[ERR]')" = 00
     case "$VARIANT" in
     valgrind)
-        check "valgrind: 0 errors" test "$(cnt "$SWLOG" 'ERROR SUMMARY: 0 errors from 0 contexts')" -eq 1
-        check "valgrind: 0 bytes in use at exit" test "$(cnt "$SWLOG" 'in use at exit: 0 bytes in 0 blocks')" -eq 1
-        check "valgrind: nothing lost" test "$(T grep -cE '(definitely|indirectly|possibly) lost: [1-9]' "$SWLOG")" -eq 0
+        check "valgrind: 0 errors" test "$(cnt "$SWERR" 'ERROR SUMMARY: 0 errors from 0 contexts')" -eq 1
+        check "valgrind: 0 bytes in use at exit" test "$(cnt "$SWERR" 'in use at exit: 0 bytes in 0 blocks')" -eq 1
+        check "valgrind: nothing lost" test "$(T grep -cE '(definitely|indirectly|possibly) lost: [1-9]' "$SWERR")" -eq 0
         check "valgrind: no descriptor left open (besides 0, 1, 2)" \
-              test "$(T grep -cE 'Open (AF_INET socket|file descriptor) ([3-9]|[1-9][0-9])' "$SWLOG")" -eq 0
+              test "$(T grep -cE 'Open (AF_INET socket|file descriptor) ([3-9]|[1-9][0-9])' "$SWERR")" -eq 0
         ;;
     tsan)
-        check "ThreadSanitizer: no report" test "$(cnt "$SWLOG" 'ThreadSanitizer')" -eq 0
+        check "ThreadSanitizer: no report" test "$(cnt "$SWERR" 'ThreadSanitizer')" -eq 0
         ;;
     esac
 }

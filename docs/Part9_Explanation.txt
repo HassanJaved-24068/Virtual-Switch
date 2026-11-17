@@ -1,0 +1,214 @@
+=====================================================================
+PART 9 - THE ASYNCHRONOUS LOGGER THREAD
+=====================================================================
+
+1. WHAT PART 9 IMPLEMENTS
+-------------------------
+Until Part 8 every log_msg() call formatted a line and wrote it to stderr itself, under a mutex. A receiver
+thread that logged a frame therefore waited for the terminal / file / pipe: a slow log slowed the fast path,
+and a blocked log (a full pipe, a stopped terminal) would have stopped the whole switch. Now log_msg() only
+formats the text and copies it into a bounded ring; ONE logger thread writes the lines to switch.log.
+"Logging never slows the fast path": when the ring is full the message is dropped and counted.
+
+Files:   include/log.h, src/log.c          the logger (new internals, same log_msg() API)
+         src/switch.c                      starts the logger, stops it last; takes the file name
+         include/common.h                  DEFAULT_LOG_FILE
+         tests/test_log.c                  unit tests of the logger (normal, TSan, valgrind)
+         tests/test_logger.py              end-to-end tests with the real switch (normal, TSan, valgrind)
+         tests/test_switch.py, tests/lib.sh  read the log file (the shared helpers; see section 9)
+         tests/run_unit.sh, Makefile       the new tests are part of the suite
+         docs/Part9_Explanation.txt, notes/bugs.md
+
+
+2. THE DESIGN (src/log.c)
+-------------------------
+   log_rec_t { struct timespec ts; int level; char text[256]; }
+   a ring of 1024 records, a mutex (qlock), a condition variable (not_empty), the flags running/stopping,
+   the counters dropped (since the last report) and dropped_total. All of it is protected by qlock.
+
+   log_msg(level, fmt, ...)                          never waits for space, never does I/O
+     1. vsnprintf into a local 256-byte buffer       (no lock; longer text is cut to 255 characters)
+     2. clock_gettime(CLOCK_REALTIME)                the timestamp is taken by the CALLER, so it is the time of
+                                                     the event, not the time the line was written
+     3. lock qlock
+     4. if the logger runs and is not stopping:
+            if count < 1024: copy the record into the ring (a copy: nothing points into the caller)
+            else:            dropped++, dropped_total++
+            pthread_cond_signal(not_empty); unlock; return
+     5. otherwise (no logger): unlock and write synchronously to stderr, as in Part 1.
+
+   Logger thread ("logger" in ps -T)
+     loop:  lock; while (ring empty && nothing dropped && !stopping) cond_wait(not_empty)     <- while, never if
+            if (stopping && nothing left) { unlock; exit }
+            pop up to 64 records into a local array, take and reset "dropped"; unlock
+            fprintf every record as "YYYY-MM-DD HH:MM:SS.mmm [LEVEL] text"
+            if records were dropped: one more line "[WARN] N log messages dropped"
+            fflush
+     All I/O is done with no lock held. The lock is held only to copy records.
+
+   log_stop(): set stopping, broadcast not_empty, JOIN the logger. The logger does not exit while anything is
+     left in the ring (or any drops are unreported): it drains everything, then exits. The file is closed.
+   log_start(path): open(path, O_WRONLY|O_CREAT|O_APPEND|O_CLOEXEC), start the thread. EBUSY if running.
+
+
+3. WHY IT IS BUILT THIS WAY
+---------------------------
+   * Never waits: a receiver thread must not stall because of a disk or a pipe. The only waiting left in log_msg
+     is the mutex, held for a few instructions (a copy of 280 bytes).
+   * Drop, do not block: a flood with per-frame logging (every received frame is logged) produces far more lines than
+     any file can take; the cheapest correct behaviour is to drop the excess and say how many. The count is exact:
+     (lines written) + (sum of the "N log messages dropped" lines) = (lines sent). The unit tests check this.
+   * Bounded memory: 1024 x 280 bytes = about 280 KB, a static array (no heap, nothing to free).
+   * Copying the text means no pointer can outlive the caller's buffer (the roadmap's rule).
+   * The condition-variable wait is a while loop on the real predicate under qlock; the signal is sent under
+     the lock (also when a message is dropped, so a logger that is waiting always wakes up to report it).
+   * One thread writes the file, so lines can never interleave, and the order is the order in the ring (the
+     order in which the callers got qlock). Lines of one thread are therefore always in that thread's order.
+   * Timestamps are taken before the lock, so two threads may differ by a few milliseconds from the ring order
+     (the test allows 50 ms; the unit test shows per-thread order is exact).
+
+
+4. LIFE CYCLE AND SHUTDOWN
+--------------------------
+   Start (switch.c main): after signal_setup() (the logger thread inherits the blocked signal mask) and after the
+   listener and wake eventfd exist, BEFORE the first log line ("switch listening ...") and before any other
+   thread. If the log file cannot be opened the switch prints "cannot open the log file" on stderr and exits 1.
+   Stop: log_stop() is the LAST thing main does: after shutdown_switch() (all other threads joined and everything
+   destroyed) and after the line "shutdown: complete". So every message of the shutdown, including the ones of
+   the reaper and the aging thread, reaches the file; the last line of switch.log is "shutdown: complete" (tested).
+   The start-up failure paths (a thread cannot be created, the MAC table cannot be allocated) also call log_stop().
+   Without a running logger (before log_start, after log_stop, and in host, swctl and the unit tests) log_msg()
+   writes to stderr synchronously exactly as before: the API is the same everywhere and nothing has to be changed
+   in the other programs.
+
+
+5. WHERE THE LOG GOES
+---------------------
+   switch.log in the working directory (the roadmap's default; "log_file" in the config of Part 10), opened with
+   O_APPEND: an existing file is kept and new lines are added.
+   Until Part 10 reads the config there is ONE small extra: the environment variable VSWITCH_LOG_FILE names another
+   file. It is needed by the tests (every test run must have its own file; otherwise they would all append to one
+   switch.log in the repository, tens of megabytes per flood) and is NOT in the roadmap. Part 10's config key log_file
+   can replace it; if the roadmap's author wants no environment variable it can be removed together with the
+   tests' use of it (the helpers set it in one place each).
+   stderr now carries only what is not a log line: start-up errors (bad arguments, bind failure, cannot open the log
+   file) and the reports of valgrind and ThreadSanitizer. Normal operation writes nothing to stderr.
+
+
+6. LOCK ORDER
+-------------
+   Global order (roadmap 2.6): 1 ports_lock, 2 queue locks, 3 bucket locks, 4 reaper lock, 5 frame ref_lock,
+   6 LOGGER LOCK (qlock), 7 stats mutex. log_msg() takes qlock, so it may be called while holding locks of rank 1-5
+   (after them in the order) but never while holding the stats mutex (7). The code still logs after releasing the
+   locks wherever it did before. qlock is a leaf: nothing else is locked while it is held, and the logger does all
+   its I/O with it released. The synchronous fallback has its own leaf mutex (sync_lock).
+
+
+7. WHAT CHANGED FOR THE OTHER CODE AND THE TESTS
+------------------------------------------------
+   * Behaviour: the per-frame lines "port N: RX src=... dst=..." are logged for EVERY received frame (as before; there is
+     no debug level yet) and under a fast flood many of them are now DROPPED. That is the intended trade ("messages
+     are dropped instead"). A test can no longer count RX lines to count frames: tests/test_switch.py (the 3000-frame
+     test) now checks that each frame is logged OR counted in a "N log messages dropped" line.
+   * The Switch helper of the Python tests and tests/lib.sh give each switch its own log file (VSWITCH_LOG_FILE) and keep
+     stderr separate; valgrind/TSan checks read stderr, log checks read the log file.
+   * New checks in the shell scripts' sw_stop: nothing on stderr during normal operation.
+   * The thread count test of Part 3 expects one more thread ("logger").
+
+
+8. TESTS (methodology)
+----------------------
+   tests/test_log.c (37 checks; also build/test_log_tsan and valgrind):
+     - without a logger: log_msg writes to stderr (checked in a forked child), log_stop() is harmless
+     - start (EBUSY on a second start; ENOENT for a bad path), 3 levels, exact line format with a regular expression-like
+       parse, O_APPEND keeps old content, a second run appends
+     - a 3000-character message is cut to 255, "%" in the arguments is safe
+     - 8 threads x 5000 messages: every line is whole, each thread's lines are in order, written + reported dropped =
+       sent, and the reported number equals log_dropped_total()
+     - log_stop drains: 1000 queued messages are all written, in order, and the last message is the last line
+     - STALLED SINK: the log file is a FIFO that nobody reads. 200,000 log_msg calls return in about 0.02 s while the
+       logger is blocked; 198,400 were dropped; after the reader starts, written + reported = 200,000 exactly.
+   tests/test_logger.py (end to end, the real switch):
+     1 events: connect, disconnect, MAC moved and port security are in switch.log; every line has the timestamp and level
+       format; timestamps do not go backwards by more than 50 ms; the last line is "shutdown: complete"; stderr is empty
+     2 the default file switch.log in the working directory; two runs append (not truncate); stderr empty
+     3 an unusable log path is a clean start-up error (exit 1, message on stderr)
+     4 FLOOD OF 100,000 FRAMES with per-frame logging: S sends 100,000 unicast frames for B and then a marker frame for M;
+       the time until M prints the marker is the time the switch needs for all frames. Baseline: log on disk. Then the
+       same with the log file a FIFO that nobody reads. The stalled log must not slow the switch (<= 2.5 x + 2 s), B must
+       still receive, and each frame must be logged or counted as dropped. Afterwards the FIFO is read: the dropped line
+       is there, the shutdown messages are there, exit status 0.
+     5 SIGINT during a flood, three rounds: exit 0, no torn line, "shutdown: complete" written.
+     6 (valgrind) 0 errors, 0 bytes in use at exit, nothing lost, no descriptor open at exit (the log file was closed).
+     tsan mode: tests 4 and 5 with ./switch_tsan (30,000 frames).
+   The whole Parts 1-8 suite (tests/run_unit.sh + the ten integration scripts in normal, valgrind and tsan variants) was
+   run again: see section 10.
+
+
+9. BUGS AND MISTAKES FOUND
+--------------------------
+   No defect was found in the logger itself. Mistakes in the tests and one real behaviour change are in notes/bugs.md
+   (items 15-17): the Part 3 test that assumed every frame is logged; my first flood measurement (sendall returns
+   before the switch has done anything, and SIGINT came before the switch had read everything); a startup race in the
+   flood helper under TSan; valgrind's file-descriptor report for a forked test child.
+
+
+10. ACTUAL RESULTS
+------------------
+All numbers below were measured on this machine (Linux 7.0, gcc, valgrind 3.26, ThreadSanitizer with setarch -R).
+
+Build:   make clean && make && make tsan (+ switch_small, test_log, test_log_tsan): 0 errors, 0 warnings
+         (-std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread). No sleep()/usleep() in the switch sources.
+
+Part 9 tests (all passed):
+   tests/test_log.c          37 checks, 0 failures: normal (run many times), ThreadSanitizer (6 runs, no report),
+                             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all
+                             --error-exitcode=1 --track-fds=yes (3 runs: 0 errors in both processes, 0 bytes in use at exit)
+   tests/test_logger.py      normal 55 checks; tsan mode 27 checks (3 extra runs); valgrind mode 9 checks
+                             (0 errors, 0 bytes in use at exit, nothing lost, no descriptor open at exit)
+   Measured in them:
+     unit, stalled sink:  200,000 log_msg calls in 0.02 s while the logger was blocked (a blocking log_msg would never
+                          have returned); 198,400 dropped, 1,600 written, and written + reported dropped = 200,000 exactly
+     unit, 8 threads:     40,000 messages: every line whole, each thread's lines in order, written + reported dropped = sent
+     switch, 100,000-frame flood with per-frame logging, switch.log on disk:  1.4-1.5 s until the marker frame;
+                          about 89,000-93,000 RX lines written, 7,000-11,000 counted as dropped (written + dropped >= 100,000)
+     the same flood, log file = a FIFO nobody reads:  0.75-1.0 s until the marker (NOT slower; the logger is blocked
+                          and the receivers never wait); after the FIFO is read the "N log messages dropped" line and the
+                          shutdown messages are in the file, exit status 0
+     longest message the switch logs: 74 characters (the record holds 255)
+
+Regression (everything of Parts 1-8 plus the new tests):
+   ./tests/run_all.sh (the Parts 1-9 suite = tests/run_unit.sh, then the ten Part 8 scripts), two full runs on the final
+   files: both rc 0, "All tests passed" (456 s and 464 s). They include: unit tests of Parts 1-7, the TSan unit tests,
+   test_switch 165 checks, test_forward 99, test_lifecycle 107, test_mac 102, test_shutdown 158 / 41 (tsan) / 11 (valgrind),
+   test_log, test_logger, and the ten integration scripts in the normal variant.
+   The ten scripts in the valgrind and tsan variants (VARIANT=valgrind / VARIANT=tsan) were run twice each with the final
+   sources: 10 of 10 passed in every one of those four runs, and 10 of 10 twice more in the normal variant without the
+   unit suite. (Those four runs were made before the test-only changes to tests/test_forward.py, which is a normal-variant
+   unit test; src/ did not change after them.)
+   An earlier full run FAILED in tests/test_forward.py (section 9, notes/bugs.md item 15); after the test was
+   corrected it passed 5 of 5 times alone and in both full runs.
+Cleanup: after the runs there were 0 switch/host processes, 0 test directories or FIFOs in /tmp, 0 vgdb pipes and no
+   switch.log in the repository. (Stray /tmp/tmp*.log files left by my own interrupted or crashed runs were removed.)
+
+
+
+11. LIMITATIONS AND DECISIONS FOR THE USER
+------------------------------------------
+   * VSWITCH_LOG_FILE is an addition that the roadmap does not have (section 5). Decision for you: keep it until Part 10
+     or remove it.
+   * Text is cut at 255 characters (the roadmap's record size). The longest message the switch logs today is 74
+     characters. Part 10's MAC dump goes to its own file, not through log_msg.
+   * IMPORTANT LINES CAN BE DROPPED TOO. The ring does not know which lines matter: during a flood the per-frame INFO
+     lines fill it and a WARN (a port security event, a first "queue full") can find the ring full and be dropped like any
+     other line. The count "N log messages dropped" tells that something was lost, not what. The roadmap's design is
+     followed as written; if the events matter more than the per-frame lines, a later change could reserve room for
+     WARN/ERR or let the per-frame line be switched off (Part 10 config). The tests that look for single warning lines
+     under a flood were written for this (for example "not logged twice" instead of "logged exactly once").
+   * Under a flood most per-frame lines are dropped. There is no debug level yet: "per-frame debug logging enabled" in
+     the roadmap's completion criteria is the existing per-frame RX line, which is always on; a switch to turn it off
+     belongs to the config (Part 10).
+   * A write error on the log file (disk full) is reported once on stderr; the logger keeps going.
+   * No log rotation. The file grows; the log of a long flood can be tens of megabytes.
+   * After log_stop() log_msg() writes to stderr again (nothing is lost, but the line is not in switch.log).
+   * No public test files exist for this project (see docs/Part8_Explanation.txt, section 6; the TA's answer is pending).

@@ -1,10 +1,10 @@
 #!/bin/bash
-# Parts 1-7 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-9 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
-        build/test_port_tsan build/test_mactable_tsan || exit 1
+        build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -41,4 +41,13 @@ else
     echo "valgrind not installed: skipping the Part 7 valgrind test"
 fi
 
-echo "Parts 1-7 tests passed."
+run ./build/test_log                      # Part 9: logger unit tests (format, append, truncation, 8 threads, drain, stalled sink)
+run $NOASLR ./build/test_log_tsan         # Part 9: the same under ThreadSanitizer
+run python3 tests/test_logger.py          # Part 9: switch.log, default file, 100k-frame flood with a stalled log file
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_logger.py tsan   # Part 9: flooding + SIGINT under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_logger.py valgrind                              # Part 9: no errors, no leaks, log file closed
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_log
+fi
+
+echo "Parts 1-9 unit and regression tests passed."

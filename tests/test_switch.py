@@ -2,8 +2,9 @@
 """
 Part 3 end-to-end tests for ./switch (listener, port table, receiver threads).
 
-The switch writes its log to stderr; every test sends that to a file and
-reads the lines back. Hosts are the real ./host program, or raw Python
+The switch writes its log to a file (Part 9: the logger thread; VSWITCH_LOG_FILE names it) and
+sanitizer / valgrind reports go to stderr; every test gives each its own file and reads the
+lines back (Switch.log() returns both). Hosts are the real ./host program, or raw Python
 sockets when a test needs to send something a normal host never would.
 
 Environment: SWITCH (default ./switch), HOST (default ./host). To test the
@@ -48,21 +49,25 @@ def frame(src, dst, vlan, prio, payload, length=None):
 class Switch:
     def __init__(self, num_ports, port=None, extra=(), nofile=None, cmd=None):
         self.port = port or free_port()
-        self.logf = tempfile.NamedTemporaryFile("w+b", suffix=".log", delete=False)
+        self.logf = tempfile.NamedTemporaryFile("w+b", suffix=".log", delete=False)   # the switch's log file
+        self.errf = tempfile.NamedTemporaryFile("w+b", suffix=".err", delete=False)   # its stderr
+        env = dict(os.environ, VSWITCH_LOG_FILE=self.logf.name)
         pre = None
         if nofile:
             def pre():
                 resource.setrlimit(resource.RLIMIT_NOFILE, (nofile, nofile))
         self.p = subprocess.Popen(shlex.split(cmd or SWITCH) + [str(self.port), str(num_ports)] + list(extra),
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                  stderr=self.logf, preexec_fn=pre)
+                                  stderr=self.errf, env=env, preexec_fn=pre)
         self.hosts = []
         if not self.wait_log("listening on TCP port %d" % self.port, 10):
             raise RuntimeError("switch did not start; log:\n" + self.log())
 
     def log(self):
         with open(self.logf.name, "rb") as f:
-            return f.read().decode(errors="replace")
+            text = f.read().decode(errors="replace")
+        with open(self.errf.name, "rb") as f:
+            return text + f.read().decode(errors="replace")
 
     def count(self, text):
         return self.log().count(text)
@@ -115,7 +120,9 @@ class Switch:
         check("ThreadSanitizer" not in log and "Sanitizer" not in log,
               "no sanitizer report in the switch log")
         self.logf.close()
+        self.errf.close()
         os.unlink(self.logf.name)
+        os.unlink(self.errf.name)
         return alive
 
 
@@ -208,13 +215,14 @@ def test_three_hosts():
     check(names.count("accept") == 1, "ps -T shows exactly one accept thread")
     txs = sorted(t for t in names if t.startswith("tx-port"))
     check(txs == ["tx-port1", "tx-port2", "tx-port3"], "ps -T shows one sender per host: %s" % txs)
-    others = [t for t in names if t not in ("accept", "reaper", "aging", "signal") and not t.startswith(("rx-port", "tx-port"))]
+    others = [t for t in names if t not in ("accept", "reaper", "aging", "signal", "logger") and not t.startswith(("rx-port", "tx-port"))]
     # the main thread; the TSan build has one extra runtime thread with the same name
     check(names.count("reaper") == 1, "ps -T shows exactly one reaper thread")
     check(names.count("aging") == 1, "ps -T shows exactly one aging thread")
     check(names.count("signal") == 1, "ps -T shows exactly one signal thread (Part 7)")
-    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 4 + 6 + len(others),
-          "main + accept + reaper + aging + signal + 3 receivers + 3 senders (+TSan helper), got %s" % names)
+    check(names.count("logger") == 1, "ps -T shows exactly one logger thread (Part 9)")
+    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 5 + 6 + len(others),
+          "main + accept + reaper + aging + signal + logger + 3 receivers + 3 senders (+TSan helper), got %s" % names)
 
     d = sw.host(ME[3])
     check(d is not None and "port 4: host connected" in sw.log(), "fourth host -> port 4")
@@ -375,13 +383,30 @@ def test_port_full():
     sw.stop()
 
 
+def logged_and_dropped(sw, text):
+    """(lines containing `text`, messages reported as dropped by the logger)."""
+    log = sw.log()
+    dropped = sum(int(n) for n in re.findall(r"(\d+) log messages dropped", log))
+    return log.count(text), dropped
+
+
 def test_flood_log():
     print("switch: 3000 frames from one host")
     sw = Switch(4)
     h = sw.host(ME[0], "--flood", "3000", "--to", "bcast")
-    check(sw.wait_log("port 1: RX", 20, 3000), "all 3000 frames logged")
-    time.sleep(0.2)
-    check(sw.count("port 1: RX") == 3000, "exactly 3000, no duplicates")
+    # Part 9: the logger never slows the receiver down, so a fast flood may overflow its ring
+    # (1024 records) and some per-frame lines are DROPPED (and counted). Every frame must be
+    # either logged or counted as dropped; none may be logged twice.
+    end = time.time() + 20
+    while time.time() < end:
+        n, d = logged_and_dropped(sw, "port 1: RX")
+        if n + d >= 3000:
+            break
+        time.sleep(0.05)
+    time.sleep(0.3)
+    n, d = logged_and_dropped(sw, "port 1: RX")
+    check(n + d >= 3000, "each of the 3000 frames is logged or counted as dropped (%d logged, %d dropped)" % (n, d))
+    check(n <= 3000, "no frame is logged twice (%d RX lines)" % n)
     sw.stop()
 
 

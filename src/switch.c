@@ -13,6 +13,8 @@
  *
  * Part 7: a signal thread (sigwait) turns SIGINT/SIGTERM into request_shutdown();
  * main waits for it and then runs the shutdown sequence (see shutdown_switch()).
+ * Part 9: log_msg() queues its lines for one logger thread that writes the log file;
+ * it starts before the first log line and is the last thread to stop.
  */
 #include "common.h"
 #include "frame.h"
@@ -410,6 +412,17 @@ int main(int argc, char **argv)
     sw.listen_fd = make_listener((int)tcp_port);
     CHECK(sw.wake_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
 
+    /* The logger: from here on log_msg() is queued and written to the log file by its own thread.
+     * (Part 10 takes the file name from the config; until then switch.log, or $VSWITCH_LOG_FILE.) */
+    const char *log_path = getenv("VSWITCH_LOG_FILE");
+    if (log_path == NULL || *log_path == '\0')
+        log_path = DEFAULT_LOG_FILE;
+    rc = log_start(log_path);
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot open the log file '%s': %s\n", log_path, strerror(rc));
+        return EXIT_FAILURE;
+    }
+
     log_msg(LOG_INFO, "switch listening on TCP port %ld with %ld ports", tcp_port, num_ports);
     if (config != NULL)
         log_msg(LOG_INFO, "config file: %s (not used until Part 10)", config);
@@ -419,9 +432,15 @@ int main(int argc, char **argv)
     sw.mac_region = malloc(mac_size);
     if (sw.mac_region == NULL) {
         fprintf(stderr, "switch: cannot allocate the MAC table\n");
+        log_stop();
         return EXIT_FAILURE;
     }
-    CHECK_PT(mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets));
+    rc = mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets);
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot initialise the MAC table: %s\n", strerror(rc));
+        log_stop();
+        return EXIT_FAILURE;
+    }
     log_msg(LOG_INFO, "MAC table: %d entries, %d buckets, aging %lds, at most %d MACs per port",
             sw.mac_table_size, sw.mac_buckets, atomic_load(&sw.mac_aging_sec),
             atomic_load(&sw.max_macs_per_port));
@@ -462,6 +481,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "switch: cannot start the %s thread: %s\n", failed, strerror(rc));
         request_shutdown();
         shutdown_switch(&st);
+        log_stop();                        /* the last thread: the messages above are written first */
         return EXIT_FAILURE;
     }
 
@@ -474,5 +494,6 @@ int main(int argc, char **argv)
 
     shutdown_switch(&st);
     log_msg(LOG_INFO, "shutdown: complete");
+    log_stop();                            /* the logger is the LAST thread to stop: it writes everything above */
     return EXIT_SUCCESS;
 }

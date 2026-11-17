@@ -161,3 +161,46 @@ program that ignores SIGINT.
   60 % bound is inside the noise there. The count threshold is now 30 % in every variant (a 60 % bound then failed once in 16 normal runs too:
   D 4340 vs 7392, so the counts are noisy everywhere, not only under valgrind). The time check (A's flood is not slower than 2.5 x the baseline + 2 s) is unchanged and passed in all
   runs; it is the actual head-of-line test.
+
+## 15. Part 3 test assumed that every received frame is logged (found in Part 9)
+- Symptom: `tests/test_switch.py` "3000 frames from one host" failed intermittently ("all 3000 frames logged") as soon as
+  the logger was asynchronous.
+- Cause: not a switch defect. The test counted the per-frame "port 1: RX" lines to count frames. With the Part 9 logger a
+  fast flood overflows the 1024-record ring and the excess lines are DROPPED on purpose and counted ("N log messages
+  dropped"). Before Part 9 the receiver was slowed down by synchronous logging, so every line was written.
+- Fix: the test now checks that each frame is either logged or counted as dropped (logged + dropped >= 3000) and that
+  none is logged twice. Passed 3 of 3 afterwards, and in the full suite.
+- The same assumption was in `tests/test_forward.py` (found by the first full run of the Part 9 suite: it failed, and
+  took 1048 s because each wait ran into its 240 s timeout):
+  * `run_hol` and `test_dropped_frames_are_counted_and_released` waited until N lines "port X: RX" were logged; with
+    drops that never happens. They now use `processed()` = lines written + lines reported as dropped.
+  * Absolute counts that only held because synchronous logging throttled the sender: "B and D received >= 50 % of
+    100,000 frames" (they now get 30-75 %, identical runs differ by 2x: the fast hosts' own 64-frame queues overflow
+    now that A's receiver is faster) and "B received >= 2000 frames" (986 once). Replaced by the real criteria: the flood
+    with the frozen host takes about as long as without it (unchanged, never close to failing), B and D keep >= 40 % of
+    their baseline and >= 10 % of N, and B still receives a marker frame after the other host was killed.
+  * "the first drop was logged exactly once" became "not logged twice": under a flood the logger can drop that one
+    warning line itself (a real consequence of the design, see docs/Part9_Explanation.txt, limitations).
+  * test_forward.py passed 5 of 5 runs afterwards.
+
+## 16. Mistakes in the first versions of the Part 9 flood test
+- `sendall()` of 100,000 frames returned in 0.00 s: it returns when the kernel has the data, not when the switch has
+  processed it, so "time to send" measured nothing. The test now sends a marker frame to a second host after the flood
+  and measures the time until that host prints it (= the switch has handled every frame before it).
+- SIGINT was sent 0.5 s after the send, before the switch had read everything: 12,211 frames were neither logged nor
+  dropped (they were never read: the connection was torn down). Fixed by the marker: SIGINT only after the marker.
+- The test assumed the raw sender gets port 3, but the port depends on which process connects first (TSan runs: 1 RX line
+  counted). It now counts the lines by the sender's source MAC.
+- Under TSan the hosts' hello broadcasts were sometimes sent before the (slow) switch had brought the raw sender's port
+  up, so the helper waited for nothing. The hosts now announce again until the sender has seen both.
+- Under TSan the baseline run (30,000 frames) drops nothing because the TSan switch is slow enough for the logger to keep
+  up; the "drops happen" check is only made for the fast variants (the stalled-sink check requires drops everywhere).
+
+## 17. valgrind --track-fds reported the test's own descriptors (Part 9)
+- `test_log` under `valgrind --track-fds=yes --error-exitcode=1` reported "1 errors": fd 2 after the test redirected stderr
+  with dup2 to capture it. Then, after moving the redirection into a forked child, the child (also run by valgrind)
+  exited with open descriptors and its non-zero status failed the test (3 of 3 runs).
+- Fix: the child closes the descriptors it opened before `_exit`. The test now passes under valgrind with all flags
+  (0 errors in both processes, 0 bytes in use at exit), 3 of 3 runs.
+- Not a logger defect: the logger's own file descriptor is closed by log_stop() (the end-to-end valgrind test checks that no
+  descriptor is open at exit).

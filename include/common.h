@@ -45,6 +45,8 @@
 #endif
 #define DEFAULT_PRIO_AGING_MS 200     /* low-priority aging */
 #define DEFAULT_VLAN 1
+#define DEFAULT_LOG_FILE "switch.log" /* config log_file (Part 10); until then the environment
+                                       * variable VSWITCH_LOG_FILE may name another file */
 
 #define MAC_LEN 6                     /* bytes in a MAC address */
 #define MAC_STR_LEN 18                /* "aa:bb:cc:dd:ee:ff" + '\0' */
