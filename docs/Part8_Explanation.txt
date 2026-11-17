@@ -1,0 +1,271 @@
+=====================================================================
+PART 8 - CHECKPOINT: TIER 1 INTEGRATION AND HARDENING
+=====================================================================
+
+1. PURPOSE
+----------
+Parts 1-7 delivered the five mandatory (Tier 1) items: the wire protocol, no
+head-of-line blocking, shared reference-counted frames, the concurrent MAC table,
+and the port limit with its lifecycle. Each part was tested alone. Part 8 tests them
+TOGETHER, from the outside, the way a user or a grader does: real ./switch and
+real ./host processes, driven by shell scripts, ended with SIGINT, and run three
+ways (normal, under valgrind, with ThreadSanitizer). No feature was added. The
+switch sources were not changed in this part (see section 7).
+
+Methodology. There is no official public test facility for this project: the course staff (the TA) test
+the submitted project themselves. The roadmap's "released public tests" therefore do not exist, and nothing
+was waited for or imitated. Instead the project has its OWN integration tests, written from the project
+requirements and the roadmap: forwarding decision (Part 6), flooding and no head-of-line blocking (Part 4),
+frame sharing (Part 4), the wire protocol (Part 2), the port limit and lifecycle (Part 5), signals and shutdown
+(Part 7). They are internally developed tests; they are not, and must not be presented as, official public
+tests. Each requirement is tested from the outside with real processes; the internals are covered by the
+unit tests of Parts 1-7 (tests/run_unit.sh), which this part keeps and runs.
+
+Files:   tests/lib.sh                     shared helpers (sourced by the scripts)
+         tests/forward.sh broadcast.sh slow_host.sh partial.sh midframe_disconnect.sh
+         tests/port_full.sh mac_aging.sh mac_move.sh port_security.sh many_hosts.sh
+         tests/run_all.sh                 the runner (new)
+         tests/run_unit.sh                the Parts 1-7 suite (the old run_all.sh, unchanged apart from its name)
+         Makefile                         switch_small_tsan, test-valgrind, test-tsan
+
+
+2. HOW TO RUN
+-------------
+   ./tests/run_all.sh                     normal: Parts 1-7 suite, then the ten scripts
+   VARIANT=valgrind ./tests/run_all.sh    the ten scripts, switch under valgrind
+   VARIANT=tsan ./tests/run_all.sh        the ten scripts, ThreadSanitizer build
+   ./tests/run_all.sh forward mac_move    only these scripts
+   bash tests/forward.sh                  one script on its own (VARIANT=... works too)
+   make test | make test-valgrind | make test-tsan      the same three
+   make clean && make && make tsan        builds (the scripts need: all switch_small, and for
+                                          tsan switch_tsan switch_small_tsan; run_all.sh builds them)
+Exit status is 0 only if everything passed; run_all.sh lists the failed scripts at the end.
+Set KEEP=1 to keep a script's temporary directory (switch log, host outputs) after a run.
+
+
+3. THE TEN SCRIPTS
+------------------
+Each script starts its own switch in the background on a free port, waits for the
+"listening" log line, starts hosts, checks, sends SIGINT, waits for the exit, checks the
+exit status (0), "shutdown: complete", no [ERR] line, and the variant-specific checks.
+
+ 1 forward.sh      Our own forwarding test (roadmap Part 6: forwarding decision and its scenario "A -> C is
+                   flooded until C has sent once, then only C gets it"). 4 hosts. A -> C before C has sent is
+                   flooded (B, C, D get it; A does not get its own frame). After C has sent once, A -> C reaches
+                   only C; the reverse C -> A too; the same for B -> D. 40 unicast frames in a ring: every host gets
+                   exactly its 10, none seen by a third host, in the order sent. Header fields survive (vlan 100,
+                   prio 2); a 1500-byte and an empty payload arrive intact and unicast. FILTER: a frame for a
+                   MAC behind the ingress port (A -> A) is dropped, not flooded. A host that leaves is forgotten: a
+                   frame for its MAC is flooded again.
+ 2 broadcast.sh    Our own broadcast test (roadmap Part 4 flooding; Part 6 decision). 5 ports, 4 hosts send 5
+                   broadcasts each at the same time: each host receives exactly 15 frames, 5 from each other host,
+                   none of its own. A multicast frame is flooded like a broadcast. Empty, 1500-byte and vlan 4094 /
+                   prio 0 broadcasts arrive intact at every other host. A raw frame whose SOURCE is the broadcast
+                   address is dropped; one whose source is a multicast address is forwarded. While H1 broadcasts 40
+                   frames, 5 other hosts connect and leave: the stable hosts get exactly the 40. A host that left no
+                   longer receives. (That a broadcast frame is shared, not copied, per port is not visible from
+                   outside: it is tested by tests/test_refcount.c, and the valgrind variant would show a frame
+                   that is never freed or freed twice.)
+ 3 slow_host.sh    A floods 8000 broadcast frames of 1000 bytes. Run 1: C reads (baseline).
+                   Run 2: C is --noread. Checks: C's queue fills and "output queue full" is
+                   logged (frames dropped); A's flood is not slower than 2.5 x the baseline + 2 s;
+                   B and D keep at least 30 % of their baseline count (counts are noisy; see section 7); SIGINT
+                   with the slow host still connected and its queue full shuts down cleanly.
+                   The comparison is relative on purpose (the roadmap says "about the same as
+                   without C"); the time check is the real head-of-line test (section 7).
+ 4 partial.sh      A sends one byte at a time (--partial): frames of 5, 200, 0 and 5 bytes arrive
+                   intact and in order next to the frames of a normal sender. A raw TCP sender
+                   writes "frame 1 + 8 bytes of frame 2" in one write and the rest later: both
+                   frames and the next one arrive whole.
+ 5 midframe_disconnect.sh   A host dies in the middle of a frame (--die-midframe): "truncated frame" is
+                   logged, port 3 is reclaimed, nothing of the half frame is delivered, A and B
+                   keep talking, the next host gets port 3 again; the same three more times.
+ 6 port_full.sh    2 ports full: a third host waits, then gets SWITCH FULL after about 5 s
+                   (exit status 2, "SWITCH FULL" printed). When a host leaves, the next one gets
+                   its port at once (the token came back). A waiting host gets a port that is
+                   freed within the 5 s. The switch is then full again.
+ 7 mac_aging.sh    (switch_small: T = 3 s) C is learned; A -> C is unicast. C stays silent; A
+                   keeps probing; the first probe that reaches B (= C's entry is gone, the
+                   frame is flooded) arrives after about 4 s (checked: between 2 and 10 s). When C talks again it
+                   is relearned and unicast resumes.
+ 8 mac_move.sh     MAC X on port 1; a second host with the same MAC X connects on port 4 and sends:
+                   "MAC moved: X vlan 1 port 1 -> 4" is logged once; unicast to X now goes to
+                   port 4 only; X then moves back to port 1 (logged too).
+ 9 port_security.sh   (switch_small: M = 3) A raw connection sends from 3 source MACs (all forwarded),
+                   the 4th disables the port: "port 3 shut down: MAC flooding" and "port is
+                   DISABLED" are logged, the frame is not forwarded, A and B keep talking (no
+                   deadlock), the disabled port is not handed out again (the next host gets
+                   port 4, then the switch answers SWITCH FULL). The host program always uses
+                   its own MAC as source, so this script uses a raw /dev/tcp connection.
+10 many_hosts.sh   Run 1: 32 hosts start at once on a 32-port switch: each port 1..32 is given to
+                   exactly one host, every host receives the 31 broadcasts of the others. Run 2:
+                   32 hosts on a 30-port switch: 30 connect; the other 2 are answered SWITCH FULL
+                   (status 2) ONE AFTER THE OTHER, 5 s each (10 s in total): the accept thread handles
+                   one waiting host at a time (roadmap Part 5, "simple and deterministic"); the 30
+                   stay functional (29 broadcasts each); no port 31 is ever used.
+                   Only 2 excess hosts are used because 8 would need 40 s, longer than the
+                   30 s limit of one wait.
+
+
+4. VARIANTS
+-----------
+VARIANT is read by tests/lib.sh and decides what "the switch" is:
+   normal     ./switch (and ./switch_small for scripts 7 and 9).
+   valgrind   valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all
+              --error-exitcode=1 --track-fds=yes ./switch. After SIGINT the script checks: exit
+              status 0 (valgrind returns 1 on an error or a leak), "ERROR SUMMARY: 0 errors",
+              "in use at exit: 0 bytes in 0 blocks", nothing definitely/indirectly/possibly lost,
+              no descriptor besides 0-2 open at exit. Part 7's clean shutdown makes this possible.
+   tsan       setarch -R ./switch_tsan (and ./switch_small_tsan). setarch -R switches address-space
+              randomisation off for that process; this kernel needs it for TSan (as in Parts 4-7).
+              The script checks that the log has no "ThreadSanitizer" report; exit status 0
+              (TSan would exit with 66). Separate objects in build/tsan and build/small_tsan.
+The hosts are always the normal ./host: only the switch is the object of the test.
+A TSan binary is never run under valgrind.
+Makefile: new target switch_small_tsan (the same -DDEFAULT_... settings as switch_small plus
+-fsanitize=thread, objects in build/small_tsan), part of "make tsan"; test-valgrind and
+test-tsan; "make clean" removes it. Flags, object directories and all other targets are unchanged.
+
+
+5. TIMEOUTS, PROCESSES, FIFOs
+-----------------------------
+ * Every external command in the scripts goes through T = "timeout 30" (grep, sleep,
+   sed, python3, head, tail, cat ...). Every wait loop (wait_file, wait_gone, the host exits,
+   the switch's exit) gives up after 30 s and the check fails. TMO changes the 30.
+ * Polling loops use "timeout 30 sleep 0.02" between tests of a condition (a log line, a
+   process gone). There is no other way for a shell to wait for text in a file; none of the
+   waits is a fixed delay that a test depends on. The only deliberate pause is 0.1 s in partial.sh
+   (to let TCP deliver the first half of a cut frame before the second). Where a test must
+   show that something did NOT arrive it uses a barrier: the sender broadcasts a marker, and
+   when all the others have printed it, everything sent before has been forwarded (one
+   receiver thread per port, one FIFO queue per port).
+ * run_all.sh runs every script under "timeout 300". That is longer than 30 s because one script
+   is several commands (port_full and many_hosts wait for the 5 s port timeout; valgrind runs
+   take a minute in total). It is a backstop: if it fires, the script gets SIGTERM, its EXIT
+   trap runs, and the script is reported as failed ("timed out").
+ * If the switch does not exit after SIGINT, sw_stop prints "gdb -p PID -batch -ex 'thread
+   apply all bt'", kills the switch with SIGKILL, reaps it, and the test fails. On this machine
+   gdb cannot attach (kernel.yama.ptrace_scope = 1 allows only a parent to attach), so
+   the script then prints every thread's name and kernel wait point from /proc. With
+   "sudo sysctl kernel.yama.ptrace_scope=0" (or as root) the real backtrace is printed.
+   This was tested with a fake switch that ignores SIGINT (not part of the repository).
+ * Cleanup: every script installs "trap cleanup EXIT" (and INT/TERM -> exit): all hosts are killed
+   and reaped, the FIFO descriptors are closed, a switch that is still alive is killed and reaped,
+   and the temporary directory (FIFOs, logs, outputs) is removed. A failed check, a timeout of
+   run_all.sh and a Ctrl+C all leave no process and no file behind (checked: after a killed
+   run there were 0 switch/host processes and 0 /tmp/vswitch.* directories).
+ * Hosts read their commands from a FIFO. The script keeps a writer open on it (exec {fd}<>fifo),
+   so the host sees end-of-file only when the script closes it. A host name may be used once
+   (mkfifo fails otherwise and the test fails loudly: this caught two mistakes of mine).
+
+
+6. PUBLIC TESTS: NONE EXIST
+---------------------------
+The roadmap (Part 8, B) says "Run the released public tests (forwarding and broadcast)". There is no
+official public testing facility for this project, and no such files exist (searched the repository and
+the machine). The course staff (the TA) test the submitted project themselves. So:
+   * forward.sh and broadcast.sh are OUR OWN integration tests, written from the project requirements and
+     the roadmap (see section 3, scripts 1 and 2). They are internally developed and are not official.
+   * Their coverage was reviewed against the requirements (roadmap Parts 4 and 6, the forwarding decision):
+     flooding of unknown destinations; learning; unicast to one port only; no echo to the ingress port;
+     broadcast and multicast to all others; filtering of a frame for the ingress port; a broadcast source is
+     dropped; a multicast source is forwarded; a departed host is forgotten; header fields and payload sizes
+     (0, 1500 bytes) preserved; per-flow ordering; concurrent senders; broadcasts during host churn.
+     Cases that the first version lacked (own-port filter, stale entry, header/size integrity, ordering,
+     invalid sources, churn) were added. Mutation check: deliberately breaking the switch (section 7) makes the
+     scripts fail.
+   * Not covered by these two scripts, by design: VLAN filtering and trunks (Part 13), QoS (Part 11), rate
+     limiting (Part 12), mirroring (Part 17): not implemented yet.
+
+
+7. BUGS FOUND
+-------------
+No defect was found in the switch (Parts 1-7) in this part: the sources in src/ and include/ are
+unchanged. Problems found and fixed in the new TEST code (details: notes/bugs.md items 12-13):
+   a) a bare "wait" in broadcast.sh waited for the switch and all hosts and hung;
+   b) host names reused for a second host: FIFO collision (midframe_disconnect.sh, slow_host.sh, many_hosts.sh);
+   c) slow_host.sh used a fixed minimum count (2000 frames) that valgrind's speed broke; replaced by the
+      relative comparison;
+   c2) slow_host.sh failed under valgrind in 2 of 3 repeat runs on an absolute floor (>= 1000 frames for B and D),
+      then once more on a 60 % count bound, and once in a NORMAL run (D 4340 vs a baseline of 7392 = 59 %).
+      Identical runs differ a lot in how many frames the fast hosts receive (B: 928 ... 2096 under valgrind,
+      D: 4340 ... 7392 normal). The count bound is now 30 % in every variant; the time check (A's flood not
+      slower than 2.5 x baseline + 2 s) was never close to failing and is the real test. After the change:
+      slow_host passed 10/10 normal, 10/10 tsan, 5/5 valgrind (+ 6/6 valgrind before the last tweak).
+   d) many_hosts.sh expected 8 excess hosts to be answered within 30 s; the accept thread answers one
+      per 5 s (documented design), so the excess is 2 hosts.
+Also: the first midframe_disconnect.sh run reported success although a host could not be created
+(a bug in my helper); host_spawn now fails if its FIFO cannot be created.
+
+Mutation check (the scripts must be able to fail): the switch was changed on purpose and rebuilt:
+   - no filtering of frames for the ingress port   forward.sh 1 check failed (nobody must get A's frame to A)
+   - a broadcast source address is not dropped      broadcast.sh 1 check failed
+   - always flood (never unicast)          forward.sh 6 checks failed, mac_move.sh 4, mac_aging.sh 3
+   - broadcast also goes to the ingress     broadcast.sh 9 checks failed
+   - port security never triggers           port_security.sh 4 checks failed
+The original forward.c was restored (diff shows no change).
+
+
+8. ACTUAL RESULTS
+-----------------
+All numbers below were measured on this machine (Linux 7.0, gcc, valgrind 3.26, TSan with setarch -R).
+Builds:   make clean && make && make tsan: 0 errors, 0 warnings (-std=c11 -Wall -Wextra -Werror -g -O0).
+Parts 1-7 regression suite (tests/run_unit.sh, run by "./tests/run_all.sh"): passed (rc 0) in both full runs
+below; it includes the unit tests, the TSan unit tests, the Python end-to-end tests and the Part 7 shutdown
+tests (normal 158 checks, TSan 41, valgrind 11).
+
+Final run of the ten scripts on the FINAL versions of all scripts (LEGACY=0 VARIANT=...; checks passed, 0 failed):
+   script                 normal   valgrind   tsan
+   forward                  23        27       24
+   broadcast                32        36       33
+   slow_host                13        21       15
+   partial                   8        12        9
+   midframe_disconnect      10        14       11
+   port_full                14        18       15
+   mac_aging                 9        13       10
+   mac_move                 11        15       12
+   port_security            12        16       13
+   many_hosts               17        25       19
+   => 10 of 10 scripts passed in each of the three variants. The valgrind and TSan columns are larger because
+      sw_stop adds checks per variant: valgrind 0 errors, 0 bytes in use at exit, nothing lost, no descriptor
+      left open; TSan: no report.
+
+Repeat runs (flakiness). Two rounds were run; the first round used the scripts before the last fixes to
+slow_host.sh:
+   Round 1 (forward/broadcast already extended):  full normal 1/1 passed; normal x5 5/5 passed;
+            tsan x3 3/3 passed; valgrind x3: 1/3 passed, 2 failed in slow_host only (absolute floor, section 7 c2).
+   Round 2 (floor removed, 60 % bound):  full normal 1/1 passed (325 s); valgrind x3 3/3 passed; tsan x3 3/3 passed;
+            normal x3: 2/3 passed, 1 failed in slow_host only (D 4340 vs 7392, 59 %; section 7 c2).
+   After the final change (30 % bound): slow_host 10/10 normal, 10/10 tsan, 5/5 valgrind; then one run of all ten
+            scripts per variant (table above), all passed.
+   Every failure in the repeat runs was in slow_host.sh's count check and was a TEST problem (noisy counts),
+   not a switch defect. No other script failed in any run. No run hit a timeout and no switch ever hung.
+   Honest limit: the final version of slow_host.sh and the final set of scripts together were run once per
+   variant plus the 25 slow_host repeats; the other nine scripts passed in all 22 earlier runs of the previous
+   round (they did not change).
+Timeouts and cleanup (tested): a script killed by run_all.sh's timeout (SCRIPT_TIMEOUT=3 on port_full) is
+   reported failed (exit 1) and left no process or directory; a fake switch that ignores SIGINT produced the
+   failure message and the /proc thread listing and was killed. After the full runs: 0 switch/host processes,
+   0 /tmp/vswitch.* directories, 0 FIFOs, 0 vgdb pipes. (An earlier run that I stopped by hand with SIGKILL left
+   3 /tmp/vgdb-pipe-* files of valgrind; they were removed. A run that ends normally leaves nothing.)
+Mutation check: 5 deliberate faults in src/forward.c were each caught by the scripts named in section 7; the
+   source was restored (diff clean). src/ and include/ are unchanged in Part 8 (git diff is empty for them).
+
+
+9. REMAINING LIMITATIONS
+------------------------
+   * There are no official public tests (section 6): the TA tests the project. Our forwarding and broadcast
+     tests are internal and cannot prove conformance to anything that the TA checks and we did not read.
+   * The Tier 1 backup (a git tag "tier1") is NOT created: Git is handled by the user.
+   * Frame sharing (no extra copies) cannot be observed from outside; see script 2.
+   * Counts of frames received by fast hosts in slow_host.sh vary a lot between identical runs; the script
+     can only judge a large loss (30 %) there. Head-of-line blocking is judged by A's flood time.
+   * The timing checks are bounds with slack because valgrind and TSan are slow: aging 2-10 s for T = 3 s, SWITCH FULL
+     wait 4-15 s for 5 s, flood time 2.5 x + 2 s.
+   * The accept thread serves one waiting host at a time, so many excess hosts are turned away 5 s apart
+     (many_hosts.sh uses 2). This is the documented design.
+   * gdb cannot attach on this machine without changing ptrace_scope (section 5).
+   * After the last change only one run of each variant (and 25 slow_host runs) used the final scripts together;
+     the earlier repeats are from the version before it. The earlier timing flake of the 100,000-frame check in
+     tests/test_forward.py (Part 6/7 notes) did not reappear in either full run, its cause is still unknown.
+   * Tier 2 features (VLAN, QoS, rate limit, mirroring, admin socket, logger) are not tested here: not implemented.

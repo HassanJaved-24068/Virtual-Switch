@@ -120,3 +120,44 @@ One of these goes into the final report.
   `shutting_down`. Not wrong in practice, but the roadmap requires a plain predicate
   protected by the condition variable's mutex. `shutdown_requested` (under
   `shutdown_lock`) is now the predicate; the atomic stays as a hint for the accept loop.
+
+## 12. Part 8 test-code bugs (no switch bug found in Part 8)
+All four were mistakes in the new shell tests, found while writing them; the switch sources are unchanged.
+- `broadcast.sh` hung: a bare `wait` after the four background sender loops also waits for the
+  background switch and hosts, which never exit. Fix: `wait "${senders[@]}"` (only the loops' PIDs).
+- A host name used twice (`midframe_disconnect.sh` re-used `D`, `slow_host.sh` and `many_hosts.sh`
+  started a second set of hosts with the same names): `mkfifo` failed with "File exists". The first
+  version of `host_spawn` ignored that error, so `midframe_disconnect.sh` PASSED although its loop had
+  not really run (a false pass). Fix: `host_spawn` now fails the test when the FIFO cannot be created, and
+  every host gets a unique name.
+- `slow_host.sh` asserted that B and D receive at least 2000 of 8000 frames. Under valgrind the switch is much
+  slower than the sender, the fast hosts' own queues overflow too, and B/D got 1846-2318 (flaky). The
+  roadmap's criterion is relative ("about the same as without C"), so the script now runs the flood
+  twice (C reading, C --noread) and compares times and counts (>= 60 %, same as tests/test_forward.py).
+- `many_hosts.sh` expected 8 excess hosts to be answered SWITCH FULL within 30 s. The accept thread handles ONE
+  waiting host at a time (roadmap Part 5), 5 s each, so the 8th would be answered after about 40 s.
+  Not a switch bug (documented design). The script uses 32 hosts on 30 ports (2 excess, 10 s) and checks the
+  serial behaviour (took >= 9 s).
+
+## 13. gdb cannot attach on the development machine (Part 8)
+`gdb -p PID` fails with "Could not attach to process ... ptrace_scope" (kernel.yama.ptrace_scope = 1: only a parent may
+attach). `tests/lib.sh` still tries gdb when a switch does not exit after SIGINT, and falls back to printing each
+thread's name and kernel wait point from /proc/PID/task. With `sudo sysctl kernel.yama.ptrace_scope=0` the real
+"thread apply all bt" is printed. No stuck switch occurred in any test run; the path was tested with a fake
+program that ignores SIGINT.
+
+## 14. slow_host.sh absolute floor failed under valgrind (Part 8 repeat runs)
+- Symptom: `VARIANT=valgrind ./tests/run_all.sh` failed `slow_host` in 2 of 3 repeat runs on
+  "B and D received something substantial (>= 1000 each)": B/D got 928-1396 of 8000 frames. All the relative checks
+  (flood time 1442 ms vs 1449 ms without the slow host; B and D at >= 60 % of their baseline) passed in every run.
+- Cause: I had added a fixed minimum count. Valgrind makes the switch 20-50x slower than the sender, so the fast hosts'
+  own queues overflow and they legitimately receive only about 12 % of the flood. The same kind of mistake as item 12
+  (a number that depends on the speed of the variant). Not a switch bug.
+- Fix: the fixed floor is replaced by "received more than 0"; head-of-line blocking is judged by the relative checks only.
+- Also found: valgrind runs that are killed (SIGKILL by a stopped test run) leave /tmp/vgdb-pipe-* files; they were
+  removed by hand. A run that ends normally leaves none.
+- Second failure of the same script under valgrind: the relative count check (>= 60 % of the baseline) failed once
+  (B: 1071 vs 1954). Identical valgrind runs differ by a factor of 2 in how many frames B receives (928 ... 2096), so a
+  60 % bound is inside the noise there. The count threshold is now 30 % in every variant (a 60 % bound then failed once in 16 normal runs too:
+  D 4340 vs 7392, so the counts are noisy everywhere, not only under valgrind). The time check (A's flood is not slower than 2.5 x the baseline + 2 s) is unchanged and passed in all
+  runs; it is the actual head-of-line test.
