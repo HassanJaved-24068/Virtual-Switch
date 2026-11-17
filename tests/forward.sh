@@ -3,7 +3,7 @@
 # integrity, ordering, stale entries after a host leaves, clean SIGINT shutdown.
 # Our own integration test, written from the roadmap's forwarding decision (Part 6) and its
 # scenario "A -> C is flooded until C has sent once, then only C gets it". It is NOT an official
-# public test: none exists for this project.
+# public test: none has been supplied (status: see docs/Part8_Explanation.txt, section 6).
 . "$(dirname "$0")/lib.sh"
 
 sw_start 4

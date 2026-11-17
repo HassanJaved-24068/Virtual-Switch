@@ -61,6 +61,6 @@ if [ ${#failed[@]} -ne 0 ]; then
 fi
 echo "All tests passed."
 if [ "$VARIANT" = normal ]; then
-    echo "note: there are no official public tests; forward.sh and broadcast.sh are our own tests (docs/Part8_Explanation.txt)"
+    echo "note: no official public tests have been supplied; forward.sh and broadcast.sh are our own tests (docs/Part8_Explanation.txt)"
 fi
 exit 0

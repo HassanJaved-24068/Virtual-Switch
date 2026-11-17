@@ -12,14 +12,15 @@ real ./host processes, driven by shell scripts, ended with SIGINT, and run three
 ways (normal, under valgrind, with ThreadSanitizer). No feature was added. The
 switch sources were not changed in this part (see section 7).
 
-Methodology. There is no official public test facility for this project: the course staff (the TA) test
-the submitted project themselves. The roadmap's "released public tests" therefore do not exist, and nothing
-was waited for or imitated. Instead the project has its OWN integration tests, written from the project
-requirements and the roadmap: forwarding decision (Part 6), flooding and no head-of-line blocking (Part 4),
-frame sharing (Part 4), the wire protocol (Part 2), the port limit and lifecycle (Part 5), signals and shutdown
-(Part 7). They are internally developed tests; they are not, and must not be presented as, official public
-tests. Each requirement is tested from the outside with real processes; the internals are covered by the
-unit tests of Parts 1-7 (tests/run_unit.sh), which this part keeps and runs.
+Methodology. No official public tests have been supplied: the roadmap speaks of "released public tests
+(forwarding and broadcast)", but none are in the repository or on this machine, and whether any will be
+released is NOT confirmed (the TA was asked; the answer is pending; see section 6). Nothing was waited for
+or imitated. The project has its OWN integration tests, written from the project requirements and the
+roadmap: forwarding decision (Part 6), flooding and no head-of-line blocking (Part 4), frame sharing (Part 4),
+the wire protocol (Part 2), the port limit and lifecycle (Part 5), signals and shutdown (Part 7). They are
+internally developed tests; they are not, and must not be presented as, official public tests. Each
+requirement is tested from the outside with real processes; the internals are covered by the unit tests of
+Parts 1-7 (tests/run_unit.sh), which this part keeps and runs.
 
 Files:   tests/lib.sh                     shared helpers (sourced by the scripts)
          tests/forward.sh broadcast.sh slow_host.sh partial.sh midframe_disconnect.sh
@@ -159,13 +160,20 @@ test-tsan; "make clean" removes it. Flags, object directories and all other targ
    (mkfifo fails otherwise and the test fails loudly: this caught two mistakes of mine).
 
 
-6. PUBLIC TESTS: NONE EXIST
----------------------------
-The roadmap (Part 8, B) says "Run the released public tests (forwarding and broadcast)". There is no
-official public testing facility for this project, and no such files exist (searched the repository and
-the machine). The course staff (the TA) test the submitted project themselves. So:
+6. PUBLIC TESTS: STATUS
+-----------------------
+What is documented (the roadmap, which names as its sources "Virtual_Switch_Project_OS_Fall2026.pdf" and
+"Virtual Switch Briefing.html"; those two files are NOT available to us here, so this is second hand):
+   * Part 8: "Run the released public tests (forwarding and broadcast)"; "The public tests pass".
+   * Requirements table: "Public tests (forwarding, broadcast); hidden tests (slow, misbehaving and many hosts;
+     admin and signals under traffic)", covered in Parts 8, 16 and 18 (the "hidden-test simulation" in Part 18).
+   * The roadmap does not say how public tests are delivered or whether they are released as files.
+What is confirmed: no public test file has been supplied, and none exists in the repository or on this
+machine (searched). The TA has been asked whether public tests will be released; the answer is PENDING.
+We do not assume they exist or that they do not. We proceed without waiting. When the TA answers, this section
+must be updated, and if files are released they must be run and reported separately from our own tests.
    * forward.sh and broadcast.sh are OUR OWN integration tests, written from the project requirements and
-     the roadmap (see section 3, scripts 1 and 2). They are internally developed and are not official.
+     the roadmap (section 3, scripts 1 and 2). They are internally developed and are not official.
    * Their coverage was reviewed against the requirements (roadmap Parts 4 and 6, the forwarding decision):
      flooding of unknown destinations; learning; unicast to one port only; no echo to the ingress port;
      broadcast and multicast to all others; filtering of a frame for the ingress port; a broadcast source is
@@ -174,6 +182,8 @@ the machine). The course staff (the TA) test the submitted project themselves. S
      Cases that the first version lacked (own-port filter, stale entry, header/size integrity, ordering,
      invalid sources, churn) were added. Mutation check: deliberately breaking the switch (section 7) makes the
      scripts fail.
+   * The hidden-test categories (slow, misbehaving and many hosts) are covered by our own slow_host.sh,
+     partial.sh, midframe_disconnect.sh and many_hosts.sh; admin and signals under traffic come with Parts 15-18.
    * Not covered by these two scripts, by design: VLAN filtering and trunks (Part 13), QoS (Part 11), rate
      limiting (Part 12), mirroring (Part 17): not implemented yet.
 
@@ -254,8 +264,8 @@ Mutation check: 5 deliberate faults in src/forward.c were each caught by the scr
 
 9. REMAINING LIMITATIONS
 ------------------------
-   * There are no official public tests (section 6): the TA tests the project. Our forwarding and broadcast
-     tests are internal and cannot prove conformance to anything that the TA checks and we did not read.
+   * No official public tests have been supplied and the TA's answer is pending (section 6). Our forwarding and
+     broadcast tests are internal and cannot prove conformance to anything the staff check that we have not seen.
    * The Tier 1 backup (a git tag "tier1") is NOT created: Git is handled by the user.
    * Frame sharing (no extra copies) cannot be observed from outside; see script 2.
    * Counts of frames received by fast hosts in slow_host.sh vary a lot between identical runs; the script

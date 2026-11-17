@@ -2,7 +2,7 @@
 # broadcast.sh - broadcast and multicast reach every other host exactly once, never the sender;
 # size and header integrity; invalid sources; broadcasts during host churn.
 # Our own integration test, written from the roadmap (flooding in Part 4, forwarding decision in
-# Part 6). It is NOT an official public test: none exists for this project.
+# Part 6). It is NOT an official public test: none has been supplied (status: see docs/Part8_Explanation.txt, section 6).
 # (that the frame is shared, not copied, per port is checked by tests/test_refcount.c;
 #  the valgrind variant of this script shows that the shared frames are all freed)
 . "$(dirname "$0")/lib.sh"
