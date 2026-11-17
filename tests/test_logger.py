@@ -302,8 +302,9 @@ def test_flood_stalled_sink():
     print("  baseline (file): %.2f s until the marker, B received %d, %d RX lines of S logged, %d dropped" % (base_t, base_b, rx, dr))
     check(not bad, "baseline: every line of the log is whole (%d bad)" % len(bad))
     check(rx + dr >= FRAMES, "baseline: each frame is logged or counted as dropped (%d + %d >= %d)" % (rx, dr, FRAMES))
-    if "tsan" not in ts.SWITCH:     # a TSan switch is slow enough for the logger to keep up: drops are then optional
-        check(dr > 0, "baseline: the logger dropped messages instead of slowing the receiver (%d)" % dr)
+    # Whether the logger drops anything here depends on the relative speed of the receiver and the logger (a slower
+    # or TSan switch lets it keep up: 0 dropped is correct, nothing was lost). So the number is reported, not asserted;
+    # "drops are counted exactly" is asserted above and in test_log.c, and the stalled run below MUST report drops.
     sw.stop()
 
     # the same flood, the log file is a FIFO that nobody reads

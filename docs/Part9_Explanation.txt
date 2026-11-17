@@ -164,7 +164,7 @@ Part 9 tests (all passed):
    tests/test_log.c          37 checks, 0 failures: normal (run many times), ThreadSanitizer (6 runs, no report),
                              valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all
                              --error-exitcode=1 --track-fds=yes (3 runs: 0 errors in both processes, 0 bytes in use at exit)
-   tests/test_logger.py      normal 55 checks; tsan mode 27 checks (3 extra runs); valgrind mode 9 checks
+   tests/test_logger.py      normal 54 checks; tsan mode 27 checks (3 extra runs); valgrind mode 9 checks
                              (0 errors, 0 bytes in use at exit, nothing lost, no descriptor open at exit)
    Measured in them:
      unit, stalled sink:  200,000 log_msg calls in 0.02 s while the logger was blocked (a blocking log_msg would never

@@ -204,3 +204,25 @@ program that ignores SIGINT.
   (0 errors in both processes, 0 bytes in use at exit), 3 of 3 runs.
 - Not a logger defect: the logger's own file descriptor is closed by log_stop() (the end-to-end valgrind test checks that no
   descriptor is open at exit).
+
+## 18. test_mactable_tsan failed at "mac_size() == 6" (test synchronization, not a switch race)
+- Symptom: `make test` once failed `build/test_mactable_tsan` (2 failures, lines 920/921 of tests/test_mactable.c):
+  `mac_size() == 6` and the per-port counts (2, 1, 3). The normal build never failed. Not reproducible on an idle machine
+  (0 of 40 runs, both builds); reproduced under CPU load: TSan 1 of 30 and 1 of 48 runs, normal build 0 of 30.
+- Diagnosis: a temporary print at the failing line showed `mac_size=5 counts=2,1,2 stats_in=2,1,3`: the receiver of port 3 had
+  counted its third frame (STAT_IN = 3, so the test's `wait_in(3, 3)` returned) but had not learned its source MAC yet.
+  src/port.c `receiver_main` does `stats_inc(STAT_IN)`, formats the addresses, logs the RX line, and only then calls
+  `forward_frame()`, which learns the MAC. STAT_IN means "frame READ", not "frame processed". A slow or loaded run (TSan)
+  can look at the table inside that window.
+- Not an implementation race: every shared value involved is an atomic or is read under its lock (ThreadSanitizer reported nothing),
+  the table is consistent at every moment, and the switch is correct; the test used a proxy counter that is incremented one step too early.
+- Fix (tests/test_mactable.c only): a `wait_macs(port, n)` helper that waits (bounded, 10 s) until the port's `mac_count` has reached n, used
+  before the unchanged assertions. `mac_count` is incremented while the entry is inserted, after the table's own count, so once it
+  has reached n, `mac_size()` is final as well. The assertions were not weakened: if a MAC were never learned the wait times out and the check fails.
+- Result: `test_mactable_tsan` 0 failures in 150 runs under heavier load (4 busy loops on 2 cores), where the bug appeared in
+  about 1 of 30-50 runs before; 353 checks now (one more than before: the new wait).
+- Also (Part 9 test, same full run): `test_logger.py` asserted that the baseline 100,000-frame flood must make the logger drop messages. It
+  depends on the relative speed of receiver and logger: in one run the logger kept up (all 100,001 lines written, 0 dropped, nothing lost) and
+  the assertion failed; over 5 later runs the baseline dropped 0, 761, 2887, 3129, 5329. Removed; the number is only reported. What
+  the requirement needs is still asserted: written + dropped >= frames sent, the stalled-sink run is not slower, and the stalled run
+  reports drops in every variant.

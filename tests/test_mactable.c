@@ -890,6 +890,23 @@ static bool wait_in(int port, unsigned long long n)
     return false;
 }
 
+/*
+ * Wait until `port` has learned n MAC addresses (polling the counter: test code).
+ * wait_in() is NOT enough before looking at the table: the receiver counts STAT_IN when it has READ a frame,
+ * then formats and logs it, and only then learns its source MAC in forward_frame(). A slow or loaded run (ThreadSanitizer)
+ * can therefore see "n frames received" while the last MAC is not in the table yet. mac_count is incremented while the
+ * entry is inserted, after the table's own count, so once it has reached n the table size is final too.
+ */
+static bool wait_macs(int port, int n)
+{
+    for (int i = 0; i < 10000; i++) {
+        if (atomic_load(&sw.ports[port].mac_count) >= n)
+            return true;
+        usleep(1000);
+    }
+    return false;
+}
+
 static int sem_value(void)
 {
     int v = -1;
@@ -917,6 +934,7 @@ static void test_ports_and_table(void)
     host_sends(p3, 5, bc);
     host_sends(p3, 6, bc);                              /* exactly M = 3 on port 3 */
     EXPECT(wait_in(1, 2) && wait_in(2, 1) && wait_in(3, 3));
+    EXPECT(wait_macs(1, 2) && wait_macs(2, 1) && wait_macs(3, 3));      /* learned, not just received */
     EXPECT(mac_size() == 6);
     EXPECT(atomic_load(&sw.ports[1].mac_count) == 2 && atomic_load(&sw.ports[2].mac_count) == 1 &&
            atomic_load(&sw.ports[3].mac_count) == 3);
