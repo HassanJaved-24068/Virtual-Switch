@@ -1,0 +1,258 @@
+=====================================================================
+PART 7 - SIGNAL THREAD AND CLEAN SIGINT / SIGTERM SHUTDOWN
+=====================================================================
+
+1. WHAT PART 7 IMPLEMENTS
+-------------------------
+Ctrl+C (SIGINT) or SIGTERM now stops the switch in an orderly way: every thread
+is woken and joined, every port is torn down by the reaper, every socket, eventfd,
+semaphore, mutex, condition variable and heap block is released, and the process
+exits with status 0. Before Part 7 the process was just killed by the default
+signal action.
+
+New files:       include/sig.h   src/sig.c       signal setup, signal thread, request_shutdown()
+                 tests/test_shutdown.py          the Part 7 tests
+                 docs/Part7_Explanation.txt      this file
+Changed files:   src/switch.c    startup order, accept-thread shutdown, shutdown sequence
+                 src/port.c      switch_destroy(); switch_wait_ms() uses the new predicate
+                 include/port.h  shutdown_requested, switch_destroy()
+                 src/mactable.c  aging thread tests shutdown_requested under shutdown_lock
+                 Makefile        sig.o added to SWITCH_NAMES (normal, TSan and small builds)
+                 tests/*         see section 14
+SIGHUP and SIGUSR1 are collected too, but only log "not yet implemented" (Part 10).
+
+
+2. WHY A DEDICATED SIGNAL THREAD
+--------------------------------
+A signal can interrupt any thread at any instruction. The code that runs then
+may only call "async-signal-safe" functions: not malloc, not pthread_mutex_lock,
+not printf. Shutdown needs exactly those (a mutex, a condition variable, logging).
+So the switch does NOT run shutdown code in a handler. One thread does nothing
+except wait for signals, as an ordinary thread, where all functions are allowed.
+
+
+3. WHY THE SIGNALS ARE BLOCKED BEFORE ANY THREAD IS CREATED
+-----------------------------------------------------------
+A new thread inherits the signal mask of the thread that creates it. main() calls
+signal_setup() first thing (before argument parsing, before any pthread_create):
+   * sigaction(SIGPIPE, SIG_IGN)   a write to a vanished host fails with EPIPE
+   * a set {SIGINT, SIGTERM, SIGHUP, SIGUSR1} is blocked with pthread_sigmask()
+So every thread of the switch has these four signals blocked. If the mask were set
+later, a thread created earlier could still receive SIGINT and the process would
+die with the default action. A blocked signal is not lost: it stays pending until
+someone takes it, which is also what makes "SIGINT immediately after start" safe
+(section 8).
+
+
+4. HOW sigwait() WORKS
+----------------------
+sigwait(&set, &sig) waits until one of the signals in the set is pending, removes
+it from the pending set and returns its number. The signals must be blocked in the
+calling thread (they are), otherwise they would be delivered the normal way. It
+returns 0 or an error number directly (it does not set errno, like all pthread-style
+functions), and the code checks it: on an error the thread logs and requests shutdown
+instead of looping on the error.
+signal_main() loops:
+   SIGINT / SIGTERM   log, request_shutdown(), leave the loop (the thread ends)
+   SIGHUP / SIGUSR1   log "not yet implemented", continue
+
+
+5. WHY NO ASYNCHRONOUS HANDLERS
+-------------------------------
+See section 2: nothing useful may be done in a handler. There is also no global
+"volatile sig_atomic_t flag" to poll: polling would need sleep() or a timeout, and
+a handler cannot wake a thread blocked in pthread_cond_wait. sigwait() has neither
+problem.
+
+
+6. request_shutdown()  (src/sig.c)
+----------------------------------
+   lock(shutdown_lock)
+   shutdown_requested = true            <- THE predicate, protected by shutdown_lock
+   shutting_down      = true            <- atomic, only a lock-free hint
+   pthread_cond_broadcast(shutdown_cond)   (lock still held)
+   unlock(shutdown_lock)
+   write(wake_efd, uint64_t 1)          EINTR: retry; EAGAIN: counter at its maximum, the
+                                        eventfd is readable already, fine; other error: logged
+It is thread-safe (everything is under the mutex) and idempotent: a second call
+sets true again, broadcasts to nobody or to nobody-who-cares, and adds 1 to the
+eventfd counter. If wake_efd is -1 (the unit tests have none) the write is skipped.
+The atomic is not a substitute for the predicate: condition waits test
+shutdown_requested under the mutex. The atomic is used where taking the mutex would
+be awkward (the accept loop condition, a check in admit_host).
+
+
+7. WHY THE PREDICATE AND THE BROADCAST USE THE SAME MUTEX
+---------------------------------------------------------
+A waiter does:  lock; while (!shutdown_requested) cond_wait; unlock.
+cond_wait releases the mutex and sleeps atomically. request_shutdown() sets the
+flag and broadcasts under the same mutex. So there are only two cases:
+   a) the waiter has not locked yet: it will find the flag already true and not sleep;
+   b) the waiter is asleep (the mutex is free): it gets the broadcast.
+There is no gap in which the flag changes and the signal is sent between the waiter's
+"test the flag" and "go to sleep". That gap is the classic lost wake-up. The wait is
+a while loop because wake-ups can be spurious. The same mutex also serves the
+aging thread (timed wait) and switch_wait_ms().
+
+
+8. MAIN'S WAIT AND "SIGINT RIGHT AFTER START"
+---------------------------------------------
+After all threads were created main does:
+   lock; while (!shutdown_requested) cond_wait(shutdown_cond); unlock;
+Three situations are all correct:
+   * SIGINT arrives before the signal thread exists: the signal is blocked, so it stays
+     pending; sigwait() takes it as soon as the thread starts.
+   * SIGINT is handled before main reaches its wait: shutdown_requested is already
+     true, main does not sleep at all.
+   * SIGINT arrives while main sleeps: the broadcast wakes it.
+The signal thread is created FIRST among the threads, so a signal during start-up
+is handled early. (Test 3 repeats this 40 times, sending SIGINT as soon as the
+"listening" line appears.)
+
+
+9. HOW THE EVENTFD WAKES THE ACCEPT THREAD
+------------------------------------------
+The accept thread sits in poll() on {listen_fd, wake_efd}. request_shutdown() makes
+wake_efd readable, so poll() returns, the thread sees shutting_down and leaves its
+loop. Closing the listening socket is NOT used to wake it (that does not reliably
+wake a thread blocked in poll/accept); the existing eventfd design is kept and no
+second eventfd was added.
+
+
+10. WHY main ALSO CALLS sem_post(&free_ports)
+---------------------------------------------
+The accept thread handles one host at a time. If every port is busy, it sits inside
+sem_timedwait(free_ports, ...) for up to port_wait_timeout, NOT in poll(), so the
+eventfd cannot reach it. main therefore posts the semaphore. admit_host() checks
+shutting_down right after wait_for_token() returns, whatever the reason it returned
+(a real token, the shutdown token, or a timeout):
+   shutting_down -> close the waiting host's socket, allocate no port, return;
+   the loop condition then ends the thread.
+The extra token is not returned to anything: the semaphore is destroyed later.
+Also covered: shutdown after the accept thread's check but before it waits (the post
+makes sem_timedwait return at once), and shutdown while a token is available
+(sem_trywait succeeds, admit_host still sees shutting_down and does not start a port).
+
+
+11. THE COMPLETE SHUTDOWN SEQUENCE  (shutdown_switch() in src/switch.c)
+-----------------------------------------------------------------------
+   0. main wakes from its wait (shutdown_requested is true).
+   1. join the signal thread. (It ended itself. signal_stop_join() also sends it a
+      SIGTERM first, harmless if it is gone; this is what ends it on the start-up
+      failure path, where it is still in sigwait().)
+   2. request_shutdown() again (idempotent), sem_post(free_ports), join the accept
+      thread, close listen_fd. New connections are refused from here on.
+   3. (the admin thread is Part 15: nothing to do)
+   4. Under ports_lock (write) collect the ids of all UP ports, release the lock, then
+      call port_request_down(p, PORT_FREE) for each: it takes ports_lock itself, so it
+      must be called with no lock held. A port that changed state in between is
+      already CLOSING and queued, and port_request_down just returns false for it.
+   5. reaper_finish(): sets reaper_stop, the reaper drains its whole queue (also the
+      ports that were CLOSING before the signal), then exits; it is joined.
+   6. join the aging thread (it was woken by the broadcast).
+   7. mac_destroy(), free the MAC region.
+   8. switch_destroy(): destroys the semaphore, shutdown mutex/cond, ports_lock, the
+      reaper and port_down mutexes/conds; closes wake_efd (and listen_fd if still open).
+   9. stats_destroy(). main logs "shutdown: complete" and returns 0.
+Each step checks its return value; a failure is logged and the next step still runs.
+No lock is held across pthread_join, poll or sem_timedwait. Nothing is destroyed
+while a thread that uses it could still run: the reaper (which uses the port locks,
+queues and MAC table) is joined before any of them is destroyed.
+Start-up failure: if a pthread_create fails, main requests shutdown and runs the same
+sequence with a record of which threads exist (started_t), prints the error and
+exits with status 1. Already running threads are therefore never left behind.
+
+
+12. WHY THE REAPER STAYS THE ONLY OWNER OF PORT TEARDOWN
+--------------------------------------------------------
+Tearing down a port means: close the output queue, shutdown() the socket (wakes a
+receiver blocked in read and a sender blocked in write to a host that does not read),
+join the receiver and sender, drain and free the queue, flush the MAC entries, close
+the socket, reset the slot and return the token. That order matters (the fd must not
+be closed while a thread can still use it, or its number could be reused). Part 5
+implemented it once, in the reaper. Main only REQUESTS the teardown, exactly like a
+receiver does when a host disconnects. This also means a host that disconnects at the
+same moment as the signal cannot be torn down twice: UP -> CLOSING happens once, under
+the write lock, and only its winner queues the port.
+
+
+13. HOW THE AGING THREAD EXITS
+------------------------------
+It waits with pthread_cond_timedwait() on shutdown_cond, absolute CLOCK_MONOTONIC
+deadline, one second apart. The loop is
+   lock; while (rc == 0 && !shutdown_requested) timedwait; stop = shutdown_requested; unlock;
+The broadcast wakes it at once; it then leaves without running another mac_age().
+(Part 6 tested the atomic hint here; Part 7 changed it to the real predicate.)
+
+
+14. LOCK ORDER AND PROTECTED RESOURCES
+--------------------------------------
+Global order (unchanged, see Part 6 section 11): ports_lock (1) -> queue lock (2) ->
+bucket lock (3) -> reaper lock (4) -> frame ref_lock (5) -> stats (7).
+   shutdown_lock    protects shutdown_requested; used with shutdown_cond. It is a
+                    leaf: it is held only for a few instructions, never while
+                    another lock is taken, never during I/O or logging.
+   port_down_lock   leaf, notification that a teardown finished (Part 5).
+   shutting_down    atomic hint (not a lock).
+Shutdown adds no new lock-order edge: main takes ports_lock, releases it, and only
+then calls functions that take ports_lock and the reaper lock.
+
+
+15. BUGS ENCOUNTERED AND FIXES
+------------------------------
+(a) Part 6 used the atomic shutting_down as the aging thread's wait predicate. It
+    worked, but the roadmap requires the predicate to be a variable protected by the
+    mutex. Added shutdown_requested; aging and switch_wait_ms() use it.
+(b) tests/test_port.c and test_mactable.c read sw.ports[i].state without ports_lock.
+    That is a data race against the receiver's write under the lock. ThreadSanitizer
+    did not report it in Part 6 but reported it after sw got one more field (the
+    layout of the global changed), failing test_port_tsan. The tests now read the state
+    through a helper that takes the read lock. The switch itself was not affected.
+(c) tests/test_switch.py counted threads without the new signal thread; updated.
+See notes/bugs.md.
+
+
+16. TESTS AND ACTUAL RESULTS
+----------------------------
+Commands:
+   make clean && make && make tsan     no warnings or errors (-Wall -Wextra -Werror)
+   make test                           everything, all passed (rc=0, "All tests passed.")
+   python3 tests/test_shutdown.py                   158 checks, 0 failed (3 runs after adding scenario 5b)
+   python3 tests/test_shutdown.py tsan              41 checks, 0 failed (3 extra runs: same)
+   python3 tests/test_shutdown.py valgrind          11 checks, 0 failed
+Scenarios (tests/test_shutdown.py):
+   1 four hosts + traffic + SIGINT: exit 0, 4 ports torn down by the reaper, every host
+     sees its connection closed, no [ERR] line
+   2 no hosts: exit in well under a second
+   3 SIGINT as soon as the "listening" line appears, 40 rounds
+   4 two ports busy, a third host waiting in sem_timedwait: exit within the limit, the
+     waiting socket closed with no SWITCH FULL, no port allocated
+   5 a --noread host with a full output queue: all 4 ports cleaned up, fast exit
+   5b a waiting host AND a --noread host with a full queue together (roadmap criterion)
+   6 SIGTERM, same checks as 1
+   7 SIGHUP and SIGUSR1 log "not yet implemented", the switch keeps forwarding and
+     accepting hosts, then SIGINT still stops it
+   8 40 rounds of start / 0-2 hosts (sometimes a waiting third) / SIGINT or SIGTERM
+   9 SIGINT while flooding, ./switch_tsan: no ThreadSanitizer report, exit 0
+  10 valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all
+     --error-exitcode=1 --track-fds=yes ./switch 9000 4 style run with 4 hosts, traffic
+     and a fifth host waiting for a port: ERROR SUMMARY 0 errors, "in use at exit: 0
+     bytes in 0 blocks", all heap blocks freed, no descriptor left open, exit status 0
+Every wait in the tests has a timeout, so a deadlock fails a test and cannot hang
+the suite. "Approximately one second" is checked as 1.5 s (EXIT_LIMIT) because the
+machine is not quiet; the idle switch is checked against 0.5 s.
+
+
+17. REMAINING LIMITATIONS
+-------------------------
+   * The start-up failure path (a pthread_create that fails) is written and reviewed but
+     not exercised by a test: there is no fault injection yet.
+   * A signal that arrives in the very short time between exec() and signal_setup() uses
+     the default action and ends the process (nothing exists yet that needs cleanup).
+   * Failures before the threads exist (bad arguments, bind error, malloc failure) still
+     exit directly; no thread is running then.
+   * Hosts are not told that the switch is going away; they just see the connection close.
+   * test_forward.py's 100,000-frame timing check failed once in one full run (B received
+     48,695 of 100,000) and passed in 3 reruns, in the next full run, and on the unmodified
+     Part 6 code. I could not reproduce it and did not find a cause; Part 7 does not touch
+     the forwarding path. notes/bugs.md item 9 already describes this check as noise-sensitive.

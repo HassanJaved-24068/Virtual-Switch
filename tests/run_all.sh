@@ -32,4 +32,13 @@ run ./build/test_mactable      # Part 6: MAC table unit tests, 8-thread stress, 
 run $NOASLR ./build/test_mactable_tsan  # Part 6: the same under ThreadSanitizer
 run python3 tests/test_mac.py  # Part 6: learning, unicast, aging, LRU, port security (real switch)
 
+run python3 tests/test_shutdown.py        # Part 7: SIGINT/SIGTERM, signals, repeated shutdown
+make -s switch_tsan host_tsan || exit 1
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_shutdown.py tsan   # Part 7: SIGINT while flooding, TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_shutdown.py valgrind                              # Part 7: no errors, no leaks
+else
+    echo "valgrind not installed: skipping the Part 7 valgrind test"
+fi
+
 echo "All tests passed."

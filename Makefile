@@ -10,7 +10,7 @@ PROGRAMS      = switch host swctl
 TSAN_PROGRAMS = switch_tsan host_tsan
 
 # Objects that only the switch (and the tests of its internals) need.
-SWITCH_NAMES = port forward mactable
+SWITCH_NAMES = port forward mactable sig
 
 OBJ_DIR   = build/obj
 TSAN_DIR  = build/tsan

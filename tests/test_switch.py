@@ -103,8 +103,14 @@ class Switch:
                 h.kill()
         alive = self.p.poll() is None
         if alive:
-            self.p.send_signal(signal.SIGTERM)      # default action: terminate (Part 7 adds clean shutdown)
-            self.p.wait(10)
+            self.p.send_signal(signal.SIGTERM)      # Part 7: a clean shutdown, exit status 0
+            try:
+                rc = self.p.wait(15)
+                check(rc == 0, "switch exited with status 0 after SIGTERM (got %s)" % rc)
+            except subprocess.TimeoutExpired:
+                self.p.kill()
+                self.p.wait()
+                check(False, "switch did not exit within 15 s after SIGTERM (killed)")
         log = self.log()
         check("ThreadSanitizer" not in log and "Sanitizer" not in log,
               "no sanitizer report in the switch log")
@@ -202,12 +208,13 @@ def test_three_hosts():
     check(names.count("accept") == 1, "ps -T shows exactly one accept thread")
     txs = sorted(t for t in names if t.startswith("tx-port"))
     check(txs == ["tx-port1", "tx-port2", "tx-port3"], "ps -T shows one sender per host: %s" % txs)
-    others = [t for t in names if t not in ("accept", "reaper", "aging") and not t.startswith(("rx-port", "tx-port"))]
+    others = [t for t in names if t not in ("accept", "reaper", "aging", "signal") and not t.startswith(("rx-port", "tx-port"))]
     # the main thread; the TSan build has one extra runtime thread with the same name
     check(names.count("reaper") == 1, "ps -T shows exactly one reaper thread")
     check(names.count("aging") == 1, "ps -T shows exactly one aging thread")
-    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 3 + 6 + len(others),
-          "main + accept + reaper + aging + 3 receivers + 3 senders (+TSan helper), got %s" % names)
+    check(names.count("signal") == 1, "ps -T shows exactly one signal thread (Part 7)")
+    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 4 + 6 + len(others),
+          "main + accept + reaper + aging + signal + 3 receivers + 3 senders (+TSan helper), got %s" % names)
 
     d = sw.host(ME[3])
     check(d is not None and "port 4: host connected" in sw.log(), "fourth host -> port 4")

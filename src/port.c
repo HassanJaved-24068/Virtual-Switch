@@ -71,11 +71,38 @@ void switch_wait_ms(long ms)
     int rc = 0;
 
     CHECK_PT(pthread_mutex_lock(&sw.shutdown_lock));
-    while (rc == 0 && !atomic_load(&sw.shutting_down))
+    while (rc == 0 && !sw.shutdown_requested)
         rc = pthread_cond_timedwait(&sw.shutdown_cond, &sw.shutdown_lock, &deadline);
     CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
     if (rc != 0 && rc != ETIMEDOUT) {
         log_msg(LOG_ERR, "pthread_cond_timedwait failed: %s", strerror(rc));
+    }
+}
+
+/* Report a failed cleanup call and carry on with the remaining cleanup. */
+static void destroy_failed(const char *what, int rc)
+{
+    if (rc != 0)
+        log_msg(LOG_ERR, "cleanup: %s failed: %s", what, strerror(rc));
+}
+
+void switch_destroy(void)
+{
+    destroy_failed("destroy port_down_cond", pthread_cond_destroy(&sw.port_down_cond));
+    destroy_failed("destroy port_down_lock", pthread_mutex_destroy(&sw.port_down_lock));
+    destroy_failed("destroy reaper_cond", pthread_cond_destroy(&sw.reaper_cond));
+    destroy_failed("destroy reaper_lock", pthread_mutex_destroy(&sw.reaper_lock));
+    destroy_failed("destroy free_ports", sem_destroy(&sw.free_ports) < 0 ? errno : 0);
+    destroy_failed("destroy shutdown_cond", pthread_cond_destroy(&sw.shutdown_cond));
+    destroy_failed("destroy shutdown_lock", pthread_mutex_destroy(&sw.shutdown_lock));
+    destroy_failed("destroy ports_lock", pthread_rwlock_destroy(&sw.ports_lock));
+    if (sw.listen_fd >= 0) {
+        destroy_failed("close listen_fd", close(sw.listen_fd) < 0 ? errno : 0);
+        sw.listen_fd = -1;
+    }
+    if (sw.wake_efd >= 0) {
+        destroy_failed("close wake_efd", close(sw.wake_efd) < 0 ? errno : 0);
+        sw.wake_efd = -1;
     }
 }
 

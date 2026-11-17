@@ -11,14 +11,15 @@
  * waits (up to port_wait_timeout) for a free port or gets "switch full".
  * Part 6: a MAC table (learning, aging, LRU, port security) and an aging thread.
  *
- * Shutdown on SIGINT is added in Part 7; until then the process is stopped
- * by the default signal action.
+ * Part 7: a signal thread (sigwait) turns SIGINT/SIGTERM into request_shutdown();
+ * main waits for it and then runs the shutdown sequence (see shutdown_switch()).
  */
 #include "common.h"
 #include "frame.h"
 #include "log.h"
 #include "mactable.h"
 #include "port.h"
+#include "sig.h"
 #include "stats.h"
 
 #include <netinet/in.h>
@@ -151,6 +152,15 @@ static void admit_host(int fd)
 {
     int rc = wait_for_token();
 
+    /* Shutdown wins over everything else. This also covers the host that waited in
+     * sem_timedwait(): shutdown_switch() posts the semaphore to wake us, and the token
+     * we may have received is not a real free port. Do not allocate a port; the
+     * semaphore is destroyed later, so the token need not be returned. */
+    if (atomic_load(&sw.shutting_down)) {
+        log_msg(LOG_INFO, "shutting down: closing a connection that was waiting for a port");
+        close_fd(fd);
+        return;
+    }
     if (rc == ETIMEDOUT) {
         log_msg(LOG_WARN, "no free port after %ld s: sending SWITCH FULL", sw.port_wait_sec);
         send_switch_full(fd);
@@ -221,8 +231,8 @@ static void *accept_main(void *arg)
         }
 
         if (pfd[1].revents & POLLIN) {
-            /* Part 7 writes to wake_efd to stop this thread. Until then nobody
-             * does; if it ever fires without shutdown, drain it so poll() blocks again. */
+            /* request_shutdown() writes to wake_efd to stop this thread. If it ever
+             * fires without shutdown, drain it so poll() blocks again. */
             if (atomic_load(&sw.shutting_down))
                 break;
             uint64_t counter;
@@ -269,21 +279,110 @@ static void *accept_main(void *arg)
 }
 
 /* ------------------------------------------------------------------ */
+/* Start-up and shutdown                                               */
+/* ------------------------------------------------------------------ */
+
+/* Which threads exist (and must be joined). Set only after a successful pthread_create. */
+typedef struct {
+    bool sig, reaper, aging, accept;
+    pthread_t sig_thread, accept_thread;
+} started_t;
+
+/* Ask for the teardown of every UP port. The reaper does the actual work. */
+static void request_down_all_ports(void)
+{
+    int up[MAX_PORTS + 1];
+    int n = 0;
+
+    /* Find the UP ports under the write lock, release it, THEN call
+     * port_request_down(): that function takes ports_lock itself. A port that
+     * leaves UP in between is already CLOSING and queued; port_request_down()
+     * then simply returns false for it. */
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    for (int i = 1; i <= sw.num_ports; i++)
+        if (sw.ports[i].state == PORT_UP)
+            up[n++] = i;
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+
+    for (int i = 0; i < n; i++)
+        (void)port_request_down(&sw.ports[up[i]], PORT_FREE);
+    log_msg(LOG_INFO, "shutdown: teardown requested for %d connected port(s)", n);
+}
+
+/*
+ * The shutdown sequence (also used when start-up fails half way: `st` says what
+ * exists). Every step is skipped if its thread was never started, and errors are
+ * logged without abandoning the rest.
+ */
+static void shutdown_switch(const started_t *st)
+{
+    log_msg(LOG_INFO, "shutdown: started");
+
+    /* 1. The signal thread (it ended itself after SIGINT/SIGTERM). */
+    if (st->sig)
+        signal_stop_join(st->sig_thread);
+
+    /* 2. Stop accept: the eventfd wakes poll(); the semaphore wakes a
+     *    sem_timedwait() of a host that waits for a port. request_shutdown() is
+     *    idempotent; calling it here makes the start-up failure path work too. */
+    if (st->accept) {
+        request_shutdown();
+        if (sem_post(&sw.free_ports) < 0)
+            log_msg(LOG_ERR, "shutdown: sem_post failed: %s", strerror(errno));
+        int rc = pthread_join(st->accept_thread, NULL);
+        if (rc != 0)
+            log_msg(LOG_ERR, "shutdown: join of the accept thread failed: %s", strerror(rc));
+    }
+    /* The accept thread is gone: nobody uses listen_fd any more. Close it now so
+     * new connections are refused while the ports are torn down. */
+    if (sw.listen_fd >= 0) {
+        if (close(sw.listen_fd) < 0)
+            log_msg(LOG_ERR, "shutdown: close of the listening socket failed: %s", strerror(errno));
+        sw.listen_fd = -1;
+    }
+    /* (3. The admin thread belongs to Part 15.) */
+
+    /* 4. Every UP port goes to the reaper. */
+    if (st->reaper) {
+        if (st->accept)
+            request_down_all_ports();      /* no port can be UP unless accept ran */
+        /* 5.+6. The reaper finishes everything queued (also ports that were already
+         *       CLOSING), then exits, and is joined. */
+        reaper_finish();
+    }
+
+    /* 7. The aging thread (woken by the shutdown broadcast). */
+    if (st->aging) {
+        request_shutdown();                /* start-up failure path: make sure it was requested */
+        int rc = pthread_join(sw.aging, NULL);
+        if (rc != 0)
+            log_msg(LOG_ERR, "shutdown: join of the aging thread failed: %s", strerror(rc));
+    }
+
+    /* 8-13. No thread is left: destroy things, each exactly once. */
+    mac_destroy();
+    free(sw.mac_region);
+    sw.mac_region = NULL;
+    switch_destroy();                      /* semaphore, locks, condition variables, listen_fd, wake_efd */
+    stats_destroy();
+}
 
 int main(int argc, char **argv)
 {
     long tcp_port, num_ports;
     const char *config = NULL;
+    started_t st;
+    int rc;
 
-    /*
-     * The switch now writes to sockets (sender threads). A write to a host
-     * that has gone must fail with EPIPE, not kill the whole process.
-     * (Part 7 will do this together with the signal mask for the signal thread.)
-     */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_handler = SIG_IGN;
-    CHECK(sigaction(SIGPIPE, &sa, NULL));
+    memset(&st, 0, sizeof st);
+
+    /* Before ANY thread exists: ignore SIGPIPE and block the signals that the
+     * signal thread will collect with sigwait(). */
+    rc = signal_setup();
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot set up signal handling: %s\n", strerror(rc));
+        return EXIT_FAILURE;
+    }
 
     if ((argc != 3 && argc != 5) ||
         (argc == 5 && strcmp(argv[3], "-c") != 0)) {
@@ -302,9 +401,9 @@ int main(int argc, char **argv)
         config = argv[4];
 
     switch_init((int)num_ports);
-    int src = stats_init(MAX_PORTS);
-    if (src != 0) {
-        fprintf(stderr, "switch: cannot allocate counters: %s\n", strerror(src));
+    rc = stats_init(MAX_PORTS);
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot allocate counters: %s\n", strerror(rc));
         return EXIT_FAILURE;
     }
     sw.config_path = config;
@@ -327,13 +426,53 @@ int main(int argc, char **argv)
             sw.mac_table_size, sw.mac_buckets, atomic_load(&sw.mac_aging_sec),
             atomic_load(&sw.max_macs_per_port));
 
-    CHECK_PT(pthread_create(&sw.reaper, NULL, reaper_main, NULL));   /* before any host can connect */
-    CHECK_PT(pthread_create(&sw.aging, NULL, aging_main, NULL));
+    /*
+     * Threads. The signal thread comes first so that a SIGINT during start-up is
+     * handled (a signal that arrives before it exists stays pending: it is blocked).
+     * If a thread cannot be created, the ones already running are stopped by the
+     * same shutdown sequence and the exit status is 1.
+     */
+    const char *failed = NULL;
 
-    pthread_t accept_thread;
-    CHECK_PT(pthread_create(&accept_thread, NULL, accept_main, NULL));
+    rc = signal_start(&st.sig_thread);
+    if (rc == 0) {
+        st.sig = true;
+        rc = pthread_create(&sw.reaper, NULL, reaper_main, NULL);  /* before any host can connect */
+        if (rc == 0) {
+            st.reaper = true;
+            rc = pthread_create(&sw.aging, NULL, aging_main, NULL);
+            if (rc == 0) {
+                st.aging = true;
+                rc = pthread_create(&st.accept_thread, NULL, accept_main, NULL);
+                if (rc == 0)
+                    st.accept = true;
+                else
+                    failed = "accept";
+            } else {
+                failed = "aging";
+            }
+        } else {
+            failed = "reaper";
+        }
+    } else {
+        failed = "signal";
+    }
 
-    /* Part 7 replaces this with "wait for shutdown, then run the shutdown sequence". */
-    CHECK_PT(pthread_join(accept_thread, NULL));
+    if (failed != NULL) {
+        fprintf(stderr, "switch: cannot start the %s thread: %s\n", failed, strerror(rc));
+        request_shutdown();
+        shutdown_switch(&st);
+        return EXIT_FAILURE;
+    }
+
+    /* Wait for the shutdown request. The predicate is tested under the lock before
+     * every wait, so a request made before we get here is not missed. */
+    CHECK_PT(pthread_mutex_lock(&sw.shutdown_lock));
+    while (!sw.shutdown_requested)
+        CHECK_PT(pthread_cond_wait(&sw.shutdown_cond, &sw.shutdown_lock));
+    CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
+
+    shutdown_switch(&st);
+    log_msg(LOG_INFO, "shutdown: complete");
     return EXIT_SUCCESS;
 }

@@ -10,6 +10,7 @@
 #include "frame.h"
 #include "mactable.h"
 #include "port.h"
+#include "sig.h"
 #include "stats.h"
 
 #include <arpa/inet.h>
@@ -32,6 +33,18 @@ static int checks = 0, failures = 0;
     } while (0)
 
 /* ---- access to the table region ---- */
+
+
+/* Read a port's state the way the switch does: under ports_lock (read side). */
+static enum port_state port_state(int id)
+{
+    enum port_state st;
+
+    CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
+    st = sw.ports[id].state;
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    return st;
+}
 
 static void *region;
 static mactable_t *T;
@@ -552,10 +565,7 @@ static void test_check_counts(void)
 /* ---- 11. the aging thread ---- */
 static void shutdown_now(void)
 {
-    CHECK_PT(pthread_mutex_lock(&sw.shutdown_lock));
-    atomic_store(&sw.shutting_down, true);
-    CHECK_PT(pthread_cond_broadcast(&sw.shutdown_cond));
-    CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
+    request_shutdown();             /* Part 7: no eventfd in this test (wake_efd is -1): skipped */
 }
 
 static void test_aging_thread(void)
@@ -912,7 +922,7 @@ static void test_ports_and_table(void)
            atomic_load(&sw.ports[3].mac_count) == 3);
     EXPECT(look(1, 3) == 2 && look(1, 5) == 3 && look(1, 1) == 1);
     EXPECT(check_ok());
-    EXPECT(sw.ports[3].state == PORT_UP);                /* 3 = M: no shutdown */
+    EXPECT(port_state(3) == PORT_UP);                /* 3 = M: no shutdown */
 
     /* a unicast from host 1 to MAC 3 (behind port 2) reaches port 2 only; then a broadcast
      * reaches everybody: the first frame port 3 gets must be the broadcast. */
@@ -954,7 +964,7 @@ static void test_ports_and_table(void)
     g = port_down_count(3);
     host_sends(p3, 7, bc);
     EXPECT(port_wait_down(3, g, 10000));
-    EXPECT(sw.ports[3].state == PORT_DISABLED);
+    EXPECT(port_state(3) == PORT_DISABLED);
     EXPECT(atomic_load(&sw.ports[3].mac_count) == 0 && look(1, 7) == -1 && look(1, 4) == -1);
     EXPECT(sem_value() == 8 - 3 + 1);                    /* a DISABLED port keeps its token */
     EXPECT(check_ok());

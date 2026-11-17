@@ -100,3 +100,23 @@ One of these goes into the final report.
   more in the median. The bounds are now 2.5x + 2 s for the time and 0.6x for the counts.
 - "30 connections reset after connect" (Part 5 test) read its counters before a slow
   (TSan) switch had accepted anything; it now waits until the counts are stable.
+
+## 10. Unlocked reads of port state in the unit tests (found in Part 7)
+- Symptom: `build/test_port_tsan` exited with status 66 after printing "ALL PASSED"
+  (the test redirects stderr to a log file and deletes it, so the report was invisible;
+  `TSAN_OPTIONS=log_path=...` showed it): a data race on `sw.ports[1].state`, read by
+  the test's main thread at `EXPECT(sw.ports[1].state == PORT_UP)` and written by the
+  receiver in `request_down_locked`.
+- Cause: the test read `state` without `ports_lock`. The race was already there in
+  Part 6; TSan reported it only after Part 7 added a field to `switch_t`, which changed
+  the layout of the global `sw` (the Part 6 sources passed 25+ runs).
+- Not a switch bug: the switch always reads/writes `state` under `ports_lock`.
+- Fix: `port_state(id)` helper in test_port.c and test_mactable.c that takes the read
+  lock; all comparisons of `state` in those tests use it.
+- Lesson: a test that "passes" can still exit non-zero; run_all.sh checks exit status.
+
+## 11. Shutdown predicate was only an atomic (Part 6 -> Part 7)
+- The aging thread and `switch_wait_ms()` waited on `shutdown_cond` testing the atomic
+  `shutting_down`. Not wrong in practice, but the roadmap requires a plain predicate
+  protected by the condition variable's mutex. `shutdown_requested` (under
+  `shutdown_lock`) is now the predicate; the atomic stays as a hint for the accept loop.

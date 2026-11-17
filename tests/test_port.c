@@ -109,6 +109,17 @@ static void tcp_pair(int *host, int *sw_fd)
     CHECK(close(ls));
 }
 
+/* Read a port's state the way the switch does: under ports_lock (read side). */
+static enum port_state port_state(int id)
+{
+    enum port_state st;
+
+    CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
+    st = sw.ports[id].state;
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    return st;
+}
+
 static void set_up(int nports)
 {
     switch_init(nports);
@@ -163,12 +174,12 @@ static void test_one_host(void)
     int peer;
     int id = start_host(&peer);
     EXPECT(id == 1);
-    EXPECT(sw.ports[1].state == PORT_UP);
+    EXPECT(port_state(1) == PORT_UP);
     EXPECT(sem_value() == 3);                           /* value + held tokens = FREE ports */
     EXPECT(open_threads() == thr0 + 2);                 /* receiver + sender (created, so present at once) */
 
     host_leaves(id, peer);
-    EXPECT(sw.ports[1].state == PORT_FREE);
+    EXPECT(port_state(1) == PORT_FREE);
     EXPECT(sw.ports[1].rfd == -1 && sw.ports[1].wfd == -1);
     EXPECT(sem_value() == 4);
     EXPECT(port_down_count(1) == 1);
@@ -207,7 +218,7 @@ static void test_forwarding_and_drain(void)
 
     host_resets(b, pb);                                 /* B dies; its queued frames are drained */
     host_leaves(a, pa);
-    EXPECT(sw.ports[1].state == PORT_FREE && sw.ports[2].state == PORT_FREE);
+    EXPECT(port_state(1) == PORT_FREE && port_state(2) == PORT_FREE);
     EXPECT(sem_value() == 4);
     tear_down();
     EXPECT(frame_live_count() == live0);                /* every frame was released exactly once */
@@ -298,7 +309,7 @@ static void test_single_teardown(void)
     EXPECT(port_wait_down(id, g, WAIT_MS));
     EXPECT(port_down_count(id) == g + 1);               /* torn down once, not 16 times */
     EXPECT(sem_value() == 3);                           /* one post, not 16 */
-    EXPECT(sw.ports[id].state == PORT_FREE);
+    EXPECT(port_state(id) == PORT_FREE);
     EXPECT(!port_request_down(&sw.ports[id], PORT_FREE));       /* a FREE port cannot be torn down */
     CHECK_PT(pthread_barrier_destroy(&bar));
     CHECK(close(peer));
@@ -318,7 +329,7 @@ static void test_disabled(void)
     unsigned long g = port_down_count(id);
     EXPECT(port_request_down(&sw.ports[id], PORT_DISABLED));
     EXPECT(port_wait_down(id, g, WAIT_MS));
-    EXPECT(sw.ports[id].state == PORT_DISABLED);
+    EXPECT(port_state(id) == PORT_DISABLED);
     EXPECT(sem_value() == 2);                           /* no sem_post for a DISABLED port */
     EXPECT(threads_settle(thr0) == thr0 && open_fds() == fds0 + 1);   /* +1: our own end `peer` */
     EXPECT(!port_request_down(&sw.ports[id], PORT_FREE));       /* DISABLED cannot be requested down */
@@ -372,7 +383,7 @@ static void test_simultaneous_failures(void)
             ok = 0;
         if (port_down_count(b) != g + 1)                /* exactly one teardown per round */
             ok = 0;
-        if (sw.ports[b].state != PORT_FREE || sem_value() != 3)
+        if (port_state(b) != PORT_FREE || sem_value() != 3)
             ok = 0;
     }
     EXPECT(ok);
@@ -409,7 +420,7 @@ static void test_many_cycles(void)
         }
         if (!port_wait_down(1, g, WAIT_MS) || port_down_count(1) != g + 1)
             ok = 0;
-        if (sem_value() != 2 || sw.ports[1].state != PORT_FREE)
+        if (sem_value() != 2 || port_state(1) != PORT_FREE)
             ok = 0;
     }
     EXPECT(ok);
@@ -431,7 +442,7 @@ static void test_reaper_finish(void)
         EXPECT(port_request_down(&sw.ports[i], PORT_FREE));
     reaper_finish();                                    /* returns after the 3 teardowns */
     for (int i = 1; i <= 3; i++)
-        EXPECT(sw.ports[i].state == PORT_FREE);
+        EXPECT(port_state(i) == PORT_FREE);
     EXPECT(sem_value() == 4);
     for (int i = 0; i < 3; i++)
         CHECK(close(p[i]));

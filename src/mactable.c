@@ -664,9 +664,9 @@ void *aging_main(void *arg)
          * (and the loop exits) as soon as shutdown starts. No sleep(), no polling. */
         CHECK_PT(pthread_mutex_lock(&sw.shutdown_lock));
         rc = 0;
-        while (rc == 0 && !atomic_load(&sw.shutting_down))
+        while (rc == 0 && !sw.shutdown_requested)                  /* the predicate, under the lock */
             rc = pthread_cond_timedwait(&sw.shutdown_cond, &sw.shutdown_lock, &deadline);
-        bool stop = atomic_load(&sw.shutting_down);
+        bool stop = sw.shutdown_requested;
         CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
 
         if (rc != 0 && rc != ETIMEDOUT)

@@ -57,7 +57,7 @@ typedef struct {
     int num_ports;
 
     int listen_fd;                 /* non-blocking listening socket */
-    int wake_efd;                  /* eventfd that wakes the accept thread (written from Part 7) */
+    int wake_efd;                  /* eventfd: request_shutdown() writes it to wake the accept thread */
 
     /* Free-port semaphore. Invariant: its value + the tokens held by the accept
      * thread = the number of FREE ports. */
@@ -77,7 +77,12 @@ typedef struct {
     pthread_cond_t port_down_cond;           /* monotonic clock */
     unsigned long port_down_gen[MAX_PORTS + 1];  /* teardowns completed per port */
 
-    _Atomic bool shutting_down;    /* set from Part 7 */
+    /* Shutdown (Part 7). shutdown_requested is THE predicate: it is protected by
+     * shutdown_lock and every wait on shutdown_cond tests it in a loop.
+     * shutting_down is only a lock-free hint for loops that must not take the lock
+     * (the accept thread); it is set together with shutdown_requested. */
+    bool shutdown_requested;
+    _Atomic bool shutting_down;
     pthread_mutex_t shutdown_lock;
     pthread_cond_t shutdown_cond;  /* monotonic clock; timed waits wake early on shutdown */
 
@@ -98,8 +103,15 @@ extern switch_t sw;
 void switch_init(int num_ports);
 
 /*
- * Wait up to ms milliseconds on shutdown_cond (returns early if shutting_down
- * is set). Used instead of sleep() when a loop must pause.
+ * Destroy every lock, condition variable and the semaphore created by
+ * switch_init() and close wake_efd and listen_fd if still open. Call it once,
+ * after every thread that could use them has been joined.
+ */
+void switch_destroy(void);
+
+/*
+ * Wait up to ms milliseconds on shutdown_cond (returns early if shutdown was
+ * requested). Used instead of sleep() when a loop must pause.
  */
 void switch_wait_ms(long ms);
 
