@@ -1,0 +1,68 @@
+=====================================================================
+PART 13 - VLANs AND THE TRUNK PORT
+=====================================================================
+
+1. WHAT PART 13 IMPLEMENTS
+--------------------------
+Hosts reach only hosts of the same VLAN; one trunk port carries every VLAN. Configuration: port.N.vlan (default 1; reloadable) and trunk_port
+(0 = none; startup only).
+
+Files:   src/forward.c          the VLAN rule at ingress and the egress eligibility test
+         src/port.c, include/port.h   port_set_vlan(), port_vlan_ok(); port_start sets p->vlan and p->trunk from the configuration
+         src/config.c, include/config.h   config_port_vlan(cfg, port): port.N.vlan if set, else 1
+         src/reload.c           a reload applies the EFFECTIVE VLAN of every port whose VLAN changed (port_set_vlan + flush)
+         tests/test_vlan.c, tests/test_vlan.py   the Part 13 tests (permanent; registered in tests/run_unit.sh)
+         tests/test_part13.py   temporary dedicated runner of exactly those tests (deleted when Part 14 starts)
+         Makefile (test_vlan joins the switch-object test rule), README.md, docs/Part13_Explanation.txt, notes/bugs.md 24
+
+2. DESIGN
+---------
+  - The VLAN of a frame is fixed ONCE, at ingress, in forward_frame (ports_lock held for reading, the frame still private, refcount 1):
+      access port: f->vlan = in_port->vlan and the two wire bytes 14-15 are overwritten, whatever the host wrote;
+      trunk port : the frame keeps its VLAN; outside 1..4094 -> dropped, counted (STAT_DROP of the trunk), not learned, logged
+                   ("trunk frame with invalid VLAN V dropped", first and every 1000th).
+  - Egress eligibility port_vlan_ok(dst, v) = dst is the trunk or dst->vlan == v; with "UP and not the ingress port" it is used for
+    flooding and for unicast. The lookup is keyed by (v, dst) so a MAC learned in another VLAN is never found: such a unicast floods inside
+    the sender's VLAN and is never delivered across VLANs. A stale unicast target (a port whose VLAN just changed) is not used: flood.
+  - No per-copy rewrite: the VLAN is already final, so the single shared frame is right for every queue (the trunk keeps the field, access
+    hosts see their own VLAN). The zero-copy broadcast of Part 4 is kept.
+  - Trunk ports are exempt from max_macs_per_port (this was already coded in mactable.c).
+  - port_set_vlan(p, v): write lock, p->vlan = v, unlock, then mac_flush_port(p->id), so entries of the old VLAN vanish. A frame is learned
+    and rewritten in ONE read-locked section, so no entry can be learned with the old VLAN after the write lock was granted.
+  - Port start: port_start reads the configuration (config_lock is a leaf) and fixes p->vlan and p->trunk before the port is UP.
+  - Reload: the effective VLAN (port.N.vlan or 1) is compared old/new for every port; changed -> port_set_vlan, logged
+    ("reload: port N VLAN a -> b, its old MAC entries were flushed"); unchanged ports are not touched. trunk_port: "ignored until restart".
+Lock order is unchanged.
+
+3. TESTS
+--------
+tests/test_vlan.c (normal, TSan, valgrind): the roadmap layout (ports 1,3 VLAN 10; 2,4 VLAN 20; 5 trunk; 6 default): broadcast from port 1
+reaches 3 and the trunk, the trunk sees vlan 10 in f->vlan and in the wire bytes, one shared frame (zero-copy); a trunk frame with vlan 20
+reaches 2 and 4 only; unicast never crosses VLANs; same MAC in two VLANs = two entries; destination not UP floods in its VLAN; invalid trunk VLANs
+0, 4095, 5000, 65535 are dropped, counted and not learned, 1 and 4094 are valid; access ports ignore the field (0 and 65535 are rewritten, not
+dropped); trunk exempt from port security, access port not; port_set_vlan flushes; the window between "VLAN set" and "flushed"; only the VLAN
+bytes are rewritten; 3 forwarding threads + a thread that changes a VLAN 400 times.
+tests/test_vlan.py (normal 83, TSan 42, valgrind 15 checks): the same criterion through real sockets, default VLAN 1, invalid trunk frames, SIGHUP
+moves (and an invalid reload changes nothing), a new host on a port, bad values, port security of the trunk, SIGINT under VLAN traffic, valgrind.
+Mutation checks (all caught): no rewrite, wire bytes not rewritten, flood ignores VLAN, unicast ignores VLAN (found a gap: a test for the stale
+entry was added), trunk not checked, trunk limit 4095, no flush in port_set_vlan, trunk not eligible, reload not applied, p->trunk never set.
+
+4. CHANGES TO EXISTING TESTS (the user approved these; none was removed or skipped)
+-------------------------------------------------------------------------------------
+Part 13 makes an access port overwrite the VLAN of a frame, and applies port.N.vlan / trunk_port. Tests that wrote a non-default VLAN on an
+access port and expected it back, or that relied on "stored, not applied", changed:
+  tests/test_switch.py        thread count: + the "token-timer" thread of Part 12.
+  tests/test_config_signals.py  reload log for rates (Part 12) and VLANs (Part 13) is "applied", not "stored" (stricter); the MAC dump test makes
+                              host B's port the trunk so that B still appears in a second VLAN; the reload-under-flood test toggles port 4's VLAN
+                              (the flood uses ports 1-3; port 2 in another VLAN would hide the marker from host M).
+  tests/test_forward.py, tests/forward.sh, tests/broadcast.sh   frames written with vlan 4094/100/10/258 now arrive with the port's VLAN 1;
+                              prio, length and payload are asserted as before; the unicast to host 3 is now a unicast (its MAC is learned in VLAN 1).
+  tests/test_port.c           a frame written with vlan 7 arrives as vlan 1.
+  tests/test_mac.py           "VLAN is part of the key": port 2 is the trunk and the observer's port moves to VLAN 7 by SIGHUP; port security:
+                              the same MAC with another VLAN field is now the SAME entry (no violation), and a really new 4th MAC still disables the port.
+  tests/test_mactable.c       the VLAN-key step makes port 3 the trunk and ports 1, 2, 4 VLAN 9 for that step.
+
+5. RESULTS
+----------
+python3 tests/test_part13.py: ALL PASSED (normal, TSan, valgrind). make test: all of Parts 1-13 and the ten integration scripts passed.
+Open: test_mac.py failed 2 checks once in 10 runs (aging step) and was not captured; it passed 12 later runs. Not explained.

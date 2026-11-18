@@ -63,8 +63,9 @@ check "B got ring-a-1 .. ring-a-10 in order" test "$got" = "$want"
 
 echo "header fields and payload sizes survive the switch (vlan, prio, 0 and 1500 bytes)"
 say A "sendx bcast 100 2 hdr-test"
-for h in B C D; do wait_out $h "vlan=100 prio=2 len=8 data=hdr-test" || bad "$h did not get vlan 100 / prio 2 intact"; done
-ok "B, C and D got the frame with vlan=100 prio=2 unchanged"
+# Part 13: the host wrote vlan 100; an access port overwrites it with the port's VLAN (1); prio, length and data stay
+for h in B C D; do wait_out $h "vlan=1 prio=2 len=8 data=hdr-test" || bad "$h did not get vlan 1 (rewritten from 100) / prio 2 / the data intact"; done
+ok "B, C and D got the frame with vlan=1 (the sender wrote 100: the access port rewrites it), prio=2 and the data unchanged"
 BIG=$(printf 'M%.0s' $(seq 1 1500))
 say A "send $B $BIG"
 say A "send $B"

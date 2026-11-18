@@ -100,24 +100,43 @@ int reload_config(void)
         changes++;
     }
     changes += report_int("prio_aging_ms", old.prio_aging_ms, fresh.prio_aging_ms, "(applies to the next frame picked)");
-    changes += report_int("rate_limit", old.rate_limit, fresh.rate_limit, "(stored; no effect until the rate limiting of Part 12)");
+    changes += report_int("rate_limit", old.rate_limit, fresh.rate_limit, "(frames/s; applies at once to every port without its own port.N.rate)");
     if (strcmp(old.mac_dump_file, fresh.mac_dump_file) != 0) {
         log_msg(LOG_INFO, "reload: mac_dump_file '%s' -> '%s'", old.mac_dump_file, fresh.mac_dump_file);
         changes++;
     }
     for (int i = 1; i <= sw.num_ports; i++) {
-        /* The effects belong to later parts: VLAN switching (Part 13/16) and the token bucket (Part 12). The
-         * values are kept in the live configuration so that those parts can read them; nothing pretends that
-         * a port's VLAN or rate is applied now. */
         if (old.port_vlan[i] != fresh.port_vlan[i]) {
-            log_msg(LOG_INFO, "reload: port.%d.vlan %d -> %d (stored; VLANs are not applied until Part 13)", i,
-                    old.port_vlan[i], fresh.port_vlan[i]);
+            log_msg(LOG_INFO, "reload: port.%d.vlan %d -> %d (0 = not set, VLAN %d; applied below)", i,
+                    old.port_vlan[i], fresh.port_vlan[i], DEFAULT_VLAN);
             changes++;
         }
         if (old.port_rate[i] != fresh.port_rate[i]) {
-            log_msg(LOG_INFO, "reload: port.%d.rate %d -> %d (stored; rate limiting is not applied until Part 12)", i,
+            log_msg(LOG_INFO, "reload: port.%d.rate %d -> %d (frames/s, -1 = not set, rate_limit applies)", i,
                     old.port_rate[i], fresh.port_rate[i]);
             changes++;
+        }
+    }
+    /* VLANs (Part 13): a port whose EFFECTIVE VLAN changed gets it now; its MAC entries of the old VLAN are flushed
+     * (port_set_vlan). The trunk port keeps the VLAN of every frame, so for it the value only matters as a setting.
+     * A port that is not UP reads the configuration when a host connects. No lock is held here. */
+    for (int i = 1; i <= sw.num_ports; i++) {
+        const int was = config_port_vlan(&old, i), now = config_port_vlan(&fresh, i);
+
+        if (was != now) {
+            port_set_vlan(&sw.ports[i], (uint16_t)now);
+            log_msg(LOG_INFO, "reload: port %d VLAN %d -> %d, its old MAC entries were flushed", i, was, now);
+        }
+    }
+    /* Rate limiting (Part 12): a port whose EFFECTIVE rate changed gets its new rate at once (its token bucket
+     * is reset to the new cap); ports whose rate did not change keep their tokens. A port that is not UP reads
+     * the configuration when it starts. No lock is held here. */
+    for (int i = 1; i <= sw.num_ports; i++) {
+        const int was = config_port_rate(&old, i), now = config_port_rate(&fresh, i);
+
+        if (was != now) {
+            port_apply_rate(i, now);
+            log_msg(LOG_INFO, "reload: port %d rate limit %d -> %d frames/s (0 = unlimited), applied", i, was, now);
         }
     }
     report_ignored("mac_table_size", old.mac_table_size, fresh.mac_table_size);

@@ -11,6 +11,10 @@
  *   - outq_pop picks the next frame with sched_pick(): weighted round robin (weights from the
  *     configuration, 5:3:1 by default) plus an aging override so that a low-priority frame is never
  *     starved: the head of the low (then normal) ring that has waited longer than prio_aging_ms is sent next.
+ *
+ * Part 12 (rate limiting) adds a token bucket to the same pop path: rate (frames per second, 0 = unlimited)
+ * and tokens_milli (one frame costs 1000). A timer thread adds tokens every TOKEN_TICK_MS (outq_refill);
+ * outq_pop sleeps on the condition variable - it does not spin - until a whole token is there.
  */
 #ifndef QUEUE_H
 #define QUEUE_H
@@ -39,7 +43,13 @@ typedef struct {
     int credit[OUTQ_CLASSES];  /* weighted round robin: sends left for each class in this round */
     int cap;                   /* frames per class */
     bool closing;
+    int rate;                  /* frames per second; 0 = unlimited (no token check) */
+    long tokens_milli;         /* 1000 = one frame; never more than rate * 1000 (a burst of one second) */
 } outq_t;
+
+#define TOKEN_TICK_MS 100          /* period of the token timer thread */
+#define TOKEN_COST 1000L           /* milli-tokens per frame */
+#define MAX_RATE 1000000           /* largest allowed rate (frames/s); keeps rate * 1000 far inside a long */
 
 /* The ring that a frame priority maps to: 0 -> 0, 1 -> 1, anything above 2 -> 2. */
 int outq_class_of(unsigned prio);
@@ -63,10 +73,21 @@ int outq_init(outq_t *q, int cap);
 bool outq_try_push(outq_t *q, frame_t *f);
 
 /*
- * Take the next frame as chosen by sched_pick (see queue.c); sleeps while the queue is empty. Returns
+ * Take the next frame as chosen by sched_pick (see queue.c); sleeps while the queue is empty or (with a rate)
+ * while there is no whole token; a frame sent costs one token. Returns
  * true and sets *f (the caller now owns that reference), or returns false when the queue is closing.
  */
 bool outq_pop(outq_t *q, frame_t **f);
+
+/*
+ * Set the rate (frames per second; 0 = unlimited; values above MAX_RATE are cut to it). Takes effect at
+ * once: the bucket is reset to its new cap (rate * 1000, a burst of one second) and a waiting sender is woken.
+ */
+void outq_set_rate(outq_t *q, int rate);
+
+/* Add `ms` milliseconds' worth of tokens (rate * ms), capped at rate * 1000; wakes the sender when a whole
+ * token is available. Does nothing for an unlimited queue. Called by the token timer thread. */
+void outq_refill(outq_t *q, long ms);
 
 /* Mark the queue closing and wake the sleeping sender. */
 void outq_close(outq_t *q);

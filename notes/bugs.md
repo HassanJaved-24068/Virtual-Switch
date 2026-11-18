@@ -294,3 +294,20 @@ program that ignores SIGINT.
   frames" and the switch does not shut down.
 - Left as it is: test_dropped_frames_are_counted_and_released asserts a drop counter >= 1000 after 10,000 frames of 1400 bytes to a host that never reads; that
   depends on how much the kernel buffers (a few MB), not on the load. It passed in every run.
+
+## 23. Part 12 tests: three test-side mistakes (no switch defect)
+- test_rate.c: a producer leaked a frame whose push failed (the caller keeps its reference when try_push returns false). Found by the frame_live_count check.
+- test_rate.py: the reader thread put a 0.5 s timeout on host A's socket, which the flooder also uses; under valgrind sendall() timed out. Now select().
+- test_rate.py: the bounds used the nominal window (5 s) instead of the real one (valgrind made the last sendall last longer): 324 frames in a longer window
+  looked like a violation of "at most 310". Bounds now use the measured window.
+- Also: the Part 10 test that asserted "stored; ... until Part 12" was updated to the Part 12 behaviour (docs/Part12_Explanation.txt section 4).
+
+## 24. Part 13: old tests that assumed the VLAN of a frame is kept, and test-side mistakes (no switch defect)
+- Part 13 is a deliberate behaviour change (access ports overwrite the VLAN; port.N.vlan and trunk_port are applied), so tests written for Parts 4-10
+  failed: test_forward.py, forward.sh, broadcast.sh, test_port.c, test_mac.py (2 tests), test_mactable.c, test_config_signals.py (3 places). Each was
+  adapted with the user's approval, keeping its intent (docs/Part13_Explanation.txt section 4). One adaptation also corrected a hidden assumption: a frame
+  written with vlan 4094 for a MAC that is learned in VLAN 1 is now a unicast, not a flood.
+- test_vlan.c: the wire image of a test frame was only partly initialised (valgrind: "conditional jump depends on uninitialised value"); a failed check
+  dereferenced a NULL frame (segfault instead of a failed check); a mutation showed that nothing tested a stale unicast entry (test added).
+- test_vlan.py: the host index was off by one in four unicast checks.
+- Open: tests/test_mac.py failed two checks in one run of ten (an aging step, output not kept); 12 later runs passed. Cause not found.

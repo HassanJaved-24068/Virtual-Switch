@@ -142,19 +142,28 @@ def test_basic_flooding():
     hs[1].say("sendx %s 4094 2 vlan-and-prio" % ME[3])
     hs[1].say("sendx bcast 10 0 ")
     hs[1].say("sendx bcast 258 1 " + big)
-    sent_by(1, 3, "the special frames")
+    # Part 13: the first frame is written with vlan 4094 but rewritten to the port's VLAN 1, where host 3's MAC is already learned:
+    # it is a unicast to host 3 only (before Part 13 the lookup in VLAN 4094 failed and it was flooded). The two broadcasts reach all.
+    sent_by(1, 2, "the special broadcasts")
+    want[3] += 1
+    check(hs[3].wait_rx(want[3]), "host 3 received the special unicast from host 1")
     # These three frames have THREE DIFFERENT PRIORITIES (2, 0, 1). Since Part 11 the sender of a port takes high before
     # normal before low: when the three are queued together (a busy machine, a slow sender) they leave in that order,
     # not in the order they were sent. Each frame must arrive exactly once and intact (all fields); the order between
     # different priorities is the scheduler's choice and is not asserted here (tests/test_qos.c and test_qos.py do).
-    special = (("vlan 4094 prio 2", (ME[1], ME[3], 4094, 2, 13, "vlan-and-prio")),
-               ("zero-length frame", (ME[1], BCAST, 10, 0, 0, "")),
-               ("1500-byte payload", (ME[1], BCAST, 258, 1, 1500, big)))
+    # Part 13: the VLAN of a frame from an access port is the port's VLAN (1 here), whatever the host wrote (4094, 10, 258 are
+    # sent, VLAN 1 must arrive); addresses, priority, length and payload still arrive exactly as sent.
+    special = (("vlan 4094 -> 1, prio 2", (ME[1], ME[3], 1, 2, 13, "vlan-and-prio")),
+               ("zero-length frame (sent vlan 10)", (ME[1], BCAST, 1, 0, 0, "")),
+               ("1500-byte payload (sent vlan 258)", (ME[1], BCAST, 1, 1, 1500, big)))
     for j in (0, 2, 3):
-        got = [parse_rx(l) for l in hs[j].rx()][-3:]
-        for name, frame in special:
+        mine = special if j == 3 else special[1:]                 # hosts 0 and 2 do not get the unicast for host 3
+        got = [parse_rx(l) for l in hs[j].rx()][-len(mine):]
+        for name, frame in mine:
             check(got.count(frame) == 1, "host %d: %s intact" % (j, name))
-        check(sorted(got) == sorted(f for _, f in special), "host %d: the last three frames are exactly these three (nothing else, none missing)" % j)
+        check(sorted(got) == sorted(f for _, f in mine), "host %d: the last %d frames are exactly these (nothing else, none missing)" % (j, len(mine)))
+        if j != 3:
+            check(not any(f == special[0][1] for f in [parse_rx(l) for l in hs[j].rx()]), "host %d did not get the unicast meant for host 3" % j)
 
     # a burst from one sender: order is kept (the queue is 64 frames, so a burst of 200
     # may lose frames; then a drop was logged, and the ones that arrive are still in order)

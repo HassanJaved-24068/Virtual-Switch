@@ -181,4 +181,23 @@ void *receiver_main(void *arg);
 /* Sender thread: arg is a port_t *. Pops frames from p->q and writes them. */
 void *sender_main(void *arg);
 
+/*
+ * Rate limiting (Part 12). The token timer thread wakes every TOKEN_TICK_MS (absolute deadlines on
+ * shutdown_cond: no drift, and it ends at once on shutdown) and gives every UP port's queue its tokens,
+ * one port at a time in ascending order (ports_lock read, then the queue lock).
+ */
+void *token_timer_main(void *arg);
+
+/*
+ * VLANs (Part 13). port_set_vlan: take the ports_lock write lock, set the VLAN of the port, release it, THEN
+ * mac_flush_port() so that the entries learned in the old VLAN vanish (no lock is held while flushing). Used by SIGHUP
+ * (and by swctl later). The trunk port keeps the VLAN of every frame; its own `vlan` field is not used.
+ * vlan_eligible: may a frame of VLAN v be sent out of `dst`? (the caller holds ports_lock; the port must also be UP)
+ */
+void port_set_vlan(port_t *p, uint16_t vlan);
+bool port_vlan_ok(const port_t *dst, uint16_t vlan);
+
+/* Apply a new rate to port `id` if it is UP (a port that starts later reads the configuration itself). */
+void port_apply_rate(int id, int rate);
+
 #endif /* PORT_H */

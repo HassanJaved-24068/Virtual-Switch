@@ -62,6 +62,20 @@ void config_defaults(config_t *cfg, int num_ports)
     snprintf(cfg->log_file, sizeof cfg->log_file, "%s", DEFAULT_LOG_FILE);
 }
 
+int config_port_rate(const config_t *cfg, int port)
+{
+    if (port >= 1 && port <= MAX_PORTS && cfg->port_rate[port] >= 0)
+        return cfg->port_rate[port];
+    return cfg->rate_limit;
+}
+
+int config_port_vlan(const config_t *cfg, int port)
+{
+    if (port >= 1 && port <= MAX_PORTS && cfg->port_vlan[port] >= 1)
+        return cfg->port_vlan[port];
+    return DEFAULT_VLAN;
+}
+
 int config_mac_buckets(int mac_table_size)
 {
     int b = 1;

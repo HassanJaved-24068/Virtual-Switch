@@ -63,6 +63,12 @@ void config_defaults(config_t *cfg, int num_ports);
  */
 int config_load(const char *path, config_t *cfg, config_error_t *err);
 
+/* The rate (frames/s, 0 = unlimited) of port `port` (1..MAX_PORTS): port.N.rate if set, else rate_limit. */
+int config_port_rate(const config_t *cfg, int port);
+
+/* The VLAN of access port `port` (1..MAX_PORTS): port.N.vlan if set, else DEFAULT_VLAN (1). */
+int config_port_vlan(const config_t *cfg, int port);
+
 /* Bucket count for a table of K entries: 256, or the largest power of two <= K for a small table. */
 int config_mac_buckets(int mac_table_size);
 

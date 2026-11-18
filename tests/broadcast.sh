@@ -43,7 +43,8 @@ say H1 "send bcast"
 say H1 "sendx bcast 4094 0 vlan-test"
 for i in 2 3 4; do
     wait_out H$i "len=1500 data=$BIG" || bad "H$i did not get the 1500-byte broadcast"
-    wait_out H$i "vlan=4094 prio=0 len=9 data=vlan-test" || bad "H$i did not get vlan 4094 / prio 0 intact"
+    # Part 13: written as vlan 4094, delivered with the VLAN of the access port (1); prio, length and data stay
+    wait_out H$i "vlan=1 prio=0 len=9 data=vlan-test" || bad "H$i did not get vlan 1 (rewritten from 4094) / prio 0 / the data intact"
     wait_out H$i "src=$(mac 1) dst=ff:ff:ff:ff:ff:ff vlan=1 prio=1 len=0 data=" || bad "H$i did not get the empty broadcast"
 done
 ok "H2, H3 and H4 got all three frames unchanged"

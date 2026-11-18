@@ -206,7 +206,8 @@ static void test_forwarding_and_drain(void)
     frame_hdr_t r;
     uint8_t pay[MAX_PAYLOAD];
     EXPECT(frame_recv(pb, &r, pay) == FR_OK);           /* the sender thread of port 2 wrote it */
-    EXPECT(r.len == 5 && r.vlan == 7 && memcmp(pay, "hello", 5) == 0);
+    /* Part 13: the host wrote vlan 7; an access port overwrites it with the port's VLAN (1 by default). */
+    EXPECT(r.len == 5 && r.vlan == 1 && memcmp(pay, "hello", 5) == 0);
     EXPECT(stats_get(1, STAT_IN) == 1);
 
     /* Fill port 2's queue: host B never reads, so its sender blocks in write(). */

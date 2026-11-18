@@ -962,11 +962,18 @@ static void test_forward_decision(void)
         EXPECT(mac_lookup(1, ms) == -1);               /* but not learned */
     }
 
-    /* the vlan is part of the key: A is unknown in vlan 9, so this floods */
+    /* the vlan is part of the key: A is unknown in vlan 9, so this floods.
+     * Part 13: only the trunk keeps the VLAN a frame carries and only ports in that VLAN receive it, so for this step port 3 is the
+     * trunk and ports 1, 2 and 4 are in VLAN 9; everything is restored afterwards. */
+    sw.ports[3].trunk = true;
+    sw.ports[1].vlan = sw.ports[2].vlan = sw.ports[4].vlan = 9;
     f = mkframe(0xC, 0xA, false, false, 9);
     forward_frame(&sw.ports[3], f);
     frame_unref(f);
     EXPECT(queued(1) == 3 && queued(2) == 6 && queued(4) == 6);
+    sw.ports[3].trunk = false;
+    for (int i = 1; i <= 4; i++)
+        sw.ports[i].vlan = DEFAULT_VLAN;
 
     /* port security: the 4th MAC on port 2 -> LEARN_VIOLATION, frame dropped, no lock left held */
     int before = queued(1) + queued(3) + queued(4);

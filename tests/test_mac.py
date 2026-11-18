@@ -10,7 +10,7 @@ file before Part 10).
 
 Environment: SWITCH (default ./switch), SWITCH_SMALL (default ./switch_small), HOST.
 """
-import os, re, shlex, signal, socket, struct, subprocess, sys, threading, time
+import os, re, shlex, signal, socket, struct, subprocess, sys, tempfile, threading, time
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -132,7 +132,12 @@ def no_errors(sw):
 
 def test_filter_and_source_rules():
     print("MAC table: filtering, broadcast and multicast sources")
-    sw = ts.Switch(8)
+    # Part 13: the raw host on port 2 is the TRUNK port, the only port that keeps the VLAN a frame carries (an access port
+    # overwrites it), so that it can still use several VLANs in the vlan-key check at the end.
+    vconf = os.path.join(tempfile.mkdtemp(prefix="vswmac."), "v.conf")
+    with open(vconf, "w") as f:
+        f.write("trunk_port = 2\n")
+    sw = ts.Switch(8, extra=["-c", vconf])
     obs = tf.H(sw, ME[5])                               # port 1: observer (real host)
     raw = ts.connect(sw)                                # port 2: a raw host with several MACs
     fast_wait(sw, "port 2: host connected")
@@ -157,7 +162,12 @@ def test_filter_and_source_rules():
     check(fast_wait(sw, "port 1: RX src=%s" % ME[5]), "observer sent")
     check(sw.count("port 2: RX src=%s" % MCAST) == 1, "multicast source frame was received once")
 
-    # the vlan is part of the key
+    # the vlan is part of the key. Part 13: the observer's port moves to VLAN 7 (SIGHUP), so that it is in the VLAN of the trunk frame
+    n = sw.count("configuration reloaded from")
+    with open(vconf, "w") as f:
+        f.write("trunk_port = 2\nport.1.vlan = 7\n")
+    sw.p.send_signal(signal.SIGHUP)
+    check(fast_wait(sw, "configuration reloaded from", n + 1), "the observer's port is moved to VLAN 7 by a reload")
     raw.sendall(ts.frame(X, BCAST, 7, 1, b"in-vlan-7"))
     obs.say("sendx %s 7 1 to-x-vlan7" % X)
     check(got(obs, "in-vlan-7"), "frame in vlan 7 forwarded")
@@ -175,6 +185,7 @@ def test_filter_and_source_rules():
     raw.close()
     obs.quit()
     sw.stop()
+    subprocess.run(["rm", "-rf", os.path.dirname(vconf)])
 
 
 def test_mac_move_and_flush():
@@ -380,7 +391,7 @@ def test_port_security():
 
 
 def test_port_security_details():
-    print("MAC table: multicast sources and repeated MACs do not count; vlans do")
+    print("MAC table: multicast sources and repeated MACs do not count; the VLAN field of an access port does not make a new entry (Part 13)")
     sw = ts.Switch(4, cmd=SMALL)
     obs = tf.H(sw, ME[9])
     r = ts.connect(sw)
@@ -394,8 +405,13 @@ def test_port_security_details():
     check(sw.count("shut down") == 0, "6 multicast sources + 1 MAC repeated: no violation")
     r.sendall(ts.frame(ME[31], BCAST, 1, 1, b"two") + ts.frame(ME[32], BCAST, 1, 1, b"three"))
     check(got(obs, "three") and sw.count("shut down") == 0, "3 MACs: still fine")
-    r.sendall(ts.frame(ME[30], BCAST, 2, 1, b"vlan-2"))   # the same MAC in another vlan = a 4th entry
-    check(fast_wait(sw, "port 2 shut down: MAC flooding"), "the same MAC in a 2nd vlan counts as another entry")
+    # Part 13: before, "the same MAC in another VLAN" was a 4th entry. An access port now overwrites the VLAN field with its own
+    # VLAN, so it is the SAME entry: no violation. (The (VLAN, MAC) key itself is tested in test_mactable.c and test_vlan.c.)
+    r.sendall(ts.frame(ME[30], BCAST, 2, 1, b"vlan-2"))
+    check(got(obs, "vlan-2"), "the frame written with vlan 2 is forwarded (as VLAN 1)")
+    check(sw.count("shut down") == 0, "the same MAC with another VLAN field is not a 4th entry on an access port")
+    r.sendall(ts.frame(ME[33], BCAST, 1, 1, b"four"))     # a really new MAC is the 4th entry
+    check(fast_wait(sw, "port 2 shut down: MAC flooding"), "a 4th different MAC is a violation")
     check(fast_wait(sw, "port 2: " + DISABLED), "-> DISABLED")
     r.close()
     obs.quit()

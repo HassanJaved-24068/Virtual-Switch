@@ -1,0 +1,59 @@
+=====================================================================
+PART 12 - RATE LIMITING: TOKEN BUCKET AND TOKEN TIMER THREAD
+=====================================================================
+
+1. WHAT PART 12 IMPLEMENTS
+--------------------------
+Each port sends at most `rate` frames per second to its host, with no sleeping and no spinning. rate_limit (every port) and port.N.rate (one
+port, overrides rate_limit) come from the configuration; 0 = unlimited. A SIGHUP applies a changed rate at once.
+
+Files:   include/queue.h, src/queue.c   outq_t.rate / tokens_milli, outq_set_rate(), outq_refill(), the token wait in outq_pop()
+         src/port.c, include/port.h     token_timer_main() (the timer thread), port_apply_rate(), the rate set in port_start()
+         src/switch.c                   the timer thread is created, tracked in started_t and joined in the shutdown sequence
+         src/config.c, include/config.h config_port_rate(cfg, port): port.N.rate if set, else rate_limit
+         src/reload.c                   a reload applies the EFFECTIVE rate of every port whose rate changed
+         tests/test_rate.c, tests/test_rate.py   the Part 12 tests (permanent; registered in tests/run_unit.sh)
+         tests/test_part12.py           temporary dedicated runner of exactly those tests (deleted when Part 13 starts)
+         README.md, docs/Part12_Explanation.txt
+
+2. DESIGN
+---------
+Units are milli-tokens: a frame costs 1000. The bucket (tokens_milli) never holds more than rate * 1000 (a burst of one second).
+  - Timer thread "token-timer": every TOKEN_TICK_MS (100 ms) it takes each UP port in ascending order (ports_lock read, then that queue's lock,
+    one queue at a time) and calls outq_refill(q, ms): tokens += rate * ms, capped; broadcast when the total reached 1000. It waits with
+    pthread_cond_timedwait(shutdown_cond) on an ABSOLUTE deadline that advances by 100 ms per tick (no drift); it ends at once on shutdown.
+    If it is late it counts the missed periods (at most 1 s: the bucket cannot hold more), so the long-run rate stays right on a loaded machine.
+  - outq_pop: while (!closing) { empty -> cond_wait; rate > 0 && tokens < 1000 -> cond_timedwait (safety net of 2 ticks); else break }.
+    Nothing polls. After picking the frame (scheduler of Part 11 unchanged) it subtracts 1000. rate 0: no token check at all.
+  - outq_set_rate: sets the rate, resets the bucket to the new cap, broadcasts: effective immediately. Values are cut to 0..1000000.
+  - Throttling never blocks a receiver: frames that wait for tokens fill the rings; a full ring means try_push fails and the frame is dropped
+    (counted, logged) exactly as before.
+  - Start of a port: port_start reads the configuration (config_lock is a leaf) and sets the rate BEFORE the sender thread exists.
+  - Reload: ports whose effective rate changed get port_apply_rate (ports_lock read, port UP only); the others keep their tokens.
+Lock order is unchanged: ports_lock -> queue lock; config_lock and shutdown_lock are leaves.
+
+3. TESTS
+--------
+tests/test_rate.c (194 checks; normal, TSan, valgrind): rate 0 unlimited; set_rate clamps; burst then block (the blocked sender used 0.2 ms of CPU in
+300 ms); half a token is not enough; wake-up by the refill broadcast (not by the safety timeout); cap and overflow; rate change and rate 0 release a
+blocked sender; close wakes a throttled sender; push never blocks; 5:3:1 order unchanged; 4 producers + limited sender + refill thread.
+tests/test_rate.py (normal 79, TSan 36, valgrind 11 checks): port.2.rate = 50 -> B gets 300 in 5 s (limit: burst 50 + 50/s), the unlimited host gets
+about 700x more, A's sendall never stalls; the sender thread's CPU (from /proc) is below 5 % of the time; rate_limit with an override; SIGHUP
+unlimited -> 30 -> unlimited, an unrelated reload keeps the buckets, an invalid reload keeps the old rate; rate 1 and 1000000; a new host on a limited
+port is limited again; invalid values are start-up errors; SIGINT while throttled exits promptly; valgrind clean.
+Mutation checks: no cost per frame, no cap, no token check, no bucket reset, no wake-up, rate not set at port start, rate not applied on reload: all caught.
+
+4. CHANGES TO EXISTING TESTS (not weakened)
+-------------------------------------------
+tests/test_switch.py: the thread-count test expects the new "token-timer" thread (12 threads + main instead of 11).
+tests/test_config_signals.py: the Part 10 test asserted that the reload log calls rate_limit / port.N.rate "stored ... not applied until Part 12".
+Part 12 applies them, so it now asserts the Part 12 behaviour (rate reported, effective rate applied and logged, no "stored" text); stricter.
+
+5. MISTAKES FOUND WHILE TESTING (test side, see notes/bugs.md 23)
+-------------------------------------------------------------------
+Three test-only problems: a leaked frame in a test producer; a socket timeout shared by the reader and the flooder (valgrind is slow); bounds computed from the
+nominal instead of the real measurement window.
+
+6. RESULTS
+----------
+python3 tests/test_part12.py: ALL PASSED (normal, TSan, valgrind). make test: all of Parts 1-12 and the ten integration scripts passed.

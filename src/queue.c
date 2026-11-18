@@ -129,11 +129,55 @@ static int sched_pick(outq_t *q)
     }
 }
 
+void outq_set_rate(outq_t *q, int rate)
+{
+    if (rate < 0)
+        rate = 0;
+    if (rate > MAX_RATE)
+        rate = MAX_RATE;
+    CHECK_PT(pthread_mutex_lock(&q->lock));
+    q->rate = rate;
+    q->tokens_milli = (long)rate * 1000;                  /* a full bucket: the change is effective at once */
+    CHECK_PT(pthread_cond_broadcast(&q->cond));           /* a sender that waits for tokens re-checks */
+    CHECK_PT(pthread_mutex_unlock(&q->lock));
+}
+
+void outq_refill(outq_t *q, long ms)
+{
+    CHECK_PT(pthread_mutex_lock(&q->lock));
+    if (q->rate > 0 && ms > 0) {
+        const long cap = (long)q->rate * 1000;
+        const long before = q->tokens_milli;
+        long add = (long)q->rate * ms;
+
+        q->tokens_milli = add > cap - before ? cap : before + add;     /* cap: no overflow, burst <= 1 s */
+        if (q->tokens_milli >= TOKEN_COST)
+            CHECK_PT(pthread_cond_broadcast(&q->cond));
+    }
+    CHECK_PT(pthread_mutex_unlock(&q->lock));
+}
+
+/*
+ * The sender sleeps while the queue is empty or, with a rate, while there is not a whole token. Nothing here
+ * polls: a push signals the condition, the timer's refill broadcasts it. While frames wait for a token the wait
+ * has a timeout (two ticks) only as a safety net; waking up early just runs the loop again.
+ */
 bool outq_pop(outq_t *q, frame_t **f)
 {
     CHECK_PT(pthread_mutex_lock(&q->lock));
-    while (q->count[0] + q->count[1] + q->count[2] == 0 && !q->closing)   /* always while, never if */
-        CHECK_PT(pthread_cond_wait(&q->cond, &q->lock));
+    while (!q->closing) {                                                  /* always while, never if */
+        if (q->count[0] + q->count[1] + q->count[2] == 0) {
+            CHECK_PT(pthread_cond_wait(&q->cond, &q->lock));
+        } else if (q->rate > 0 && q->tokens_milli < TOKEN_COST) {
+            struct timespec until = deadline_mono(2 * TOKEN_TICK_MS);
+            int rc = pthread_cond_timedwait(&q->cond, &q->lock, &until);
+
+            if (rc != ETIMEDOUT)
+                CHECK_PT(rc);
+        } else {
+            break;
+        }
+    }
     if (q->closing) {
         CHECK_PT(pthread_mutex_unlock(&q->lock));
         return false;
@@ -143,6 +187,8 @@ bool outq_pop(outq_t *q, frame_t **f)
     q->ring[c][q->head[c]].f = NULL;
     q->head[c] = (q->head[c] + 1) % q->cap;
     q->count[c]--;
+    if (q->rate > 0)
+        q->tokens_milli -= TOKEN_COST;         /* the loop above saw >= 1000 and we still hold the lock */
     CHECK_PT(pthread_mutex_unlock(&q->lock));
     return true;
 }

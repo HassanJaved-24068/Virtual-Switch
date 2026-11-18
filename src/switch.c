@@ -287,8 +287,8 @@ static void *accept_main(void *arg)
 
 /* Which threads exist (and must be joined). Set only after a successful pthread_create. */
 typedef struct {
-    bool sig, reaper, aging, accept;
-    pthread_t sig_thread, accept_thread;
+    bool sig, reaper, aging, timer, accept;
+    pthread_t sig_thread, accept_thread, timer_thread;
 } started_t;
 
 /* Ask for the teardown of every UP port. The reaper does the actual work. */
@@ -354,7 +354,13 @@ static void shutdown_switch(const started_t *st)
         reaper_finish();
     }
 
-    /* 7. The aging thread (woken by the shutdown broadcast). */
+    /* 7. The token timer thread (Part 12) and the aging thread: both wake on the shutdown broadcast. */
+    if (st->timer) {
+        request_shutdown();
+        int rc = pthread_join(st->timer_thread, NULL);
+        if (rc != 0)
+            log_msg(LOG_ERR, "shutdown: join of the token timer thread failed: %s", strerror(rc));
+    }
     if (st->aging) {
         request_shutdown();                /* start-up failure path: make sure it was requested */
         int rc = pthread_join(sw.aging, NULL);
@@ -481,11 +487,17 @@ int main(int argc, char **argv)
             rc = pthread_create(&sw.aging, NULL, aging_main, NULL);
             if (rc == 0) {
                 st.aging = true;
-                rc = pthread_create(&st.accept_thread, NULL, accept_main, NULL);
-                if (rc == 0)
-                    st.accept = true;
-                else
-                    failed = "accept";
+                rc = pthread_create(&st.timer_thread, NULL, token_timer_main, NULL);
+                if (rc == 0) {
+                    st.timer = true;
+                    rc = pthread_create(&st.accept_thread, NULL, accept_main, NULL);
+                    if (rc == 0)
+                        st.accept = true;
+                    else
+                        failed = "accept";
+                } else {
+                    failed = "token timer";
+                }
             } else {
                 failed = "aging";
             }

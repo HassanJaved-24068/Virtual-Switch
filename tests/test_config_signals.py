@@ -208,7 +208,7 @@ def test_sighup_invalid():
 
 
 def test_sighup_startup_only():
-    print("4. SIGHUP: startup-only keys are 'ignored until restart'; per-port settings are stored, not applied; weights and aging are applied (Part 11)")
+    print("4. SIGHUP: startup-only keys are 'ignored until restart'; VLANs are stored, not applied; weights, aging (Part 11) and rates (Part 12) are applied")
     path = conf("mac_aging_seconds = 50\n")
     sw = ts.Switch(4, extra=["-c", path])
     ok = reload_and_wait(sw, path, "mac_aging_seconds = 60\nmac_table_size = 2048\nqueue_capacity = 8\ntrunk_port = 2\n"
@@ -222,10 +222,15 @@ def test_sighup_startup_only():
     check(sw.count("ignored until restart") == 4, "exactly the 4 startup-only keys are reported")
     check("reload: mac_aging_seconds 50 -> 60" in log and "reload: max_macs_per_port 16 -> 4" in log and
           "reload: port_wait_timeout 5 -> 9" in log, "the reloadable keys with an effect now are applied and reported")
-    check("port.3.vlan 0 -> 20 (stored; VLANs are not applied until Part 13)" in log, "port.3.vlan is stored, and the log says that it is not applied yet")
-    check("port.3.rate -1 -> 100 (stored; rate limiting is not applied until Part 12)" in log, "port.3.rate likewise")
-    check("rate_limit 0 -> 500 (stored; no effect until the rate limiting of Part 12)" in log,
-          "rate_limit is stored and reported as not used yet (Part 12)")
+    # Part 13 made the VLANs effective: the change is applied and logged, no longer 'stored'
+    check("reload: port.3.vlan 0 -> 20" in log and "VLANs are not applied" not in log, "port.3.vlan is reported as a setting, no longer as 'stored' (Part 13)")
+    check("reload: port 3 VLAN 1 -> 20, its old MAC entries were flushed" in log, "the effective VLAN of port 3 (1 -> 20) is applied and logged (Part 13)")
+    # Part 12 made the rates effective: the log must say that they are applied, not 'stored'
+    check("reload: port.3.rate -1 -> 100 (frames/s" in log and "stored; rate" not in log, "port.3.rate is reported as a rate, no longer as 'stored' (Part 12)")
+    check("reload: rate_limit 0 -> 500 (frames/s" in log and "no effect until the rate limiting" not in log,
+          "rate_limit is reported as applied, no longer as 'not used yet' (Part 12)")
+    check("reload: port 3 rate limit -1 -> 100" not in log and "port 3 rate limit 0 -> 100 frames/s" in log,
+          "the effective rate of port 3 (0 -> 100) is applied and logged (Part 12)")
     # Part 11 made these two effective: the log must say that they are applied, not 'stored'
     check("wrr_weights 5,3,1 -> 6,4,2 (applies at the next scheduling round of every port)" in log and
           "prio_aging_ms 200 -> 150 (applies to the next frame picked)" in log,
@@ -264,7 +269,8 @@ def test_sighup_under_traffic():
     th = threading.Thread(target=run, daemon=True)
     th.start()
     time.sleep(0.5)
-    texts = ["mac_aging_seconds = 3\nmax_macs_per_port = 3\n", "mac_aging_seconds = 300\nmax_macs_per_port = 16\nport.2.vlan = 5\n",
+    # Part 13: a changed port.N.vlan is applied now. The flood uses ports 1-3, so the VLAN setting that comes and goes is port 4's.
+    texts = ["mac_aging_seconds = 3\nmax_macs_per_port = 3\n", "mac_aging_seconds = 300\nmax_macs_per_port = 16\nport.4.vlan = 5\n",
              "mac_aging_seconds = 17\nbogus = 1\n", "mac_aging_seconds = 5\nwrr_weights = 9,9,9\n"]
     sent = 0
     end = time.time() + 40
@@ -327,13 +333,14 @@ def dump_and_wait(sw, path, timeout=15):
 def test_sigusr1_dump():
     print("7. SIGUSR1: the MAC table is dumped to mac_dump_file: header with the time, 'vlan mac port age_s'")
     dump = os.path.join(TMP, "dump.txt")
-    sw = ts.Switch(4, extra=["-c", conf("mac_dump_file = %s\n" % dump)])
+    # Part 13: only the trunk port keeps the VLAN of a frame, so B (port 2) is the trunk to be able to appear in a second VLAN
+    sw = ts.Switch(4, extra=["-c", conf("mac_dump_file = %s\ntrunk_port = 2\n" % dump)])
     a, b, c = hosts_abc(sw)                                    # C is learned (vlan 1, port 3)
     a.say("send bcast a-hello")                                # A: vlan 1, port 1
-    b.say("send bcast b-hello")                                # B: vlan 1, port 2
-    b.say("sendx bcast 100 1 b-vlan100")                       # B again, in a second VLAN: its own entry
-    check(wait_line(c, "data=a-hello") and wait_line(c, "data=b-hello") and wait_line(c, "data=b-vlan100"),
-          "all frames were forwarded (so all four entries are learned)")
+    b.say("sendx bcast 100 1 b-vlan100")                       # B (trunk), in a second VLAN: its own entry (not seen by C: VLAN 1)
+    b.say("send bcast b-hello")                                # B again, vlan 1; B's receiver handles its frames in order
+    check(wait_line(c, "data=a-hello") and wait_line(c, "data=b-hello"),
+          "all frames were forwarded (so all four entries are learned: b-hello follows b-vlan100 from the same host)")
     time.sleep(2.2)                                            # let the entries age a little
     t_before = time.time()
     check(dump_and_wait(sw, dump), "SIGUSR1: 'MAC table dumped to' is logged")

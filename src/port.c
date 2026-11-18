@@ -7,6 +7,7 @@
 #include "frame.h"
 #include "log.h"
 #include "mactable.h"
+#include "reload.h"
 #include "stats.h"
 
 #include <string.h>
@@ -144,6 +145,14 @@ enum port_start_rc port_start(int fd, int *port_id, int *err)
 
         *err = outq_init(&p->q, sw.queue_capacity);
         if (*err == 0) {
+            config_t cfg;
+
+            config_snapshot(&cfg);                       /* config_lock is a leaf: fine under ports_lock */
+            outq_set_rate(&p->q, config_port_rate(&cfg, p->id));   /* before the sender exists */
+            p->vlan = (uint16_t)config_port_vlan(&cfg, p->id);     /* Part 13: VLAN and trunk role, fixed here */
+            p->trunk = cfg.trunk_port == p->id;
+            if (p->q.rate > 0)
+                log_msg(LOG_INFO, "port %d: rate limit %d frames/s", p->id, p->q.rate);
             *err = pthread_create(&p->tx, NULL, sender_main, p);
             if (*err != 0) {
                 outq_destroy(&p->q);                     /* nothing is running yet */
@@ -465,4 +474,84 @@ void *sender_main(void *arg)
         stats_inc(p->id, STAT_OUT);
     }
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Rate limiting (Part 12)                                             */
+/* ------------------------------------------------------------------ */
+
+void port_apply_rate(int id, int rate)
+{
+    if (id < 1 || id > sw.num_ports)
+        return;
+    CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
+    if (sw.ports[id].state == PORT_UP)                   /* the queue exists from UP until teardown */
+        outq_set_rate(&sw.ports[id].q, rate);
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+}
+
+void *token_timer_main(void *arg)
+{
+    struct timespec deadline = deadline_mono(TOKEN_TICK_MS);
+    int rc;
+
+    (void)arg;
+    rc = pthread_setname_np(pthread_self(), "token-timer");
+    if (rc != 0)
+        log_msg(LOG_WARN, "cannot set token timer thread name: %s", strerror(rc));
+
+    for (;;) {
+        /* Sleep until the absolute deadline; shutdown ends the wait early. No sleep(), no polling. */
+        CHECK_PT(pthread_mutex_lock(&sw.shutdown_lock));
+        rc = 0;
+        while (rc == 0 && !sw.shutdown_requested)
+            rc = pthread_cond_timedwait(&sw.shutdown_cond, &sw.shutdown_lock, &deadline);
+        bool stop = sw.shutdown_requested;
+        CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
+
+        if (rc != 0 && rc != ETIMEDOUT)
+            log_msg(LOG_ERR, "token timer: pthread_cond_timedwait failed: %s", strerror(rc));
+        if (stop)
+            break;
+
+        /* The deadlines advance by exactly one period (no drift). If we are late (a loaded machine) every
+         * missed period still counts, so the long-run rate stays right; after a long stop (a suspended
+         * machine) we do not catch up more than one second: the buckets cannot hold more anyway. */
+        const struct timespec now = now_mono();
+        long ticks = 0;
+
+        while (ts_diff_ms(deadline, now) <= 0 && ticks < 1000 / TOKEN_TICK_MS) {
+            ticks++;
+            deadline = ts_add_ms(deadline, TOKEN_TICK_MS);
+        }
+        if (ts_diff_ms(deadline, now) <= 0)
+            deadline = deadline_mono(TOKEN_TICK_MS);
+        if (ticks == 0)
+            continue;                                   /* woken early: nothing is due */
+
+        for (int i = 1; i <= sw.num_ports; i++) {        /* one queue at a time, ascending */
+            CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
+            if (sw.ports[i].state == PORT_UP)
+                outq_refill(&sw.ports[i].q, ticks * TOKEN_TICK_MS);
+            CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        }
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* VLANs (Part 13)                                                     */
+/* ------------------------------------------------------------------ */
+
+bool port_vlan_ok(const port_t *dst, uint16_t vlan)
+{
+    return dst->trunk || dst->vlan == vlan;
+}
+
+void port_set_vlan(port_t *p, uint16_t vlan)
+{
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    p->vlan = vlan;
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    (void)mac_flush_port(p->id);             /* after the unlock: old-VLAN entries of this port vanish */
 }

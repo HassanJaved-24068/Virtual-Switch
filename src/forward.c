@@ -3,6 +3,11 @@
  * Part 4: flooding. Part 6: MAC learning and unicast forwarding.
  * Part 11: the priority of a frame chooses the ring of every output queue (queue.c); a priority above 2
  * is queued as low priority and counted per ingress port (bad_prio), with one log line per port.
+ * Part 13: VLANs. The VLAN of a frame is fixed at ingress: an access port stamps its own VLAN into the frame
+ * (f->vlan and wire bytes 14-15) before anything else happens; the trunk port keeps the frame's VLAN and drops
+ * a frame whose VLAN is outside 1..4094 (counted). A frame is then sent only to UP ports that are the trunk or
+ * have that VLAN, for unicast and flooding alike, and the MAC lookup is keyed by (VLAN, MAC). The frame is
+ * never copied: it is shared by every output queue, so the zero-copy broadcast is kept.
  */
 #include "forward.h"
 
@@ -33,6 +38,24 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
         return LEARN_OK;
     }
 
+    /* The VLAN of the frame is decided here, once. The frame is still private to this thread (reference count 1),
+     * so it may be changed; afterwards it is only read. */
+    if (in_port->trunk) {
+        if (f->vlan < 1 || f->vlan > 4094) {     /* a trunk frame must say which VLAN it belongs to */
+            unsigned long long n = stats_inc(in_port->id, STAT_DROP);
+
+            CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+            if (n == 1 || n % DROP_LOG_EVERY == 0)
+                log_msg(LOG_WARN, "port %d: trunk frame with invalid VLAN %u dropped (%llu dropped so far)",
+                        in_port->id, (unsigned)f->vlan, n);
+            return LEARN_OK;
+        }
+    } else {
+        f->vlan = in_port->vlan;                 /* access port: the port decides, whatever the host wrote */
+        f->wire[FRAME_OFF_VLAN] = (uint8_t)(f->vlan >> 8);
+        f->wire[FRAME_OFF_VLAN + 1] = (uint8_t)(f->vlan & 0xff);
+    }
+
     /* Learn the source (a multicast source is never learned). */
     if (!mac_is_multicast(f->src))
         lr = mac_learn_ex(f->vlan, f->src, in_port->id, &move);
@@ -55,15 +78,15 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
 
         if (p == in_port->id)
             filtered = true;                     /* the destination is behind the ingress port */
-        else if (p >= 1 && p <= sw.num_ports && sw.ports[p].state == PORT_UP)
-            target = p;                          /* known and UP: only that port */
-        /* unknown, or its port is not UP: flood */
+        else if (p >= 1 && p <= sw.num_ports && sw.ports[p].state == PORT_UP && port_vlan_ok(&sw.ports[p], f->vlan))
+            target = p;                          /* known, UP and in this VLAN (or the trunk): only that port */
+        /* unknown, or its port is not UP / not in this VLAN: flood (inside the VLAN) */
     }
 
     for (int i = 1; i <= sw.num_ports && !filtered; i++) {
         port_t *dst = &sw.ports[i];
 
-        if (dst == in_port || dst->state != PORT_UP)
+        if (dst == in_port || dst->state != PORT_UP || !port_vlan_ok(dst, f->vlan))
             continue;
         if (target != 0 && i != target)
             continue;

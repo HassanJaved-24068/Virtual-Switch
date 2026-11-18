@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 11** (priority queues and weighted round robin; before it the
-configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (rate limiting, VLAN switching, the admin socket, shared-memory
+This README describes the switch as of **Part 13** (VLANs and the trunk port; before it rate limiting of Part 12, the priority
+queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
+Features of later parts (the admin socket, shared-memory
 statistics, port mirroring) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
@@ -68,16 +68,12 @@ port.3.rate       = 100      # reloadable, overrides rate_limit
 | `port_wait_timeout` | seconds a host waits for a free port before "switch full" | 0 ... 3600 | 5 | yes, applies to the next waiting host |
 | `wrr_weights` | weighted round robin weights `high,medium,low`, exactly three numbers | each 1 ... 1000 | 5,3,1 | yes, applies at the next scheduling round |
 | `prio_aging_ms` | a frame at the head of the low (then the normal) queue that has waited longer than this is sent next | 1 ... 60000 | 200 | yes, applies to the next frame picked |
-| `rate_limit` | frames per second for every port, 0 = unlimited (Part 12) | 0 ... 1000000 | 0 | yes (*) |
-| `trunk_port` | trunk port number, 0 = none (Part 13) | 0 ... `num_ports` | 0 | no: "ignored until restart" (*) |
+| `rate_limit` | frames per second for every port, 0 = unlimited (Part 12) | 0 ... 1000000 | 0 | yes, applies at once |
+| `trunk_port` | trunk port number, 0 = none (Part 13) | 0 ... `num_ports` | 0 | no: "ignored until restart" |
 | `log_file` | the log file (opened with `O_APPEND`) | a file name | `switch.log` | no: "ignored until restart" |
 | `mac_dump_file` | where `SIGUSR1` writes the MAC table (opened with `"w"`) | a file name | `mac_dump.txt` | yes |
-| `port.N.vlan` | VLAN of port N (Part 13) | N = 1 ... `num_ports`; 1 ... 4094 | not set (VLAN 1) | yes (*) |
-| `port.N.rate` | frames per second of port N, overrides `rate_limit`; 0 = unlimited (Part 12) | N = 1 ... `num_ports`; 0 ... 1000000 | not set | yes (*) |
-
-(*) **These settings are validated, kept in the live configuration and logged when they change, but they have
-no effect yet**: rate limiting (Part 12) and VLAN switching (Part 13) are not implemented. The log says so
-("stored; ... not applied until Part N") instead of pretending.
+| `port.N.vlan` | VLAN of port N (Part 13) | N = 1 ... `num_ports`; 1 ... 4094 | not set (VLAN 1) | yes, applies at once |
+| `port.N.rate` | frames per second of port N, overrides `rate_limit`; 0 = unlimited (Part 12) | N = 1 ... `num_ports`; 0 ... 1000000 | not set | yes, applies at once |
 
 A key that the file does not mention has its default. The file is checked completely: an unknown key, a
 value that is not a plain decimal number, a value out of range, a duplicate key, a line without `=`, a missing
@@ -105,6 +101,36 @@ frame at the head of the low queue (then of the normal queue) has waited longer 
 next, so a low-priority frame is still sent within about `prio_aging_ms` plus one write even under continuous
 high-priority traffic. Fullness is checked per class: a full low queue drops low frames only (counted, logged as
 `output queue full`); high and normal frames of the same port are still accepted. The receiver never blocks.
+
+## Rate limiting
+
+`rate_limit` (every port) and `port.N.rate` (one port, overrides `rate_limit`) set the most frames per second that the
+**sender** of a port writes to its host; 0 = unlimited. It is a token bucket per port: a frame costs 1000 milli-tokens, the
+bucket holds at most `rate * 1000` (a burst of one second, so a host that was idle may receive `rate` frames at once), and a
+**token timer thread** adds `rate * 100` every 100 ms (absolute deadlines, no drift; it also counts periods it was late).
+The sender of a limited port sleeps on a condition variable until a whole token is there: no polling, so the switch is
+near 0 % CPU while a port is throttled. Frames that wait for a token fill the three rings of the port (Part 11); when a
+ring is full the receiver of the *other* port drops the frame (counted, logged as `output queue full`): **throttling never
+blocks a receiver** and never slows other ports. A reload (`SIGHUP`) applies a changed rate to the connected hosts at
+once (the bucket is reset to the new cap); ports whose rate did not change keep their tokens. A host that connects later
+gets the rate from the configuration (`port N: rate limit R frames/s` is logged). The priorities of Part 11 are unchanged: a token
+is spent on whichever frame the scheduler picks.
+
+## VLANs and the trunk port
+
+Every port is an **access port** in one VLAN (`port.N.vlan`, default 1) except the **trunk port** (`trunk_port`), which carries every
+VLAN. The VLAN of a frame is fixed once, when the switch receives it:
+
+* from an access port the frame's VLAN is the port's VLAN: the switch overwrites the VLAN field (`f->vlan` and the two wire bytes 14-15),
+  whatever the host wrote;
+* from the trunk the frame keeps its VLAN; one outside 1...4094 is dropped, counted (`port N: trunk frame with invalid VLAN V dropped`).
+
+A frame is sent only to ports that are UP, are not the ingress port and are the trunk or in the frame's VLAN; this holds for flooding and for
+unicast. The MAC table is keyed by (VLAN, MAC), so a MAC learned in another VLAN is never found: unicast to it floods inside the sender's VLAN and
+is never delivered across VLANs. The frame is shared by all output queues (one copy), which is correct because the VLAN is already final: the trunk
+host sees the VLAN of the frame, an access host sees its own. The trunk is exempt from `max_macs_per_port`. `SIGHUP` moves a port to its new VLAN at
+once (`port_set_vlan`: VLAN set under the write lock, then the port's MAC entries are flushed); a host that connects later gets the VLAN from the
+configuration. `trunk_port` changes only at start-up.
 
 ## Signals
 
@@ -165,6 +191,10 @@ VARIANT=tsan ./tests/run_all.sh        # ... with ThreadSanitizer
 python3 tests/test_config_signals.py [tsan|valgrind]   # configuration, SIGHUP, SIGUSR1 (Part 10)
 ./build/test_qos                # the priority queue scheduler (after `make build/test_qos`)
 python3 tests/test_qos.py [tsan|valgrind]              # priorities through a congested port (Part 11)
+./build/test_rate               # the token bucket (after `make build/test_rate`)
+python3 tests/test_rate.py [tsan|valgrind]             # rate limiting with the real switch (Part 12)
+./build/test_vlan               # VLAN forwarding and the trunk, no sockets (after `make build/test_vlan`)
+python3 tests/test_vlan.py [tsan|valgrind]             # VLANs with the real switch (Part 13)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 

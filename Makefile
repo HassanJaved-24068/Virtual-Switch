@@ -72,8 +72,8 @@ $(SMALL_TSAN_DIR)/%.o: src/%.c
 
 # ---- unit tests (tests/test_NAME.c -> build/test_NAME) ----
 # tests of the switch internals need the switch-only objects too
-build/test_port build/test_mactable: $(patsubst %,$(OBJ_DIR)/%.o,$(SWITCH_NAMES))
-build/test_port_tsan build/test_mactable_tsan: $(patsubst %,$(TSAN_DIR)/%.o,$(SWITCH_NAMES))
+build/test_port build/test_mactable build/test_vlan: $(patsubst %,$(OBJ_DIR)/%.o,$(SWITCH_NAMES))
+build/test_port_tsan build/test_mactable_tsan build/test_vlan_tsan: $(patsubst %,$(TSAN_DIR)/%.o,$(SWITCH_NAMES))
 
 # test_config tests the pure parser: it needs only config.o
 build/test_config: $(OBJ_DIR)/config.o

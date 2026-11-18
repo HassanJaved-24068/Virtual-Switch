@@ -1,10 +1,11 @@
 #!/bin/bash
-# Parts 1-11 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-13 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
-        build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan || exit 1
+        build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
+        build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -69,4 +70,22 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_qos
 fi
 
-echo "Parts 1-11 unit and regression tests passed."
+run ./build/test_rate                     # Part 12: token bucket: burst, cap, whole tokens, rate change, close, no spinning, order unchanged
+run $NOASLR ./build/test_rate_tsan        # Part 12: the same under ThreadSanitizer
+run python3 tests/test_rate.py            # Part 12: port.N.rate / rate_limit, override, SIGHUP, edge rates, new host, bad values, SIGINT while throttled
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_rate.py tsan    # Part 12: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_rate.py valgrind                                # Part 12: no errors, no leaks, no descriptor left open
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_rate
+fi
+
+run ./build/test_vlan                     # Part 13: VLAN forwarding without sockets: layout, (VLAN, MAC) lookup, trunk, invalid VLANs, set_vlan + flush
+run $NOASLR ./build/test_vlan_tsan        # Part 13: the same under ThreadSanitizer
+run python3 tests/test_vlan.py            # Part 13: the real switch: criterion, default VLAN, invalid trunk frames, SIGHUP, bad values, port security
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_vlan.py tsan   # Part 13: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_vlan.py valgrind                                # Part 13: no errors, no leaks, no descriptor left open
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_vlan
+fi
+
+echo "Parts 1-13 unit and regression tests passed."
