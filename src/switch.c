@@ -425,11 +425,6 @@ int main(int argc, char **argv)
 
     switch_init((int)num_ports);
     config_install(&cfg);                  /* the live configuration; no other thread exists yet */
-    rc = stats_init(MAX_PORTS);
-    if (rc != 0) {
-        fprintf(stderr, "switch: cannot allocate counters: %s\n", strerror(rc));
-        return EXIT_FAILURE;
-    }
     sw.config_path = config;
     sw.listen_fd = make_listener((int)tcp_port);
     CHECK(sw.wake_efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK));
@@ -446,6 +441,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    /* The shared counters come AFTER everything that can fail for an outside reason (the TCP port is in use...):
+     * a switch that cannot start must not replace, or remove, the segment of one that is running. */
+    rc = stats_init(MAX_PORTS);
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot create the shared counters %s: %s\n", STATS_SHM_NAME, strerror(rc));
+        log_stop();
+        return EXIT_FAILURE;
+    }
+    for (int i = 1; i <= sw.num_ports; i++) {      /* the fields that "swctl show ports" will read (Part 15) */
+        stats_set_state(i, sw.ports[i].state);
+        stats_set_vlan(i, sw.ports[i].vlan);
+        stats_set_mirror(i, atomic_load(&sw.ports[i].mirror_to));
+    }
+
     log_msg(LOG_INFO, "switch listening on TCP port %ld with %ld ports", tcp_port, num_ports);
     if (config != NULL)
         log_msg(LOG_INFO, "configuration file: %s (SIGHUP reloads it)", config);
@@ -458,12 +467,14 @@ int main(int argc, char **argv)
     if (sw.mac_region == NULL) {
         fprintf(stderr, "switch: cannot allocate the MAC table\n");
         log_stop();
+        stats_destroy();
         return EXIT_FAILURE;
     }
     rc = mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets);
     if (rc != 0) {
         fprintf(stderr, "switch: cannot initialise the MAC table: %s\n", strerror(rc));
         log_stop();
+        stats_destroy();
         return EXIT_FAILURE;
     }
     log_msg(LOG_INFO, "MAC table: %d entries, %d buckets, aging %lds, at most %d MACs per port",

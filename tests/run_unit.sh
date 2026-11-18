@@ -1,11 +1,11 @@
 #!/bin/bash
-# Parts 1-13 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-14 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
         build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
-        build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan || exit 1
+        build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -88,4 +88,13 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_vlan
 fi
 
-echo "Parts 1-13 unit and regression tests passed."
+run ./build/test_stats                    # Part 14: shared-memory counters: layout, 0600, magic/version, threads + processes, robust mutex (kill -9 while locked), stale segment, unlink, failure paths
+run $NOASLR ./build/test_stats_tsan       # Part 14: the same under ThreadSanitizer
+run python3 tests/test_shm.py             # Part 14: the real switch: segment in /dev/shm, counters = host counts, state/VLAN fields, SIGINT unlinks, stale + failed start
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_shm.py tsan    # Part 14: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_shm.py valgrind                                 # Part 14: no errors, no leaks, no descriptor left open, no segment left
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_stats
+fi
+
+echo "Parts 1-14 unit and regression tests passed."

@@ -1,0 +1,131 @@
+=====================================================================
+PART 14 - COUNTERS IN SHARED MEMORY
+=====================================================================
+
+1. WHAT PART 14 IMPLEMENTS
+--------------------------
+The per-port counters of Part 4 moved from a heap array into a POSIX shared-memory segment, behind the SAME API (stats_init, stats_inc,
+stats_get, stats_destroy), so another process can read them while the switch runs. Part 15 (swctl) will be that reader; nothing in the
+switch reads the segment, and no admin socket or swctl command exists yet.
+
+Files:   include/stats.h, src/stats.c   the segment, its layout, the robust mutex, the API (+ the setters of the port fields)
+         src/port.c      copies the port state and VLAN into the segment whenever they change (under ports_lock; stats = last lock)
+         src/switch.c    creates the segment at start-up (after the listener and the log file exist), removes it on every exit path
+         tests/test_stats.c, tests/test_shm.py   the Part 14 tests (permanent; registered in tests/run_unit.sh -> make test)
+         tests/test_part14.py   temporary dedicated runner of exactly those tests (deleted when Part 15 starts)
+         tests/test_part13.py   deleted (its tests stay in the permanent suite: test_vlan.c, test_vlan.py)
+         README.md, docs/Part14_Explanation.txt
+
+Note on the roadmap: Virtual_Switch_Implementation_Roadmap_v2.pdf is not in the project directory (only the older
+Virtual_Switch_Implementation_Roadmap.pdf is). The layout below follows the requirements given in the Part 14 hand-over (page-aligned
+control and data areas); the old roadmap's text (one struct, same fields, same mutex attributes) is consistent with it.
+
+2. THE SEGMENT
+--------------
+Name:     /vswitch_stats_P   (shm_open; it appears as /dev/shm/vswitch_stats_P)
+Mode:     0600 (same user only). A new object gets 0600 & ~umask, so fchmod(fd, 0600) makes it exact whatever the umask.
+PAGE:     sysconf(_SC_PAGESIZE) (4096 on x86-64; never hard-coded; it must be a power of two >= sizeof(stats_ctl_t)).
+Size:     PAGE + round_up(sizeof(stats_data_t), PAGE)  = 4096 + 4096 = 8192 bytes (stats_data_t is 65 x 48 = 3120 bytes).
+
+  offset 0      stats_ctl_t   uint32_t magic        STATS_MAGIC 0x56535453 ("VSTS"), written LAST with a release store
+                              uint32_t version      STATS_VERSION 1
+                              int      num_ports    highest port number given to stats_init (counters exist for 0..num_ports)
+                              pthread_mutex_t lock  process-shared + robust
+                              (the rest of the first page is zero: the area is exactly one page because the data area starts at PAGE)
+  offset PAGE   stats_data_t  port[MAX_PORTS + 1], each { uint64_t in, out, dropped, mirrored; int state, vlan, mirror_to; }  (48 bytes)
+
+The structures are in include/stats.h so that Part 15 and the tests use the same declarations.
+in = frames received from the host of that port, out = frames written to it, dropped = frames lost because its queue was full (also the
+invalid trunk frames of Part 13), mirrored = reserved for Part 17 (stays 0). Slot 0 is allocated but unused.
+state = enum port_state (0 FREE, 1 UP, 2 CLOSING, 3 DISABLED), vlan = the port's VLAN field, mirror_to = sniffer port (0 = none).
+The state and VLAN fields are copies of the port structure and follow it: a FREE port shows what the port structure holds (the default
+VLAN 1; the configured VLAN is applied when a host connects, Part 13).
+
+3. THE MUTEX
+------------
+  pthread_mutexattr_setpshared(PTHREAD_PROCESS_SHARED) + pthread_mutexattr_setrobust(PTHREAD_MUTEX_ROBUST), initialised ONLY by the switch,
+  before the magic is written. Why robust: a reader (swctl, Part 15) locks the same mutex; if it is killed while holding it, a plain
+  mutex would stay locked for ever and every stats_inc of every thread of the switch would hang.
+  stats_lock(m) (used by the switch and meant for readers):
+      pthread_mutex_lock == 0            -> held.
+      EOWNERDEAD                         -> the previous owner died holding it; we hold it now. The protected data are 64-bit counters and
+                                            int fields updated one at a time, so there is nothing to repair: pthread_mutex_consistent(m),
+                                            continue. (If consistent fails the mutex is unlocked and the error returned.)
+      any other error (EINVAL, ENOTRECOVERABLE, ...) -> returned, the lock is NOT held. In the switch stats_inc / stats_get then do nothing
+                                            (the update is lost, one message on stderr) instead of exiting: the damage came from outside and
+                                            forwarding must go on. log_msg is never called while the mutex is held.
+  Every stats_inc/stats_get/set locks, updates and unlocks: no update is lost between threads or processes.
+  Lock order: the stats mutex is the LAST lock of the global order (roadmap 2.6). It is taken while ports_lock is held (the state/VLAN
+  copies in port.c, the counters in the receiver/forwarding code) and nothing else is ever taken while it is held, so no cycle can form.
+
+4. START-UP AND SHUTDOWN
+------------------------
+Start-up (stats_init_named):
+  1. check the arguments (0 <= max_port <= MAX_PORTS, name starts with '/'), compute PAGE and the size.
+  2. shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600). EEXIST means a stale object (a crash, or an older switch): shm_unlink and retry
+     (a few times, in case another switch is starting at the same moment). O_EXCL guarantees we never fill in somebody else's object.
+  3. fchmod 0600, fstat (device and inode are remembered), ftruncate(size), mmap(PROT_READ | PROT_WRITE, MAP_SHARED), close(fd).
+  4. initialise the mutex (attributes above), version, num_ports, zero the data area, THEN store the magic (release).
+  5. publish the pointer. An atexit handler is registered once: if the process exits through exit() on some later start-up error, the NAME is
+     unlinked (never the mapping or the mutex: other threads may still run).
+  Any failure in steps 2-4 unmaps, closes and shm_unlinks what was created; nothing is left behind.
+In main() the segment is created AFTER the listening socket, the eventfd and the log file: a switch that cannot start (TCP port in use,
+unwritable log file, bad configuration) never replaces or removes the segment of a switch that is running. Its remaining failure paths call
+stats_destroy().
+
+Shutdown (stats_destroy, the last step of shutdown_switch, after every thread is joined):
+  1. shm_unlink FIRST, so nobody can open the object any more - but only if the name still refers to OUR object (same device and inode).
+     Without this check an older switch that exits would unlink the segment of a newer one that replaced it.
+  2. magic = 0 (release): a reader that mapped the segment earlier sees "not valid" instead of trusting a dead segment.
+  3. pthread_mutex_destroy (a still-held mutex gives EBUSY, which is ignored: nothing more can be done), 4. munmap.
+  A process that mapped the segment before keeps its memory until it exits (unlink only removes the name). stats_destroy is safe to call twice.
+Crash: SIGKILL leaves the object in /dev/shm (and the mutex possibly locked); the next start unlinks and recreates it, so the stale mutex state is never reused.
+
+Reader rules (Part 15 will follow them): open the name, check magic == STATS_MAGIC and version == STATS_VERSION (stats_validate; the magic is
+read with acquire), lock with stats_lock, copy, unlock.
+
+5. TESTS
+--------
+tests/test_stats.c (no switch; real processes; no timing: pipes + a watchdog alarm):
+  layout: name in /dev/shm, mode 0600, owner, size = PAGE + round_up(...), control structure at offset 0, counters of the API appear at PAGE + port * 48
+  (all four kinds; port 0 and port MAX_PORTS), the control page beyond the structure is zero, magic/version/num_ports;
+  reader: stats_validate detects a wrong magic (EINVAL, also 0 and one flipped bit), a wrong version (EPROTO), a zero-filled foreign segment;
+  8 threads x 5000 x four counters, plus one shared counter: nothing lost; 4 child processes (each with its own mapping) x 20000 locked updates
+  together with 2 threads of the parent: exact totals; a separate reader process sees exact in/out/dropped/mirrored;
+  fields: state/vlan/mirror_to set, read back, seen through another mapping, ports 0..max valid, others EINVAL, counters not disturbed;
+  robust mutex: (a) a child maps the segment, locks, is killed with SIGKILL, then stats_inc recovers (EOWNERDEAD) and the half-done update of the
+  child is visible; (b) a thread already blocked in stats_inc when the owner is killed gets the lock; (c) the next process can lock too; (d) trylock
+  gives EBUSY while another process holds the lock, and a thread blocked in the parent is woken when the other process unlocks (a private futex
+  would hang); the glibc mutex kind has the robust (16) and process-shared (128) bits;
+  stale: junk object with mode 0644 and 100 bytes, an object left by a process that _exit()ed after counting, an object whose mutex was locked by a
+  dead process; each is replaced by a new inode with mode 0600, correct size, zero counters; the umask (0 and 0777) does not change the mode;
+  shutdown: the name is gone at once, an old mapping still reads its data and shows magic 0, the API ignores calls afterwards, double destroy,
+  re-initialisation without destroy; an older instance does not unlink a newer one's segment (two processes);
+  failures: max_port -1 and MAX_PORTS+1, NULL, "", "noslash", "/a/b", a name of 399 characters; ftruncate failing (RLIMIT_FSIZE = 0, SIGXFSZ
+  ignored) leaves no object and no initialised state.
+tests/test_shm.py (the real switch; the segment is parsed from /dev/shm with mmap): segment present with `ls -l /dev/shm`, mode, owner, size, header,
+  all counters 0 at start; 4 hosts x 15 broadcasts: in = 15, out = 45, dropped = 0, mirrored = 0 on every port and the hosts' own receive counts
+  agree; a host that never reads: dropped > 0, out + dropped <= frames flooded; state / VLAN fields at start, after connects, after a SIGHUP VLAN
+  change, after a disconnect (FREE again) and for a new host; SIGINT and SIGTERM: exit 0, segment gone, an old mapping still readable with magic 0;
+  stale junk and a SIGKILLed switch are replaced (new inode, zero counters); a bad configuration file, a TCP port in use and a bad port count
+  leave no segment; a second switch failing to start does not touch the running one's segment; SIGINT while 3 hosts flood; valgrind.
+Mutation checks (all caught by the tests): mutex not robust (the unit test hangs and the watchdog kills it), no unlink on a failed start, mode not
+forced to 0600, no unlink at shutdown (unit and end-to-end), SIGHUP VLAN change not copied, CLOSING -> FREE not copied. One mutant is equivalent and
+cannot be detected: dropping PTHREAD_PROCESS_SHARED while keeping ROBUST - on glibc a robust mutex always uses shared futexes.
+
+6. LIMITATIONS
+--------------
+  - The name is fixed. Two switches at the same time on one machine cannot both be visible: the second replaces the first one's object (the first
+    keeps counting in its own, now unnamed, mapping and does not unlink the second's). The tests that run two switches together are not affected
+    because none of them reads the segment.
+  - A reader that holds the mutex for a long time slows the counters of the switch (every update waits for it); readers must copy and unlock.
+  - If another process damages the mutex, counter updates are lost (reported once on stderr); the switch does not exit.
+  - Part 15 (a read-only mapping, swctl show ports / stats / --watch) is not implemented.
+
+7. RESULTS (2026-11-18)
+-----------------------
+  python3 tests/test_part14.py (dedicated): build, unit, end-to-end, unit TSan, end-to-end TSan, unit valgrind, end-to-end valgrind: all PASS
+     (test_stats: 134 checks; test_shm.py: 102 checks normal, 39 TSan, 13 valgrind).
+  make test (full suite, Parts 1-14 + the ten integration scripts): passed, exit 0.
+  make test-tsan and make test-valgrind (the ten integration scripts): 10 of 10 passed each.
+  /dev/shm holds no vswitch_stats_* object after any of these runs.

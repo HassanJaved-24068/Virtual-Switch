@@ -311,3 +311,15 @@ program that ignores SIGINT.
   dereferenced a NULL frame (segfault instead of a failed check); a mutation showed that nothing tested a stale unicast entry (test added).
 - test_vlan.py: the host index was off by one in four unicast checks.
 - Open: tests/test_mac.py failed two checks in one run of ten (an aging step, output not kept); 12 later runs passed. Cause not found.
+
+## 25. Part 14: design flaws caught before they shipped, and test-side mistakes (no defect in a released behaviour)
+- Design: a first version created the segment early in main(). A second switch that failed to start (TCP port in use, bad log file) would have
+  replaced the running switch's segment and then unlinked it on exit. Fix: stats_init runs after the listener, the eventfd and the log file; the
+  unlink at shutdown / exit only happens if the name still refers to OUR object (device + inode). Tests: test_stats.c "an older switch does not
+  unlink the segment of a newer one", test_shm.py test 7.
+- Design: a start-up error that ends in exit() (CHECK, bind) would leave /dev/shm/vswitch_stats_P behind; an atexit handler now unlinks the name.
+- test_stats.c: children forked by the test inherited four pipe descriptors, which valgrind --track-fds reported as 4 errors per child (exit status 1);
+  the children now close them. stdout is line buffered so a forked child cannot replay the parent's unflushed output.
+- Equivalent mutant: removing PTHREAD_PROCESS_SHARED while keeping ROBUST is not detectable on glibc (robust mutexes use shared futexes).
+- Item 24 (test_mac.py flake): did not reappear in the full make test of Part 14 (normal, TSan and valgrind runs). Still open, cause unknown.
+- Known limitation: the segment name is fixed, so two simultaneously running switches cannot both be visible (docs/Part14_Explanation.txt section 6).

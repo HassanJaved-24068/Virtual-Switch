@@ -159,6 +159,8 @@ enum port_start_rc port_start(int fd, int *port_id, int *err)
                 port_reset(p);
             } else {
                 p->state = PORT_UP;                      /* FREE -> UP */
+                stats_set_state(p->id, PORT_UP);         /* Part 14: copy into the shared counters (stats = last lock) */
+                stats_set_vlan(p->id, p->vlan);
                 *err = pthread_create(&p->rx, NULL, receiver_main, p);
                 if (*err == 0) {
                     p->rx_started = true;
@@ -191,6 +193,7 @@ static bool request_down_locked(port_t *p, enum port_state final_state)
 
     p->state = PORT_CLOSING;                             /* UP -> CLOSING */
     p->final_state = final_state;
+    stats_set_state(p->id, PORT_CLOSING);                /* Part 14 */
 
     /* Lock order: ports_lock (1) first, then the reaper lock (4). */
     CHECK_PT(pthread_mutex_lock(&sw.reaper_lock));
@@ -267,6 +270,9 @@ static void teardown_port(port_t *p)
     port_reset(p);
     p->rx_started = false;
     p->state = final_state;
+    stats_set_state(id, final_state);                    /* Part 14 */
+    stats_set_vlan(id, p->vlan);                         /* port_reset restored the default VLAN */
+    stats_set_mirror(id, atomic_load(&p->mirror_to));
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
 
     /* 9. A FREE port gives its token back. A DISABLED port keeps it (it
@@ -552,6 +558,7 @@ void port_set_vlan(port_t *p, uint16_t vlan)
 {
     CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
     p->vlan = vlan;
+    stats_set_vlan(p->id, vlan);             /* Part 14: shared copy for "show ports" */
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
     (void)mac_flush_port(p->id);             /* after the unlock: old-VLAN entries of this port vanish */
 }

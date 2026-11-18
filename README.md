@@ -4,10 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 13** (VLANs and the trunk port; before it rate limiting of Part 12, the priority
-queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (the admin socket, shared-memory
-statistics, port mirroring) are not implemented yet; where the configuration file already accepts their keys
+This README describes the switch as of **Part 14** (per-port counters in POSIX shared memory; before it VLANs and the trunk port of
+Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
+Features of later parts (the admin socket and `swctl`, which will read the shared counters, and port mirroring) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -132,6 +131,32 @@ host sees the VLAN of the frame, an access host sees its own. The trunk is exemp
 once (`port_set_vlan`: VLAN set under the write lock, then the port's MAC entries are flushed); a host that connects later gets the VLAN from the
 configuration. `trunk_port` changes only at start-up.
 
+## Counters in shared memory
+
+The per-port counters live in the POSIX shared-memory object **`/vswitch_stats_P`** (`ls -l /dev/shm` shows `vswitch_stats_P` while the
+switch runs and not after it stopped), so that another process can read them. `swctl` will do so in Part 15; nothing reads them yet except the tests.
+
+| offset | structure | content |
+|---|---|---|
+| 0 | `stats_ctl_t` (padded to one page) | `uint32_t magic` (`0x56535453`, written last), `uint32_t version` (1), `int num_ports`, `pthread_mutex_t lock` |
+| `PAGE` | `stats_data_t` | `port[MAX_PORTS + 1]`, each `{uint64_t in, out, dropped, mirrored; int state, vlan, mirror_to;}` |
+
+`PAGE` is `sysconf(_SC_PAGESIZE)` (4096 on x86-64); the object is `PAGE + round_up(sizeof(stats_data_t), PAGE)` bytes (8192), mode **0600** (same user
+only). `in` counts frames received from the host of the port, `out` frames written to it, `dropped` frames lost because its queue was full (and
+invalid trunk frames), `mirrored` is reserved for Part 17. `state` (0 FREE, 1 UP, 2 CLOSING, 3 DISABLED), `vlan` and `mirror_to` are copied in whenever
+the port changes, for `swctl show ports` (Part 15).
+
+The lock is a **process-shared, robust** mutex that only the switch initialises, before it writes the magic. Every counter update takes it (it is the last
+lock of the global lock order). If a process dies holding it, the next locker gets `EOWNERDEAD`, calls `pthread_mutex_consistent` and goes on, so a
+crashed reader never wedges the switch. A reader must check `magic` and `version` (`stats_validate`) and lock with `stats_lock`.
+
+Start-up creates the object with `O_CREAT | O_EXCL` (a stale one left by a crash is unlinked first), sizes it with `ftruncate`, maps it with `mmap` and
+publishes the magic last; any failure removes the object again. A switch that cannot start (TCP port in use, bad file) never touches the object of a
+running switch. Shutdown: `shm_unlink` first (nobody can open it any more), the magic is cleared, the mutex destroyed, then `munmap`; a process that mapped the
+object earlier keeps its memory until it exits and sees `magic == 0`. A switch killed with `SIGKILL` leaves the object behind; the next start replaces it.
+The name is fixed, so one switch per machine and user owns it: a second switch that does start replaces the first one's object (the first keeps
+working on its own mapping but is no longer visible).
+
 ## Signals
 
 | signal | effect |
@@ -195,6 +220,8 @@ python3 tests/test_qos.py [tsan|valgrind]              # priorities through a co
 python3 tests/test_rate.py [tsan|valgrind]             # rate limiting with the real switch (Part 12)
 ./build/test_vlan               # VLAN forwarding and the trunk, no sockets (after `make build/test_vlan`)
 python3 tests/test_vlan.py [tsan|valgrind]             # VLANs with the real switch (Part 13)
+./build/test_stats              # shared-memory counters, layout, robust mutex, stale segments (after `make build/test_stats`)
+python3 tests/test_shm.py [tsan|valgrind]              # the segment of the real switch: counters, fields, shutdown (Part 14)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 
