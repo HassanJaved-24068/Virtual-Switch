@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 14** (per-port counters in POSIX shared memory; before it VLANs and the trunk port of
+This README describes the switch as of **Part 15** (the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (the admin socket and `swctl`, which will read the shared counters, and port mirroring) are not implemented yet; where the configuration file already accepts their keys
+Features of later parts (live reconfiguration by `swctl shutdown|up|vlan`, Part 16, and port mirroring, Part 17) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -134,7 +134,7 @@ configuration. `trunk_port` changes only at start-up.
 ## Counters in shared memory
 
 The per-port counters live in the POSIX shared-memory object **`/vswitch_stats_P`** (`ls -l /dev/shm` shows `vswitch_stats_P` while the
-switch runs and not after it stopped), so that another process can read them. `swctl` will do so in Part 15; nothing reads them yet except the tests.
+switch runs and not after it stopped), so that another process can read them. `swctl stats` reads them (Part 15).
 
 | offset | structure | content |
 |---|---|---|
@@ -156,6 +156,36 @@ running switch. Shutdown: `shm_unlink` first (nobody can open it any more), the 
 object earlier keeps its memory until it exits and sees `magic == 0`. A switch killed with `SIGKILL` leaves the object behind; the next start replaces it.
 The name is fixed, so one switch per machine and user owns it: a second switch that does start replaces the first one's object (the first keeps
 working on its own mapping but is no longer visible).
+
+## Admin socket and `swctl` (Part 15)
+
+An **admin thread** inside the switch listens on the UNIX-domain stream socket **`/tmp/vswitch_<tcp_port>.sock`** (mode 0600; a stale path is
+unlinked at start-up; `ss -xlp` shows it; it is removed at shutdown). It serves one client at a time. **Protocol:** the client sends one line ending in
+`\n` (at most 256 bytes including the newline, 2 s in total to send it); the switch replies with text lines, the last one `OK` or `ERR <reason>`, and
+closes. The wait for a client, for the request and for the reply is a `poll()` on the socket and on `wake_efd`, so `SIGINT` ends the thread at once even while
+a client is silent; no lock is held during socket I/O.
+
+```
+./swctl [-p tcp_port] <command>          # default tcp_port 9000
+  show mac                  the MAC table (vlan, mac, port, age), sorted
+  show ports                state, VLAN, trunk, number of MACs, mirror target of every port
+  clear mac                 empty the MAC table (unknown destinations flood until relearned)
+  stats                     per-port counters (in, out, dropped, mirrored) from the shared memory
+  stats --watch             the same every whole second, until SIGINT
+  shutdown <port> | up <port> | vlan <port> <vlan> | mirror <port> <sniffer> | mirror <port> off
+```
+
+Exit status: **0** `OK`, **1** `ERR` (also bad arguments and system errors), **2** the switch is not running (connect fails with `ENOENT` or
+`ECONNREFUSED`, or no shared-memory object: message `switch not running`).
+
+* **Done in Part 15:** `show mac`, `show ports`, `clear mac`, `stats`, `stats --watch`.
+* **Parsed and validated only** (port 1..N, VLAN 1..4094, `mirror` source != sniffer, sniffer is not the trunk): `shutdown`, `up`, `vlan`, `mirror`. What they do
+  belongs to Parts 16 and 17; until then a valid one answers `ERR not implemented yet (Part 16|17)` (exit 1). Nothing pretends to succeed.
+
+`stats` does not use the socket. `swctl` opens `/vswitch_stats_P` with `O_RDWR` and makes **two** mappings of it: the control page (offset 0, `PROT_READ|PROT_WRITE`:
+locking a mutex writes to it) and the data area (offset `PAGE`, `PROT_READ`: the counters cannot be changed by `swctl`, a write is a `SIGSEGV`). It checks
+magic and version, locks the robust mutex (`EOWNERDEAD` -> `pthread_mutex_consistent`), copies the counters, unlocks, and only then prints.
+`show ports` shows the VLAN and role of the configuration for a port that has no host yet (the switch applies them when a host connects).
 
 ## Signals
 
@@ -222,6 +252,9 @@ python3 tests/test_rate.py [tsan|valgrind]             # rate limiting with the 
 python3 tests/test_vlan.py [tsan|valgrind]             # VLANs with the real switch (Part 13)
 ./build/test_stats              # shared-memory counters, layout, robust mutex, stale segments (after `make build/test_stats`)
 python3 tests/test_shm.py [tsan|valgrind]              # the segment of the real switch: counters, fields, shutdown (Part 14)
+./build/test_admin              # the admin command parser (after `make build/test_admin`)
+./build/test_swctl              # swctl against a segment: read-only data mapping, robust mutex (after `make build/test_swctl`)
+python3 tests/test_admin.py [tsan|valgrind]            # admin socket and swctl with the real switch (Part 15)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 

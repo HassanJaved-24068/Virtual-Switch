@@ -323,3 +323,105 @@ program that ignores SIGINT.
 - Equivalent mutant: removing PTHREAD_PROCESS_SHARED while keeping ROBUST is not detectable on glibc (robust mutexes use shared futexes).
 - Item 24 (test_mac.py flake): did not reappear in the full make test of Part 14 (normal, TSan and valgrind runs). Still open, cause unknown.
 - Known limitation: the segment name is fixed, so two simultaneously running switches cannot both be visible (docs/Part14_Explanation.txt section 6).
+
+## 26. Part 15: one switch defect found by a test, and a gap closed before it shipped
+- Defect (admin.c): a request longer than 256 bytes was answered with "ERR line too long" and the connection was closed with the rest of the request
+  still unread. close() with unread data resets the connection, and the client saw ECONNRESET instead of the reply. Found by test_admin.py (1000 bytes,
+  no newline). Fix: every path of serve() now ends with shutdown(SHUT_WR) and a bounded non-blocking read of what the client sent.
+- Gap: a NUL byte inside a request ("show mac\0junk") ended the C string and passed as "show mac". read_line() now refuses it ("bad character").
+- Gap: the reply loop waited up to 2 s on a client that never reads, which would have delayed a shutdown. It now polls {client, wake_efd}.
+- Display: "show ports" for a port without a host used the port's stale defaults (the VLAN and trunk role are copied from the configuration when a host
+  connects, port.c); it now shows the configured values for such ports. The behaviour of Part 13/14 itself was not changed.
+- Test-side: test_admin.py read one recv() where the reply comes in pieces; the first --watch interval is short by design (it ends at the next whole
+  second); /proc/<pid>/maps lists the mappings by address, not by file offset. No switch defect.
+- Test change: test_shm.py expected num_ports = 64 in the segment header; the switch now stores its real number of ports (4).
+- Test change (Part 15, test_switch.py): the exact thread list now includes the "admin" thread (7 fixed threads instead of 6) and the descriptor
+  bound after "many hosts come and go" is 7 instead of 6 (the admin listening socket; the wake eventfd is shared). Intent unchanged: no thread or
+  descriptor leaks per host.
+
+## 27. Test harness: orphaned switches after a failed scenario; C5 "intermittent loss" (both test-side; no switch defect)
+**A. test_admin.py left switches running when a scenario raised (found during the end-to-end verification: two idle `./switch` processes, 55 min old).**
+- Cause: every scenario ended with a plain `sw.stop()` and no try/finally; the raw UNIX sockets and the `swctl --watch` children were never registered
+  anywhere; the main block only removed the temporary directory; a switch whose constructor raised ("did not start") was never reachable because the
+  object did not exist yet. A Python traceback therefore ended the script with the switch (and its log files) still alive.
+- Fix (tests/test_admin.py): a registry of everything a run creates (`STARTED` switches, registered BEFORE the constructor runs; `CLIENTS` sockets, hosts,
+  swctl children), `cleanup()` and `run_scenario()` (cleanup in a `finally`, the original exception propagates unchanged, a cleanup error is printed and
+  counted but never replaces it, every step runs even if an earlier one fails), `stop_proc()` (SIGTERM, wait, SIGKILL on timeout, wait = reaped; safe if it
+  already exited), per-scenario exception handling in `run_tests()`, SIGTERM of the test script itself turned into SystemExit. Only the exact processes the
+  run started are signalled (no pkill by name). test_e2e.py uses the same mechanism (its private tracking was removed).
+- Proof: tests/test_harness_cleanup.py (38 checks, in `make test`): normal completion with and without sw.stop(); an AssertionError, a RuntimeError and a
+  KeyboardInterrupt in a scenario; a real ./host child; a swctl --watch child; a switch that ignores SIGTERM (killed after the timeout, reaped, no
+  zombie); a switch that never prints "listening" (constructor raises while the process lives); an unrelated switch of the same program name keeps running;
+  a failing cleanup step neither hides the original exception nor skips the rest. Mutation check: with the switch-stopping step disabled 11 of the 38
+  checks fail.
+**B. C5 (tests/test_e2e.py) failed in about 1 of 5 normal runs: 1-60 frames lost on a READING port.**
+- The switch was not at fault and neither was TCP or the counting. Instrumented C5 (sequence numbers in every frame, per-port counters before/after, TCP
+  queues, per-thread scheduler statistics) over 59 runs of the original load: in every run `out + dropped` = frames broadcast to the port, the reader received exactly `out`,
+  and the missing sequence numbers = the switch's `dropped` counter (0 violations of these identities). So frames are lost only by being counted as
+  dropped by the bounded output queue (queue_capacity 32) of a reading port; they are not lost in TCP and not miscounted.
+- Why the queue filled: a drop needs the consumer to be delayed for longer than queue_capacity / arrival rate. At the original load (about 2100
+  frames/s into each reading port) that is 15 ms. Failing runs lost a contiguous burst, often the SAME sequence numbers on 2-3 ports at once (a common stall),
+  and a thread-level scheduler log showed the switch's sender threads (`tx-port3`: ran 360 ms, waited 1160 ms for a CPU in 8 s) and the Python readers both
+  waiting for a CPU on this 2-vCPU VM (system 36-69 % idle, steal 0 %: scheduling latency, not saturation). A faster reader (recv_into, offsets) did not remove it
+  (4 of 12 failed, legacy reader 6 of 15), and 8 MB receive buffers on the readers did not either (2 of 12; legacy reader + 8 MB 5 of 12): the reader was not the bottleneck.
+  Lowering only the offered load did: about 840 frames/s: 0 of 10 runs with a drop on ports 1-4 (the unread port still dropped >= 4332); 357 frames/s: 0 of 10;
+  at 186 frames/s the unread port no longer saturated within 8 s (so that is too slow for C5).
+- Classification: test defect (an environment-dependent assumption, "a reading host never falls behind a 32-slot queue", at a load that leaves 15 ms of
+  tolerance) plus a test completion race (fixed 1.5 s sleep before reading the counters; with TSan the backlog takes about 5 s to drain). The switch did what the
+  bounded-queue policy says: drop and count, never block the receiver.
+- Fix: C5 now floods at about 840 frames/s (38 ms of tolerance), with every original assertion unchanged and strict; completion waits for the actual condition
+  (frames received = the switch's `out` counter, stable for 1 s) instead of sleeping; new exact accounting checks; C5b keeps the original high rate and
+  asserts what is true at any rate (accounting identities, saturated port drops, senders not blocked), reporting losses on reading ports instead of failing.
+  Queue capacity, the number of hosts and the assertions were not changed to hide the problem.
+- Confirmation: C5 30 of 30 runs passed with 0 drops on ports 1-4; C5b 8 of 8; under TSan C5 5 of 5 and C5b 4 of 4 (drain at most 1.6 s). 30 runs
+  show it is rare at this load, not that it cannot happen: a long enough scheduling stall would still drop frames, by design.
+- Not measured: the switch does not expose queue occupancy or a high-water mark, so "the queue was full" is inferred from the dropped counter and the
+  burst lengths. Which of the switch's sender wake-up delay or the reader delay caused each individual burst was not separated; what was separated is that
+  neither a faster reader nor a larger receive buffer removed it and that a lower frame rate did.
+**C. tests/test_rate.c "cpu < 50.0" flaky under valgrind (Part 12 unit test) - FIXED (approved by the user).**
+- `make test` stopped at `valgrind ... ./build/test_rate`: "FAIL line 223: cpu < 50.0 / sender blocked for 300 ms, cpu used by it: 75.05 ms" (twice in full runs, 3 of
+  10 standalone runs). The test measured the sender thread's CUMULATIVE CPU since its creation. Valgrind's thread start-up costs 28-83 ms (cumulative CPU at
+  100 ms, 15 runs), so the 50 ms bound was inside the noise. A spinning thread would use about 300 ms; the code (src/queue.c, unchanged) is fine.
+- First attempt, as approved: a 150 ms bound under valgrind on the cumulative value: still 2 of 15 runs failed (170.6, 172.6 ms): the noise is wider than my first 10-run
+  sample (35-63 ms) had suggested.
+- Fix: the CPU is measured over a 300 ms window that starts after a 100 ms settling time (the same intent: blocked, not spinning); the bound is 150 ms under
+  valgrind (detected through `LD_PRELOAD` containing `vgpreload`, no valgrind headers needed) and 50 ms for the normal and TSan builds. The settled window costs
+  5-63 ms under valgrind (40 runs: max 62.6 ms), 0.02-0.19 ms in the normal and TSan builds. Mutation check: a busy-loop wait (timeout 0 in `outq_pop`) is caught in both
+  builds (294 ms in the normal build, 297 ms under valgrind, against limits of 50 and 150 ms). Result: 0 failures in 25 consecutive valgrind runs (max 38.9 ms) and a
+  green full `make test` (window 13.8 ms under valgrind).
+**D. test_admin.py::test_bad_clients failed once in the final run: `BlockingIOError: [Errno 11]` on connect() to the admin socket (test race, no switch defect).**
+- Cause: after a burst of 15 broken clients the test connected with a socket that already had a Python timeout. Such a connect() is non-blocking; the admin
+  thread serves one client at a time and listens with a backlog of 8, so while the backlog is full connect() answers EAGAIN. Reproduced against a real switch
+  with the same burst: 19 of 150 connects failed with the old method, 0 of 150 with a blocking connect (SO_SNDTIMEO 10 s, then the read timeout).
+  swctl itself connects blocking, so it waits for a slot and is not affected.
+- Fix: `uconnect()` in test_admin.py (blocking connect bounded by SO_SNDTIMEO) at the five places that connected after settimeout().
+- Property worth knowing (not a defect): more than 8 clients connecting at once while the admin thread is busy make a NON-blocking connect fail with EAGAIN.
+**E. test_admin.py::test_protocol failed once: `BrokenPipeError` in sendall() of a 100 KB request (test race, no switch defect).**
+- The switch reads 256 bytes, answers "ERR line too long" and closes (draining what is already queued); a client that is still inside one sendall() of 100 KB
+  can get EPIPE. Measured against a real switch: 36 of 400 sends failed, and in all 400 cases the reply "ERR line too long" WAS received.
+- Fix: raw() tolerates EPIPE/ECONNRESET on send and still reads the reply. The assertion was tightened, not loosened: the 100 KB case used to accept an
+  empty reply ("or big == ''"); it now requires "ERR line too long".
+**F. Historical harness: ts.Switch left its process running when the switch did not start in 10 s; one unexplained slow-machine episode.**
+- `tests/test_switch.py::Switch.__init__` raised "switch did not start" without stopping the process it had just started. One slow start under valgrind therefore left an
+  orphan, and the orphans slowed every following run, which then also failed to start (seen as 7 cascading failures of `test_qos.py valgrind`, 3 orphaned valgrind
+  switches, terminated by exact PID). Fix: the constructor now stops exactly its own process (SIGTERM, 15 s, SIGKILL), closes and removes its temp files, then raises.
+  Checked with a fake switch that ignores SIGTERM: RuntimeError after 25 s, no process left.
+- **CAUSE UNKNOWN: the `test_qos.py valgrind` failure and the slow episode around it.** Original evidence, preserved verbatim (the raw log files were lost when the session's
+  scratchpad directory was cleared; this text is copied from the session transcript of the third full `make test` of the follow-up, 11 min 14 s, rc=2):
+  ```
+  === python3 tests/test_qos.py valgrind ===
+  6. valgrind: priority scheduling, bad priorities, reload: no errors, no leaks, no descriptor left open
+    FAIL: valgrind: D, which reads, got all marked frames: the switch has forwarded them
+  11 checks passed, 1 failed
+  FAILED: python3 tests/test_qos.py valgrind
+  ```
+  The check (tests/test_qos.py, `run_round`, lines 174-184) sends marker frames from host A and waits up to 30 s for the fast reader D to have seen all of them, with
+  `queue_capacity = 8`. Immediately afterwards, standalone runs of the same test gave: run 1 passed in 57 s (it normally takes 16-17 s), runs 2-8 failed in about 16 s each with
+  `RuntimeError: switch did not start` (valgrind had not printed "listening" within the 10 s of `ts.Switch.__init__`; valgrind normally needs 2.0-2.6 s, 6 measured starts), and left 3
+  orphaned valgrind switches (pids 268539, 268577, 268610, 1:47-2:16 old) which were terminated by exact pid. After that 8 of 8 standalone runs passed at 16-17 s each.
+- **Why it was not reproduced:** it passed in 8 of 8 standalone valgrind runs, in 6 of 6 runs with two CPU-hog processes on the 2-CPU VM (17-19 s each; so plain CPU
+  contention does not trigger it), in the next full `make test` (green) and in the final one. The slowness that came with the failure (57 s instead of 16 s) is the only trace of
+  what was different, and its cause is unidentified (an earlier note called it "heavy load"; that is an interpretation, not a measurement). A plausible mechanism for the
+  failed check (the marker frames dropped on the 8-slot queue of the reading host while valgrind was slow) was NOT shown: the test prints no counters, and the log was not kept.
+  Status: unexplained, not reproduced, test and switch unchanged. If it recurs, the first things to capture are the switch's `dropped` counters (`swctl stats`) at the moment of the
+  failure and the run time of the test.

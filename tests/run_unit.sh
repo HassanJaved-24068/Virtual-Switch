@@ -1,11 +1,12 @@
 #!/bin/bash
-# Parts 1-14 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-15 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
         build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
-        build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan || exit 1
+        build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan \
+        build/test_admin build/test_admin_tsan build/test_swctl || exit 1
 
 run() {
     echo "=== $* ==="
@@ -97,4 +98,15 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_stats
 fi
 
-echo "Parts 1-14 unit and regression tests passed."
+run ./build/test_admin                    # Part 15: the admin command parser (eight commands, ranges, odd input, 256-byte limit, error texts)
+run $NOASLR ./build/test_admin_tsan       # Part 15: the same under ThreadSanitizer
+run ./build/test_swctl                    # Part 15: swctl stats against a segment: counters, data mapping read-only (SIGSEGV), kill -9 while locked (EOWNERDEAD), waits for the lock, no segment -> exit 2
+run python3 tests/test_admin.py           # Part 15: the real switch: socket + protocol, bad clients, SIGINT with silent clients, show mac / show ports / clear mac, validation, exit statuses, stats, stats --watch, damaged segments
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_admin.py tsan   # Part 15: under TSan
+run python3 tests/test_harness_cleanup.py   # Part 15 harness: scenarios that fail or raise leave no switch, host, socket or swctl child behind (SIGTERM -> SIGKILL, unrelated switch untouched)
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_admin.py valgrind                               # Part 15: no errors, no leaks, no descriptor left open, no socket left
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_admin
+fi
+
+echo "Parts 1-15 unit and regression tests passed."

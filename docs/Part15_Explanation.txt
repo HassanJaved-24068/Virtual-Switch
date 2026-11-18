@@ -1,0 +1,147 @@
+=====================================================================
+PART 15 - ADMIN SOCKET AND swctl
+=====================================================================
+
+1. WHAT PART 15 IMPLEMENTS
+--------------------------
+An admin thread in the switch that serves a UNIX-domain socket, and the separate program swctl. Roadmap (Part 15, Tier 2 item 11):
+show mac, show ports and clear mac are fully done; stats and stats --watch read the shared counters of Part 14 directly (no socket);
+shutdown, up, vlan and mirror are parsed and validated, and their effect belongs to Parts 16 and 17 (NOT implemented here).
+
+Files:   include/admin.h, src/admin.c   the admin thread, the protocol, the parser (admin_parse), the three real commands
+         src/swctl.c                    the client: socket commands, stats, stats --watch
+         src/switch.c                   admin_open() after the listener / counters exist, admin_start() with the other threads, admin_close() as
+                                        step 3 of the shutdown (the place the Part 7 comment reserved); stats_init now gets the number of ports
+         tests/test_admin.c             the parser (permanent, make test)
+         tests/test_swctl.c             swctl against a segment: mappings, SIGSEGV, kill -9 while locked (permanent)
+         tests/test_admin.py            the real switch with raw sockets and swctl (permanent)
+         tests/test_part15.py           TEMPORARY dedicated runner of exactly those tests (deleted when Part 16 starts)
+         tests/test_part14.py           deleted (its tests stay in the permanent suite: test_stats.c, test_shm.py)
+         tests/run_unit.sh, tests/run_all.sh, Makefile (admin.o is a switch object), tests/test_shm.py (see 8), README.md, notes/bugs.md
+
+2. THE ADMIN THREAD (src/admin.c)
+---------------------------------
+Start-up (main): admin_open(tcp_port) is called after everything that can fail for an outside reason (the TCP listener, the log file, the counters):
+the TCP port is ours, so /tmp/vswitch_<port>.sock is stale and is unlinked; then socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC), bind,
+chmod 0600, listen. A second switch that fails to start therefore never removes the socket of a running one. admin_start() creates the thread
+after the MAC table exists (the thread uses it).
+
+Loop:  poll({admin_fd, wake_efd}, -1) -> POLLIN: accept4(..., SOCK_CLOEXEC) -> serve one client -> close it. wake_efd is the SAME eventfd that
+request_shutdown() writes for the accept thread; it is only drained by the accept thread when no shutdown was requested, so after a shutdown
+request it stays readable for every thread that polls it. EINTR, EAGAIN, ECONNABORTED are retried; EMFILE and the like are logged and
+followed by a 100 ms wait (no busy loop); a broken listening socket ends the thread with a log line.
+
+One client at a time. Everything that can block has a bound:
+ - the request: read_line() polls {client, wake_efd} before EVERY read, with the time that is left of ONE 2 s deadline for the whole line (a client
+   that sends a byte every 1.9 s does not hold the thread: SO_RCVTIMEO alone would not give that; it is also set, as the roadmap says);
+ - the reply: built completely in memory first, then sent with send(MSG_NOSIGNAL | MSG_DONTWAIT) in a loop (the project has no write_full helper;
+   this is the same loop) that waits with poll({client POLLOUT, wake_efd}) inside one 2 s deadline (SO_SNDTIMEO is set too). A client that never reads
+   can delay the thread by at most 2 s and never delays a shutdown;
+ - after the reply: shutdown(SHUT_WR) and a bounded non-blocking read of what the client already sent, so that close() with unread bytes does not
+   reset the connection and destroy the reply (found by the test of a 1000-byte request, see notes/bugs.md item 26).
+No lock is held during poll or socket I/O: the commands copy what they need under their own short locks and format afterwards.
+The peer's uid is checked (SO_PEERCRED; the file is 0600 as well); other users get "ERR permission denied".
+
+3. THE PROTOCOL
+---------------
+Request: ONE line ending in '\n' (a '\r' before it is ignored), at most 256 bytes INCLUDING the newline, printable characters and tabs only (a NUL byte or
+a control character is "ERR bad character in the command"). More than 256 bytes: "ERR line too long (maximum 256 bytes)". Nothing complete within
+2 s: "ERR timeout waiting for the command line". A client that closes or sends nothing is dropped without an answer.
+Reply: text lines, then a last line "OK" or "ERR <reason>", then the switch closes. Anything after the first line of the request is ignored.
+
+  show mac     "# vlan mac port age_s" then one line per entry sorted by (vlan, mac), the format of the SIGUSR1 dump (mac_foreach, a
+               snapshot under the bucket locks, copied first and formatted after the locks are released)
+  show ports   "PORT STATE VLAN TRUNK MACS MIRROR", one row per port. STATE = FREE|UP|CLOSING|DISABLED. The row of a port is read under the
+               ports_lock read lock (consistent), mac_count and mirror_to are atomics. For a connected port VLAN/TRUNK are the port's own fields
+               (SIGHUP changes them); the trunk shows "-" as VLAN (it carries every VLAN). A port WITHOUT a host shows the VLAN and trunk role of the
+               configuration: port.c copies them into the port when a host connects, so the field of a FREE port would show a stale default.
+  clear mac    mac_clear(): "cleared N MAC entries". Receivers keep running; their next frames for the cleared MACs flood and relearn.
+  shutdown <p> | up <p> | vlan <p> <v> | mirror <p> <s> | mirror <p> off
+               validated by admin_parse() (no side effects): number syntax (digits only, at most 6), port 1..num_ports, VLAN 1..4094, mirror source !=
+               sniffer; and in execute(): the sniffer is not the trunk. A valid command then answers "ERR not implemented yet (Part 16)" or
+               "(Part 17)". No success is invented: there is no function to call yet (admin_shutdown, admin_up, admin_vlan, admin_mirror are Part 16/17).
+               When those parts exist, the three places to wire are the CMD_SHUTDOWN/CMD_UP, CMD_VLAN and CMD_MIRROR* cases of execute() in admin.c.
+Errors of the parser say what is wrong: "port 9 out of range (1-4)", "VLAN 4095 out of range (1-4094)", "unknown command 'x'", "usage: vlan <port> <vlan>".
+
+4. swctl (src/swctl.c)
+----------------------
+  ./swctl [-p tcp_port] <command>      default 9000
+Socket commands: the words are joined into one line (at most 255 characters, else exit 1 before connecting), sent, and the whole reply is read (10 s
+timeout); the lines before the status are printed on stdout, "ERR <reason>" goes to stderr as "swctl: ERR <reason>". The status is the LAST line;
+a reply without OK or ERR (the switch closed, was killed) is an error (exit 1).
+Exit status: 0 = OK; 1 = ERR, bad arguments, usage, any other failure (connect error other than below, reading the reply, shared-memory error,
+damaged or foreign segment); 2 = "switch not running": connect() failed with ENOENT or ECONNREFUSED, or shm_open() failed with ENOENT, or the
+segment's magic is 0 (the switch shut down while a mapping was still open). Message: "swctl: switch not running (...)".
+SIGPIPE is not an issue: send() uses MSG_NOSIGNAL.
+
+5. stats AND stats --watch: THE SHARED MEMORY
+---------------------------------------------
+No socket. shm_open("/vswitch_stats_P", O_RDWR): a read-only descriptor is not enough, because locking a pthread mutex WRITES to the mutex
+(the lock word, the owner TID), which would be a SIGSEGV in a read-only mapping. Then fstat (size must be PAGE + round_up(sizeof(stats_data_t), PAGE),
+else "wrong size"), then TWO mappings, MAP_SHARED, and the descriptor is closed:
+  control area  offset 0, length PAGE,      PROT_READ | PROT_WRITE   stats_ctl_t: magic, version, num_ports, the mutex
+  data area     offset PAGE, length (total - PAGE), PROT_READ      stats_data_t: the counters and port fields
+Why the control area is writable: the only thing swctl does to it is lock and unlock the mutex. Why the data area is read-only: swctl has no
+reason to change a counter; with PROT_READ a bug (or a corrupted pointer) in swctl cannot corrupt the switch's counters, the kernel stops it with
+SIGSEGV. Two separate pages are why the Part 14 layout puts them at offset 0 and at PAGE: protections are per page.
+Reading (print_stats): stats_validate (EINVAL: magic 0 = not initialised or shut down -> exit 2; EPROTO: another version -> exit 1, says which)
+-> stats_lock (EOWNERDEAD -> pthread_mutex_consistent -> carry on; any other error is reported and the lock is not held) -> copy num_ports + 1 records
+into a local array (num_ports is checked against MAX_PORTS first; a damaged value is "damaged", exit 1, nothing is copied) -> stats_unlock ->
+print. Nothing is printed and no allocation or I/O happens while the lock is held.
+Robust mutex: if swctl (or the switch) dies while holding the lock, the next locker gets EOWNERDEAD, makes the mutex consistent and continues:
+the data are plain 64-bit counters, so they are always usable. A dead reader can never wedge the switch, and a dead switch never wedges swctl.
+Output: PORT STATE VLAN IN OUT DROPPED MIRRORED, ports 1..num_ports (the number of ports of this switch, which stats_init now receives instead
+of MAX_PORTS). VLAN and STATE are the fields Part 14 keeps in the segment.
+--watch: SIGINT / SIGTERM set a flag (handler without SA_RESTART; swctl is an ordinary program, the "no signal handlers" rule is the switch's).
+Loop: print "\033[H\033[2J" (home + clear), print_stats, then clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, next whole second); EINTR re-checks
+the flag; the absolute deadline cannot drift and the process sleeps in the kernel (no busy loop). It is a display refresh, not synchronisation: the
+consistency of every snapshot comes from the mutex. The first refresh is immediate, so the first interval is shorter than a second.
+If the switch shuts down during --watch, magic becomes 0: swctl prints "switch not running" and exits 2.
+
+6. SHUTDOWN OF THE ADMIN THREAD
+-------------------------------
+Main's sequence (docs/Part7_Explanation.txt) has step 3 for it. shutdown_switch(): join the signal thread; request_shutdown() (writes wake_efd);
+stop and join accept; close listen_fd; admin_close(): request_shutdown() again (idempotent; makes the start-up failure path work), shutdown(admin_fd,
+SHUT_RDWR) (the roadmap's call), pthread_join; close the listening descriptor; unlink the path. The thread sees wake_efd in whichever poll it is
+in: the idle one (listening socket), the request read, or the reply write; it leaves through the normal return, and serve() closes the client
+descriptor in admin_main. The thread uses only the MAC table and the ports, which still exist at step 3. No lock is held across the join.
+Start-up failures: admin_open fails -> log, counters destroyed, exit 1 (nothing left); a later failure (MAC table, a thread) -> admin_close(false, ...)
+closes and unlinks. admin_close() is safe twice and when admin_open() never ran.
+Measured: with a silent client, half a request, or five silent clients, SIGINT -> exit in about 0.1 s (the client timeout is 2 s).
+
+7. DECISIONS AND LIMITS
+-----------------------
+ - The socket name uses the TCP port ("/tmp/vswitch_<port>.sock"): several switches can run, each with its own socket. The shared-memory name is
+   fixed (Part 14 limitation), so "swctl stats" shows the segment of the most recently started switch whatever -p says. It is documented, not changed.
+ - The wake eventfd is the switch's, not a private one: "the admin thread is woken by request_shutdown()" is literally true.
+ - A FREE port in the segment still has the default VLAN (Part 14 limitation); "show ports" does not read it, it uses the configuration for ports
+   without a host. "swctl stats" prints the segment's value.
+ - The 2 s limit on the REPLY could not be exercised by a test: a reply larger than the kernel's socket buffer (about 200 KB) would need thousands of
+   MAC entries (the default table has 1024 entries, about 30 KB). The code path is the same poll loop that the shutdown tests exercise for the request.
+ - show mac copies the table first (one 56-byte record per entry), so a very large table needs memory in proportion; the table is bounded by K.
+ - Write commands: see 3. Part 16 will replace the "not implemented" returns; the tests of Part 15 only assert that a valid command is not rejected
+   as a syntax error, so they stay valid then.
+
+8. CHANGE TO AN OLD TEST
+------------------------
+tests/test_shm.py (Part 14) asserted num_ports == MAX_PORTS (64) in the header of the segment. Part 15 passes the real number of ports to stats_init
+so that swctl stats shows exactly the ports of the switch (4 in that test). The assertion now says 4; nothing else changed.
+
+9. TESTS
+--------
+(see the results in section 10)
+tests/test_admin.c (79 checks): the parser. tests/test_swctl.c (28 checks): stats output, control mapping writable, data mapping read-only (a child
+that writes through it gets SIGSEGV), a process killed with SIGKILL while it holds the lock (swctl stats still exits 0), a reader that waits for a lock
+held by another process, no segment -> exit 2. tests/test_admin.py: sections 1-12 (socket, protocol, bad clients, shutdown, commands, flooding
+after clear mac, traffic, validation, exit 2, stats and --watch with /proc/<pid>/maps (r--s at offset PAGE, rw-s at 0), damaged segments, valgrind).
+Mutation check done: ignoring wake_efd in the request read made three shutdown checks fail (1.7 s instead of < 1.5 s).
+
+10. RESULTS
+-----------
+Dedicated (python3 tests/test_part15.py): build, parser, swctl/segment (28 checks), end-to-end normal (223 checks), parser under TSan,
+  end-to-end under TSan (121 checks), parser under valgrind, end-to-end under valgrind (15 checks): ALL PASSED.
+make test (normal): parts-1-15 suite + the ten integration scripts: all passed (about 10.5 min). First run failed in test_switch.py (thread list and
+  descriptor count, see section 8 / notes/bugs.md item 26); adapted, then passed.
+make test-tsan (ten scripts, switch_tsan): all passed, no ThreadSanitizer report.
+make test-valgrind (ten scripts): all passed.
+The runs were sequential; /dev/shm was empty afterwards.

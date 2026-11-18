@@ -16,6 +16,7 @@
  * Part 9: log_msg() queues its lines for one logger thread that writes the log file;
  * it starts before the first log line and is the last thread to stop.
  */
+#include "admin.h"
 #include "common.h"
 #include "frame.h"
 #include "log.h"
@@ -287,8 +288,8 @@ static void *accept_main(void *arg)
 
 /* Which threads exist (and must be joined). Set only after a successful pthread_create. */
 typedef struct {
-    bool sig, reaper, aging, timer, accept;
-    pthread_t sig_thread, accept_thread, timer_thread;
+    bool sig, reaper, aging, timer, accept, admin;
+    pthread_t sig_thread, accept_thread, timer_thread, admin_thread;
 } started_t;
 
 /* Ask for the teardown of every UP port. The reaper does the actual work. */
@@ -343,7 +344,9 @@ static void shutdown_switch(const started_t *st)
             log_msg(LOG_ERR, "shutdown: close of the listening socket failed: %s", strerror(errno));
         sw.listen_fd = -1;
     }
-    /* (3. The admin thread belongs to Part 15.) */
+    /* 3. The admin thread (Part 15): it leaves its loop at once, even while it waits for a silent client; then the socket is closed and its
+     *    path unlinked. It uses the MAC table and the ports, which still exist. */
+    admin_close(st->admin, st->admin_thread);
 
     /* 4. Every UP port goes to the reaper. */
     if (st->reaper) {
@@ -443,7 +446,7 @@ int main(int argc, char **argv)
 
     /* The shared counters come AFTER everything that can fail for an outside reason (the TCP port is in use...):
      * a switch that cannot start must not replace, or remove, the segment of one that is running. */
-    rc = stats_init(MAX_PORTS);
+    rc = stats_init((int)num_ports);               /* num_ports of the header = the ports of this switch (swctl stats shows exactly these) */
     if (rc != 0) {
         fprintf(stderr, "switch: cannot create the shared counters %s: %s\n", STATS_SHM_NAME, strerror(rc));
         log_stop();
@@ -453,6 +456,16 @@ int main(int argc, char **argv)
         stats_set_state(i, sw.ports[i].state);
         stats_set_vlan(i, sw.ports[i].vlan);
         stats_set_mirror(i, atomic_load(&sw.ports[i].mirror_to));
+    }
+
+    /* The admin socket (Part 15), also after everything that can fail for an outside reason: the TCP port is ours (the listener exists), so an
+     * old /tmp/vswitch_<port>.sock is stale and is unlinked. The thread that serves it starts later, when the MAC table exists. */
+    rc = admin_open((int)tcp_port);
+    if (rc != 0) {
+        fprintf(stderr, "switch: cannot create the admin socket for TCP port %ld: %s\n", tcp_port, strerror(rc));
+        log_stop();
+        stats_destroy();
+        return EXIT_FAILURE;
     }
 
     log_msg(LOG_INFO, "switch listening on TCP port %ld with %ld ports", tcp_port, num_ports);
@@ -466,6 +479,7 @@ int main(int argc, char **argv)
     sw.mac_region = malloc(mac_size);
     if (sw.mac_region == NULL) {
         fprintf(stderr, "switch: cannot allocate the MAC table\n");
+        admin_close(false, st.admin_thread);
         log_stop();
         stats_destroy();
         return EXIT_FAILURE;
@@ -473,6 +487,7 @@ int main(int argc, char **argv)
     rc = mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets);
     if (rc != 0) {
         fprintf(stderr, "switch: cannot initialise the MAC table: %s\n", strerror(rc));
+        admin_close(false, st.admin_thread);
         log_stop();
         stats_destroy();
         return EXIT_FAILURE;
@@ -501,11 +516,17 @@ int main(int argc, char **argv)
                 rc = pthread_create(&st.timer_thread, NULL, token_timer_main, NULL);
                 if (rc == 0) {
                     st.timer = true;
-                    rc = pthread_create(&st.accept_thread, NULL, accept_main, NULL);
-                    if (rc == 0)
-                        st.accept = true;
-                    else
-                        failed = "accept";
+                    rc = admin_start(&st.admin_thread);
+                    if (rc == 0) {
+                        st.admin = true;
+                        rc = pthread_create(&st.accept_thread, NULL, accept_main, NULL);
+                        if (rc == 0)
+                            st.accept = true;
+                        else
+                            failed = "accept";
+                    } else {
+                        failed = "admin";
+                    }
                 } else {
                     failed = "token timer";
                 }

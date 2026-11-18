@@ -181,7 +181,7 @@ def test_object():
     check(st.st_size % PAGE == 0, "the size is a whole number of pages")
     seg = read_segment()
     check(seg is not None and seg[0] == MAGIC and seg[1] == VERSION, "magic and version are published")
-    check(seg is not None and seg[2] == MAX_PORTS, "num_ports field = %d" % MAX_PORTS)
+    check(seg is not None and seg[2] == 4, "num_ports field = the number of ports of the switch (4)")
     check(seg is not None and all(r[:4] == (0, 0, 0, 0) for r in seg[3]), "every counter starts at 0")
     check(seg is not None and all(r[4] == FREE and r[6] == 0 for r in seg[3][1:5]), "ports 1..4 are FREE, mirror_to 0")
     sw.stop()

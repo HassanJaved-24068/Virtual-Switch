@@ -200,6 +200,13 @@ static void test_set_rate(void)
     outq_destroy(&q);
 }
 
+/* valgrind preloads its vgpreload_*.so into the program it runs (no valgrind headers needed) */
+static bool running_under_valgrind(void)
+{
+    const char *pre = getenv("LD_PRELOAD");
+    return pre != NULL && strstr(pre, "vgpreload") != NULL;
+}
+
 /* ---- 3. a burst, then blocked, then one frame per whole token ---- */
 static void test_burst_and_block(void)
 {
@@ -218,10 +225,17 @@ static void test_burst_and_block(void)
 
     popper_t p;
     popper_start(&p, &q);
-    EXPECT(!popper_wait(&p, 300));                    /* blocked, although frames wait */
-    double cpu = popper_cpu_ms(&p);
-    EXPECT(cpu < 50.0);                               /* it sleeps: a spinning thread would have used ~300 ms */
-    printf("    sender blocked for 300 ms, cpu used by it: %.2f ms\n", cpu);
+    /* The thread must be BLOCKED although frames wait. Its CPU is measured over a 300 ms window that starts after a 100 ms settling time: a spinning
+     * thread would use ~300 ms in the window, a thread in a timed condition wait almost nothing. (The cumulative CPU since the thread was created included
+     * its start-up, which under valgrind costs 28-83 ms and made the old "cpu < 50 ms" fail 3 of 10 runs; a 150 ms bound on the cumulative value still failed
+     * 2 of 15: notes/bugs.md 27 C.) Under valgrind the settled window costs 10-63 ms (15 runs), so the bound there is 150 ms; normal and TSan builds keep 50 ms. */
+    EXPECT(!popper_wait(&p, 100));                    /* settling */
+    double cpu0 = popper_cpu_ms(&p);
+    EXPECT(!popper_wait(&p, 300));                    /* the window: still blocked, although frames wait */
+    double cpu = popper_cpu_ms(&p) - cpu0;
+    double limit = running_under_valgrind() ? 150.0 : 50.0;
+    EXPECT(cpu < limit);
+    printf("    sender blocked for 300 ms, cpu used by it in that window: %.2f ms (limit %.0f ms%s)\n", cpu, limit, limit > 50.0 ? ", valgrind" : "");
 
     outq_refill(&q, 50);                              /* 10 * 50 = 500 milli-tokens: half a frame */
     EXPECT(tokens_of(&q) == 500);

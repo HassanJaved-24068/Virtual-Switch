@@ -61,7 +61,25 @@ class Switch:
                                   stderr=self.errf, env=env, preexec_fn=pre)
         self.hosts = []
         if not self.wait_log("listening on TCP port %d" % self.port, 10):
-            raise RuntimeError("switch did not start; log:\n" + self.log())
+            text = self.log()
+            # Do not leave the process we just started running (a slow start under valgrind on a busy machine used to leave an orphan that slowed
+            # down every following test): stop exactly this process, then report.
+            try:
+                if self.p.poll() is None:
+                    self.p.terminate()
+                    try:
+                        self.p.wait(15)
+                    except subprocess.TimeoutExpired:
+                        self.p.kill()
+                        self.p.wait()
+            finally:
+                for f in (self.logf, self.errf):
+                    f.close()
+                    try:
+                        os.unlink(f.name)
+                    except OSError:
+                        pass
+            raise RuntimeError("switch did not start; log:\n" + text)
 
     def log(self):
         with open(self.logf.name, "rb") as f:
@@ -223,15 +241,16 @@ def test_three_hosts():
     check(names.count("accept") == 1, "ps -T shows exactly one accept thread")
     txs = sorted(t for t in names if t.startswith("tx-port"))
     check(txs == ["tx-port1", "tx-port2", "tx-port3"], "ps -T shows one sender per host: %s" % txs)
-    others = [t for t in names if t not in ("accept", "reaper", "aging", "signal", "logger", "token-timer") and not t.startswith(("rx-port", "tx-port"))]
+    others = [t for t in names if t not in ("accept", "reaper", "aging", "signal", "logger", "token-timer", "admin") and not t.startswith(("rx-port", "tx-port"))]
     # the main thread; the TSan build has one extra runtime thread with the same name
     check(names.count("reaper") == 1, "ps -T shows exactly one reaper thread")
     check(names.count("aging") == 1, "ps -T shows exactly one aging thread")
     check(names.count("signal") == 1, "ps -T shows exactly one signal thread (Part 7)")
     check(names.count("logger") == 1, "ps -T shows exactly one logger thread (Part 9)")
     check(names.count("token-timer") == 1, "ps -T shows exactly one token timer thread (Part 12)")
-    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 6 + 6 + len(others),
-          "main + accept + reaper + aging + signal + logger + token timer + 3 receivers + 3 senders (+TSan helper), got %s" % names)
+    check(names.count("admin") == 1, "ps -T shows exactly one admin thread (Part 15)")
+    check(1 <= len(others) <= (2 if "tsan" in SWITCH else 1) and len(names) == 7 + 6 + len(others),
+          "main + accept + reaper + aging + signal + logger + token timer + admin + 3 receivers + 3 senders (+TSan helper), got %s" % names)
 
     d = sw.host(ME[3])
     check(d is not None and "port 4: host connected" in sw.log(), "fourth host -> port 4")
@@ -532,7 +551,7 @@ def test_threads_exit_clean():
     check([t for t in sw.threads() if t.startswith("rx-port")] == [], "all receiver threads have exited (none left over)")
     check(sw.threads().count("accept") == 1 and sw.p.poll() is None, "accept thread and switch still alive")
     nfd = len(os.listdir("/proc/%d/fd" % sw.p.pid))
-    check(nfd <= 6, "no descriptors leaked: %d open" % nfd)
+    check(nfd <= 7, "no descriptors leaked: %d open" % nfd)
     sw.stop()
 
 
