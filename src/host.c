@@ -47,8 +47,8 @@ static void host_finish(int code)
     CHECK_PT(pthread_mutex_lock(&finish_lock));
     if (opt.quiet)
         printf("RX_TOTAL %lu\n", (unsigned long)rx_count);
-    fflush(stdout);
-    fflush(stderr);
+    (void)fflush(stdout);                /* leaving: a closed stdout or stderr is nothing to act on */
+    (void)fflush(stderr);
     _exit(code);
 }
 
@@ -201,7 +201,7 @@ static void print_rx(const frame_hdr_t *h, const uint8_t *data)
     }
     line[n++] = '\n';
     fwrite(line, 1, n, stdout);
-    fflush(stdout);                 /* tests read our output line by line */
+    (void)fflush(stdout);           /* tests read our output line by line; a closed stdout must not stop a host that is still connected */
 }
 
 static void *receiver_main(void *arg)

@@ -448,3 +448,26 @@ program that ignores SIGINT.
 - Test (mutation harness): a mutation that left a parameter unused failed to compile under -Werror and the harness silently ran the binary of the previous mutation (a wrong "caught").
   Mutations that must compile now keep every variable used; the result of every mutation is the result of ITS OWN build.
 - Test (test_mirror.c): the first null-safe version released only one of the two references to the shared frame (a == b), which leaked and failed the live-frame check; both are released.
+
+## 30. Part 18: unchecked call results found by the new static check (fixed); hostile simulation found no defect in the switch
+- tests/static_checks.py found 53 statements that ignored the result of a system or pthread call (the roadmap's "check that every call result is handled"): the whole logger
+  (lock / unlock / signal / wait), pthread_*_destroy in mactable.c / queue.c / util.c, close / munmap / shm_unlink in stats.c, close in admin.c, close / munmap / fflush in swctl.c,
+  fflush in host.c and log.c. None had caused a visible failure (they are lock calls that cannot fail on a valid mutex, and cleanup calls). Fixed: CHECK_PT where the call must not
+  fail, a checked report where a failure is meaningful, `(void)` with a comment where the error that brought us there is the one to report. Details: docs/Part18_Explanation.txt.
+- No `sleep()` / `usleep()` in the switch; idle CPU 0.2 %.
+- Test-side mistakes found while writing the Part 18 scripts (no switch defect): the real ./host refuses sendx with VLAN > 4094 or priority > 2 (invalid values need a raw connection);
+  a rejected configuration reload is logged at [ERR] by design (lib.sh's "no [ERR]" check cannot share an instance with it); a --noread host never sees the end of the connection and
+  must be told to quit; a barrier cannot wait for the sender to print its own frame; the killed flooder's backlog delays its teardown under valgrind / TSan (bounded flood size and a
+  generous wait). hostile.sh: 32 hosts with every kind of misbehaviour, admin commands and signals throughout: stable (normal 5/5, TSan 3/3, valgrind 2/2 repeats).
+
+## 31. Part 18: a teardown processed the whole socket backlog of a flooding host (genuine defect, fixed; found by reconfig_stress.sh under valgrind)
+- Symptom: under valgrind, `swctl shutdown <port>` of a flooding port answered `ERR timeout waiting for the port to shut down` (the 5 s limit of Part 16), and SIGINT with flooding
+  hosts took 12 s (3000-frame backlog) to 34 s (30000 frames) to finish; the log showed thousands of `RX` lines after `shutdown: started`. Without the fix, test_backlog.py measured 23902 frames
+  forwarded after the teardown was requested (normal build).
+- Cause: `shutdown(fd, SHUT_RDWR)` wakes a blocked reader but does NOT discard the frames already queued in the kernel's receive buffer. The receiver kept reading and forwarding
+  that backlog until it reached the end; the slower the switch (valgrind, TSan), the longer the join of the reaper waited.
+- Fix: `port_t.closing` (`_Atomic bool`), set in `request_down_locked` when the transition UP -> CLOSING is won, cleared in `port_reset`. `receiver_main` tests it at the top of the loop and
+  again after a frame was read (that frame is dropped): the receiver stops at once.
+- Test: tests/test_backlog.py (now in tests/run_unit.sh; normal, TSan, valgrind): SIGINT with four flooders exits quickly and at most ~40 frames per port are forwarded after the request;
+  `swctl shutdown` of a flooding port answers OK well inside 5 s and the other flooders keep forwarding. Before the fix: 1 failure (normal), 3 failures (valgrind); after: 21 checks, 0 failures
+  in all three variants.

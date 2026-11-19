@@ -66,6 +66,7 @@ void port_reset(port_t *p)
     p->vlan = DEFAULT_VLAN;
     p->trunk = false;
     atomic_store(&p->mirror_to, 0);          /* atomic: other threads may read these */
+    atomic_store(&p->closing, false);
     atomic_store(&p->mac_count, 0);
     atomic_store(&p->bad_prio, 0);
 }
@@ -192,6 +193,7 @@ static bool request_down_locked(port_t *p, enum port_state final_state)
         return false;                                    /* somebody else won (or not up) */
 
     p->state = PORT_CLOSING;                             /* UP -> CLOSING */
+    atomic_store(&p->closing, true);                     /* Part 18: the receiver must not work through the socket's backlog any more */
     p->final_state = final_state;
     stats_set_state(p->id, PORT_CLOSING);                /* Part 14 */
 
@@ -391,6 +393,8 @@ void *receiver_main(void *arg)
         log_msg(LOG_WARN, "port %d: cannot set thread name: %s", p->id, strerror(rc));
 
     for (;;) {
+        if (atomic_load(&p->closing))
+            return NULL;                               /* the teardown was requested (by anybody): the reaper joins us; nothing more is read or forwarded */
         frame_t *f = frame_new();
         if (f == NULL) {
             log_msg(LOG_ERR, "port %d: out of memory for a frame, closing the host", p->id);
@@ -403,6 +407,10 @@ void *receiver_main(void *arg)
         if (fr == FR_OK) {
             char src[MAC_STR_LEN], dst[MAC_STR_LEN];
 
+            if (atomic_load(&p->closing)) {            /* the teardown was requested while we were reading this frame: drop it */
+                frame_unref(f);
+                return NULL;
+            }
             stats_inc(p->id, STAT_IN);
             mac_format(f->src, src, sizeof src);
             mac_format(f->dst, dst, sizeof dst);

@@ -1,7 +1,7 @@
 #!/bin/bash
-# run_all.sh - the Tier 1 checkpoint (Part 8).
+# run_all.sh - the Tier 1 checkpoint (Part 8), extended with the Tier 2 scripts of Parts 16-18 (reconfig_stress, vlan, qos, rate, mirror, signals, admin, idle, hostile).
 #
-#   ./tests/run_all.sh                     normal variant: Parts 1-17 suite + the integration scripts
+#   ./tests/run_all.sh                     normal variant: Parts 1-18 suite + the integration scripts
 #   VARIANT=valgrind ./tests/run_all.sh    the integration scripts with the switch under valgrind
 #   VARIANT=tsan ./tests/run_all.sh        the integration scripts with the ThreadSanitizer build of the switch
 #   ./tests/run_all.sh forward mac_move    only the named scripts (no Parts 1-17 suite)
@@ -17,7 +17,8 @@ VARIANT=${VARIANT:-normal}
 SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-300}
 export VARIANT
 
-ALL=(forward broadcast slow_host partial midframe_disconnect port_full mac_aging mac_move port_security many_hosts reconfig_stress)
+ALL=(forward broadcast slow_host partial midframe_disconnect port_full mac_aging mac_move port_security many_hosts reconfig_stress
+     vlan qos rate mirror signals admin idle hostile)
 if [ $# -gt 0 ]; then SCRIPTS=("$@"); else SCRIPTS=("${ALL[@]}"); fi
 
 case "$VARIANT" in

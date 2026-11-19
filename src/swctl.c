@@ -32,6 +32,19 @@
 #define EXIT_NOT_RUNNING 2
 #define DEFAULT_TCP_PORT 9000
 
+/* close / munmap with the result checked: a failure is reported on stderr (nothing else can be done at this point). */
+static void xclose(int fd)
+{
+    if (close(fd) < 0)
+        fprintf(stderr, "swctl: close failed: %s\n", strerror(errno));
+}
+
+static void xmunmap(void *p, size_t n)
+{
+    if (munmap(p, n) < 0)
+        fprintf(stderr, "swctl: munmap failed: %s\n", strerror(errno));
+}
+
 static void usage(void)
 {
     fprintf(stderr,
@@ -62,7 +75,7 @@ static int send_command(int tcp_port, const char *line)
     }
     if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         int e = errno;
-        close(fd);
+        xclose(fd);
         if (e == ENOENT || e == ECONNREFUSED) {
             fprintf(stderr, "swctl: switch not running (nothing listens on %s)\n", path);
             return EXIT_NOT_RUNNING;
@@ -82,7 +95,7 @@ static int send_command(int tcp_port, const char *line)
             if (errno == EINTR)
                 continue;
             fprintf(stderr, "swctl: cannot send the command: %s\n", strerror(errno));
-            close(fd);
+            xclose(fd);
             return EXIT_ERR;
         }
         off += (int)w;
@@ -92,7 +105,7 @@ static int send_command(int tcp_port, const char *line)
     size_t len = 0, cap = 4096;
     char *buf = malloc(cap);
     if (buf == NULL) {
-        close(fd);
+        xclose(fd);
         fprintf(stderr, "swctl: out of memory\n");
         return EXIT_ERR;
     }
@@ -102,7 +115,7 @@ static int send_command(int tcp_port, const char *line)
             if (q == NULL) {
                 fprintf(stderr, "swctl: out of memory\n");
                 free(buf);
-                close(fd);
+                xclose(fd);
                 return EXIT_ERR;
             }
             buf = q;
@@ -114,14 +127,14 @@ static int send_command(int tcp_port, const char *line)
         if (r < 0) {
             fprintf(stderr, "swctl: reading the reply: %s\n", strerror(errno));
             free(buf);
-            close(fd);
+            xclose(fd);
             return EXIT_ERR;
         }
         if (r == 0)
             break;
         len += (size_t)r;
     }
-    close(fd);
+    xclose(fd);
     buf[len] = '\0';
 
     /* The last line is the status; everything before it is the answer. */
@@ -178,19 +191,19 @@ static int segment_open(segment_t *s)
     struct stat st;
     if (fstat(fd, &st) < 0 || (size_t)st.st_size != s->len) {
         fprintf(stderr, "swctl: %s has the wrong size (%ld bytes, expected %zu)\n", STATS_SHM_NAME, (long)st.st_size, s->len);
-        close(fd);
+        xclose(fd);
         return EXIT_ERR;
     }
     void *c = mmap(NULL, s->page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     void *d = mmap(NULL, s->len - s->page, PROT_READ, MAP_SHARED, fd, (off_t)s->page);
     int e = errno;
-    close(fd);
+    xclose(fd);
     if (c == MAP_FAILED || d == MAP_FAILED) {
         fprintf(stderr, "swctl: cannot map %s: %s\n", STATS_SHM_NAME, strerror(e));
         if (c != MAP_FAILED)
-            munmap(c, s->page);
+            xmunmap(c, s->page);
         if (d != MAP_FAILED)
-            munmap(d, s->len - s->page);
+            xmunmap(d, s->len - s->page);
         return EXIT_ERR;
     }
     s->ctl = c;
@@ -200,8 +213,8 @@ static int segment_open(segment_t *s)
 
 static void segment_close(segment_t *s)
 {
-    munmap(s->ctl, s->page);
-    munmap((void *)s->data, s->len - s->page);
+    xmunmap(s->ctl, s->page);
+    xmunmap((void *)s->data, s->len - s->page);
 }
 
 static const char *state_name(int st)
@@ -282,7 +295,11 @@ static int cmd_stats(bool watch)
     while (!stop_watch) {
         fputs("\033[H\033[2J", stdout);               /* cursor home + clear screen */
         rc = print_stats(&seg);
-        fflush(stdout);
+        if (fflush(stdout) != 0) {                    /* stdout is gone (a closed pipe): end the watch */
+            fprintf(stderr, "swctl: cannot write to stdout: %s\n", strerror(errno));
+            rc = EXIT_ERR;
+            break;
+        }
         if (rc != 0)
             break;
         next.tv_sec += 1;                             /* the next WHOLE second of the monotonic clock: no drift, no busy loop */

@@ -74,7 +74,7 @@ int outq_init(outq_t *q, int cap)
     }
     rc = cond_init_mono(&q->cond);
     if (rc != 0) {
-        pthread_mutex_destroy(&q->lock);
+        CHECK_PT(pthread_mutex_destroy(&q->lock));
         free_rings(q);
         return rc;
     }

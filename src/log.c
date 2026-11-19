@@ -71,8 +71,8 @@ static void write_sync(const struct timespec *ts, int level, const char *text)
         return;
     }
     write_line(stderr, ts, level, text);
-    fflush(stderr);
-    pthread_mutex_unlock(&sync_lock);
+    (void)fflush(stderr);                /* a diagnostic stream: nothing can act on a failed flush */
+    CHECK_PT(pthread_mutex_unlock(&sync_lock));
 }
 
 void log_msg(enum log_level level, const char *fmt, ...)
@@ -106,11 +106,11 @@ void log_msg(enum log_level level, const char *fmt, ...)
             dropped++;                                  /* full: drop, never wait */
             dropped_total++;
         }
-        pthread_cond_signal(&not_empty);
-        pthread_mutex_unlock(&qlock);
+        CHECK_PT(pthread_cond_signal(&not_empty));
+        CHECK_PT(pthread_mutex_unlock(&qlock));
         return;
     }
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_mutex_unlock(&qlock));
     write_sync(&ts, (int)level, text);                  /* no logger: the old synchronous way */
 }
 
@@ -133,11 +133,11 @@ static void *logger_main(void *arg)
         unsigned n = 0;
         unsigned long long lost;
 
-        pthread_mutex_lock(&qlock);
+        CHECK_PT(pthread_mutex_lock(&qlock));
         while (count == 0 && dropped == 0 && !stopping)          /* while, never if */
-            pthread_cond_wait(&not_empty, &qlock);
+            CHECK_PT(pthread_cond_wait(&not_empty, &qlock));
         if (count == 0 && dropped == 0) {                        /* stopping and nothing left */
-            pthread_mutex_unlock(&qlock);
+            CHECK_PT(pthread_mutex_unlock(&qlock));
             break;
         }
         while (n < LOG_BATCH && count > 0) {                     /* pop a batch */
@@ -147,7 +147,7 @@ static void *logger_main(void *arg)
         }
         lost = dropped;
         dropped = 0;
-        pthread_mutex_unlock(&qlock);
+        CHECK_PT(pthread_mutex_unlock(&qlock));
 
         /* All I/O happens here, with no lock held. */
         for (unsigned i = 0; i < n; i++)
@@ -175,9 +175,9 @@ int log_start(const char *path)
 {
     int fd, rc;
 
-    pthread_mutex_lock(&qlock);
+    CHECK_PT(pthread_mutex_lock(&qlock));
     rc = running ? EBUSY : 0;
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_mutex_unlock(&qlock));
     if (rc != 0)
         return rc;
 
@@ -187,23 +187,23 @@ int log_start(const char *path)
     out = fdopen(fd, "a");
     if (out == NULL) {
         rc = errno;
-        close(fd);
+        (void)close(fd);                 /* error path: the fdopen error is the one to report */
         return rc;
     }
 
-    pthread_mutex_lock(&qlock);
+    CHECK_PT(pthread_mutex_lock(&qlock));
     running = true;
     stopping = false;
     head = count = 0;
     dropped = dropped_total = 0;
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_mutex_unlock(&qlock));
 
     rc = pthread_create(&logger_thread, NULL, logger_main, NULL);
     if (rc != 0) {
-        pthread_mutex_lock(&qlock);
+        CHECK_PT(pthread_mutex_lock(&qlock));
         running = false;
-        pthread_mutex_unlock(&qlock);
-        fclose(out);
+        CHECK_PT(pthread_mutex_unlock(&qlock));
+        (void)fclose(out);               /* error path: nothing was written, the pthread_create error is the one to report */
         out = NULL;
         return rc;
     }
@@ -214,23 +214,23 @@ void log_stop(void)
 {
     int rc;
 
-    pthread_mutex_lock(&qlock);
+    CHECK_PT(pthread_mutex_lock(&qlock));
     if (!running || stopping) {
-        pthread_mutex_unlock(&qlock);
+        CHECK_PT(pthread_mutex_unlock(&qlock));
         return;
     }
     stopping = true;                              /* from now on log_msg writes to stderr */
-    pthread_cond_broadcast(&not_empty);
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_cond_broadcast(&not_empty));
+    CHECK_PT(pthread_mutex_unlock(&qlock));
 
     rc = pthread_join(logger_thread, NULL);       /* it drains the ring first */
     if (rc != 0)
         fprintf(stderr, "log: join of the logger thread failed: %s\n", strerror(rc));
 
-    pthread_mutex_lock(&qlock);
+    CHECK_PT(pthread_mutex_lock(&qlock));
     running = false;
     stopping = false;
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_mutex_unlock(&qlock));
     if (fclose(out) != 0)
         fprintf(stderr, "log: closing the log file failed: %s\n", strerror(errno));
     out = NULL;
@@ -240,8 +240,8 @@ unsigned long long log_dropped_total(void)
 {
     unsigned long long n;
 
-    pthread_mutex_lock(&qlock);
+    CHECK_PT(pthread_mutex_lock(&qlock));
     n = dropped_total;
-    pthread_mutex_unlock(&qlock);
+    CHECK_PT(pthread_mutex_unlock(&qlock));
     return n;
 }

@@ -17,6 +17,7 @@ run() {
 # randomisation; "setarch -R" switches it off for that one process.
 if setarch -R true 2>/dev/null; then NOASLR="setarch -R"; else NOASLR=""; fi
 
+run python3 tests/static_checks.py   # Part 18: no sleep()/usleep()/nanosleep() in the switch; no statement ignores the result of a system or pthread call
 run ./build/test_util          # Part 1: MAC and time helpers, CHECK, log
 run ./build/test_frame         # Part 2 (+4): wire protocol, frame_recv_f
 run python3 tests/test_host.py # Part 2: host program against a fake switch
@@ -124,4 +125,10 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_mirror
 fi
 
-echo "Parts 1-17 unit and regression tests passed."
+run python3 tests/test_backlog.py         # Part 18: a teardown does not process the socket backlog of a flooding host (SIGINT, swctl shutdown)
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_backlog.py tsan   # Part 18: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_backlog.py valgrind                             # Part 18: under valgrind (where a slow switch shows the defect)
+fi
+
+echo "Parts 1-18 unit and regression tests passed."

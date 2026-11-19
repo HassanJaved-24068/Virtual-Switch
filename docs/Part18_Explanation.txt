@@ -1,0 +1,67 @@
+=====================================================================
+PART 18 - CHECKPOINT: TIER 2 INTEGRATION AND STRESS
+=====================================================================
+
+1. WHAT PART 18 CONTAINS (roadmap)
+----------------------------------
+ - all Tier 1 and Tier 2 scripts in the normal, valgrind and TSan variants, with the new scripts qos.sh, rate.sh, vlan.sh, mirror.sh, signals.sh, admin.sh;
+ - the hidden-test simulation: 32 hosts (several --noread, --partial, or killed with kill -9 mid-stream), admin commands and signals throughout, the switch stays up and the
+   other hosts keep their traffic;
+ - the "no busy waiting" check (grep for sleep( and usleep( in the switch; idle CPU near 0 %);
+ - the review "every system and library call result is handled";
+ - a tag tier2 (a frozen Tier 2 backup) before the bonus work starts.
+
+Files:   tests/vlan.sh qos.sh rate.sh mirror.sh signals.sh admin.sh   the Tier 2 features with real ./host processes (tests/lib.sh style)
+         tests/hostile.sh      the hidden-test simulation          tests/idle.sh   idle CPU          tests/static_checks.py   the two source checks
+         tests/run_all.sh      the script list now has 19 scripts (Tier 1: 10, Part 16: reconfig_stress, Part 18: 8); tests/run_unit.sh runs static_checks.py first
+         src/log.c mactable.c queue.c util.c stats.c admin.c swctl.c host.c   results of system / pthread calls are now handled (section 3)
+         tests/test_part18.py  TEMPORARY dedicated runner (deleted when Part 19 starts); tests/test_part17.py deleted (its tests are permanent)
+         README.md, notes/bugs.md (item 30), docs/Part18_Explanation.txt
+
+2. THE SCRIPTS
+--------------
+vlan.sh      ports 1,3 in VLAN 10, 2 in VLAN 20, 4 in VLAN 1, 5 the trunk: broadcasts and unicasts stay inside their VLAN, the trunk sees every VLAN and keeps the vlan
+             field, unicast across VLANs is flooded only inside the sender's VLAN, an invalid VLAN on the trunk is dropped (sent by a raw connection: the real host refuses
+             VLAN > 4094), swctl show ports shows the layout.
+qos.sh       30 frames of each priority arrive in order inside each class; priority 9 (raw connection) is delivered unchanged, counted, logged once per port, and the
+             teardown logs the total; SIGHUP changes wrr_weights.
+rate.sh      port 2 limited to 50 frames/s while A sends 400 frames/s for 5 s: C (unlimited) receives all 2000, B about 430 (burst + rate * time).
+mirror.sh    the real ./host --sniff on a port of its own VLAN receives all traffic of port 1 in both directions with the original addresses; errors; off; a sniffer killed
+             with kill -9 ends the mirroring (logged) and A and B go on.
+signals.sh   SIGUSR1 dump, SIGHUP applied, 20 x (SIGHUP + SIGUSR1) during traffic, SIGINT and SIGTERM both exit 0 with a complete shutdown log; an invalid configuration file is
+             refused (it is an [ERR] event by design, so it lives in the SIGTERM instance, whose ERR count is asserted to be exactly that one).
+admin.sh     every swctl command with real hosts: show ports / mac, stats, clear mac, vlan, shutdown (the host is disconnected) / up (a new host gets the port), 15 invalid
+             commands (exit 1), exit 2 without a switch, SIGINT with a silent admin client connected (not delayed).
+idle.sh      an idle switch (3 hosts, one --noread, a rate-limited port, the admin socket): 1 tick of CPU in 5 s = 0.2 %. Limit 5 %. Skipped under valgrind.
+hostile.sh   32 hosts: 20 well-behaved (N1-N4 broadcast all the time), 3 --noread, 3 --partial, 3 flooders killed with kill -9 after 2 s, 3 --die-midframe; `mirror 1 21` (a sender
+             mirrored to a sniffer that never reads); 150 random shutdown / up / vlan / mirror / clear mac commands on the hostile ports with SIGHUP + SIGUSR1 every 0.2 s.
+             Checks: every swctl command answers 0 or 1; the pure receivers' `out` counters grow at every sample; all 20 well-behaved hosts stay connected; the killed and dying
+             hosts are torn down and their ports come back (the reaper leaves no CLOSING port); after `up` on every port the semaphore equals the FREE ports (N new hosts get
+             ports, the next one 'switch full'); clean exit, no sanitizer / valgrind report.
+             Slow variants: a killed flooder leaves megabytes in the kernel's socket buffers that a slow switch must process before it sees the end of the connection, so under
+             TSan / valgrind the flooders send a finite number of frames and the waits have a long timeout. The switch stayed up and the others kept their traffic in every run.
+
+3. THE REVIEW OF THE CALLS
+--------------------------
+No busy waiting: sleep( / usleep( / nanosleep( do not appear in the switch. host.c paces its own frames with nanosleep (a test client); swctl stats --watch sleeps to an absolute
+deadline with clock_nanosleep (a display refresh). Idle CPU: 0.2 % (idle.sh); the Part 12 / 14 tests also check that a rate-limited sender does not spin.
+Results of calls: tests/static_checks.py reports every statement that STARTS with a call of a system / pthread / stdio-flush function and ignores the result (no (void), no
+assignment, no if, no CHECK()). Diagnostic printing (fprintf / printf to stdout or stderr) is excluded: nothing can act on its failure. First run: 53 statements in 8 files:
+   log.c (22)     pthread_mutex_lock/unlock, cond_signal/wait/broadcast of the logger -> CHECK_PT (it prints with fprintf and exits, it does not call log_msg: no recursion);
+                  fflush(stderr), close(fd) and fclose(out) on error paths -> (void) with the reason in a comment
+   mactable.c (3), queue.c (1), util.c (1)   pthread_*_destroy -> CHECK_PT
+   stats.c (5)    error-path cleanup -> (void) with a comment; munmap in stats_destroy -> checked and reported on stderr
+   admin.c (2)    close of a client and of the listening socket -> checked, logged as a warning
+   swctl.c (13)   close / munmap -> xclose() / xmunmap() that report failures on stderr; fflush(stdout) of --watch -> a closed stdout ends the watch with exit 1
+   host.c (3)     fflush -> (void): a closed stdout must not stop a host that is still connected
+After the changes the script reports nothing, and it runs first in tests/run_unit.sh, so a new unchecked call fails make test.
+
+4. RESULTS
+----------
+make (clean build, -Werror): no warnings. Final runs on 2026-11-19, after the last code change:
+  make test           EXIT 0   unit + regression suite of Parts 1-18 (incl. static_checks.py and test_backlog.py), 20 integration scripts passed
+  make test-tsan      EXIT 0   19 integration scripts passed, no ThreadSanitizer report
+  make test-valgrind  EXIT 0   19 integration scripts passed (idle.sh skipped), no valgrind error or leak
+  test_backlog.py: before the closing-flag fix 1 failure (normal) / 3 (valgrind); after: 21 checks, 0 failures in normal, TSan and valgrind (bugs.md item 31).
+Added after the interruption of the first session: bug #31 in notes/bugs.md and test_backlog.py in tests/run_unit.sh.
+Tag tier2 marks the commit of this part.

@@ -45,6 +45,8 @@ typedef struct port {
     uint16_t vlan_admin;       /* Part 16: VLAN set by "swctl vlan" (0 = none). Survives teardown, so a free port keeps it for the next host; a
                                 * configuration reload that changes this port's VLAN clears it. Protected by sw.ports_lock. */
     bool trunk;
+    _Atomic bool closing;      /* Part 18: set (under the write lock) when the teardown is requested, read lock-free by the receiver: it stops reading and forwarding
+                                * at once instead of working through the frames already queued in the socket (shutdown(fd) does not discard them) */
     _Atomic int mirror_to;     /* Part 17: the sniffer port that gets a copy of this port's traffic, 0 = off (changed under the write lock) */
     _Atomic int mac_count;     /* used from Part 6 */
     _Atomic unsigned long bad_prio;  /* Part 11: frames received with a priority above 2 (queued as low) */

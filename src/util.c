@@ -130,6 +130,6 @@ int cond_init_mono(pthread_cond_t *cond)
     rc = pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
     if (rc == 0)
         rc = pthread_cond_init(cond, &attr);
-    pthread_condattr_destroy(&attr);
+    CHECK_PT(pthread_condattr_destroy(&attr));
     return rc;
 }

@@ -4,7 +4,7 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 17** (port mirroring; before it Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 18** (the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; before it Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
 Features of later parts (the bonus items of Tier 3) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
@@ -258,8 +258,10 @@ them, lines are **dropped** and counted (`N log messages dropped`) so that loggi
 ## Tests
 
 ```
-make test                       # ./tests/run_all.sh: the unit and regression tests of all parts + the ten integration scripts
-VARIANT=valgrind ./tests/run_all.sh    # the integration scripts with the switch under valgrind
+make test                       # ./tests/run_all.sh: the unit and regression tests of all parts + the 19 integration scripts (forward, broadcast, slow_host, partial,
+                                #   midframe_disconnect, port_full, mac_aging, mac_move, port_security, many_hosts, reconfig_stress, vlan, qos, rate, mirror, signals,
+                                #   admin, idle, hostile); the integration scripts can be run alone: ./tests/run_all.sh vlan qos
+VARIANT=valgrind ./tests/run_all.sh    # the integration scripts with the switch under valgrind (idle.sh is skipped: valgrind's own CPU use)
 VARIANT=tsan ./tests/run_all.sh        # ... with ThreadSanitizer
 python3 tests/test_config_signals.py [tsan|valgrind]   # configuration, SIGHUP, SIGUSR1 (Part 10)
 ./build/test_qos                # the priority queue scheduler (after `make build/test_qos`)
@@ -277,6 +279,8 @@ python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / 
 ./build/test_mirror                                    # port mirroring without sockets (after `make build/test_mirror`)
 python3 tests/test_mirror.py [tsan|valgrind]           # port mirroring with the real switch and sniffers (Part 17)
 ./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
+python3 tests/static_checks.py                         # no sleep() in the switch; no ignored result of a system / pthread call (Part 18; runs first in make test)
+./tests/hostile.sh                                     # 32 hosts: --noread, --partial, kill -9 mid-stream, dying mid-frame, with admin commands and signals (Part 18)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 

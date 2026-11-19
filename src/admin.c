@@ -611,7 +611,8 @@ static void *admin_main(void *arg)
                 continue;
             }
             serve(c);
-            close(c);
+            if (close(c) < 0)
+                log_msg(LOG_WARN, "admin: close of a client connection failed: %s", strerror(errno));
         }
     }
     return NULL;
@@ -633,7 +634,8 @@ void admin_close(bool started, pthread_t thread)
             log_msg(LOG_ERR, "admin: join of the admin thread failed: %s", strerror(rc));
     }
     if (admin_fd >= 0) {
-        close(admin_fd);
+        if (close(admin_fd) < 0)
+            log_msg(LOG_WARN, "admin: close of the listening socket failed: %s", strerror(errno));
         admin_fd = -1;
     }
     if (path_bound) {

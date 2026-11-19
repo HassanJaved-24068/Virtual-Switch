@@ -107,7 +107,7 @@ static int init_robust_mutex(pthread_mutex_t *m)
         rc = pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST);
     if (rc == 0)
         rc = pthread_mutex_init(m, &attr);
-    pthread_mutexattr_destroy(&attr);
+    CHECK_PT(pthread_mutexattr_destroy(&attr));
     return rc;
 }
 
@@ -151,8 +151,8 @@ void mac_destroy(void)
     if (mt == NULL)
         return;
     for (int i = 0; i < mt->nbuckets; i++)
-        pthread_mutex_destroy(&buckets(mt)[i].lock);
-    pthread_mutex_destroy(&mt->pool_lock);
+        CHECK_PT(pthread_mutex_destroy(&buckets(mt)[i].lock));
+    CHECK_PT(pthread_mutex_destroy(&mt->pool_lock));
     mt->magic = 0;
     mt = NULL;
 }

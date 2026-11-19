@@ -87,7 +87,7 @@ static void unlink_if_ours(void)
         return;                                   /* already gone */
     struct stat st;
     bool ours = fstat(fd, &st) == 0 && st.st_dev == shm_dev && st.st_ino == shm_ino;
-    close(fd);
+    (void)close(fd);                              /* read-only descriptor: a failed close loses nothing */
     if (ours)
         (void)shm_unlink(shm_name);
 }
@@ -184,10 +184,10 @@ int stats_init_named(const char *name, int max_port)
 fail:
     /* Nothing stays behind: no mapping, no descriptor, no object with this name (it is ours, we just created it). */
     if (m != MAP_FAILED)
-        munmap(m, len);
+        (void)munmap(m, len);                     /* error path: the error that brought us here is the one to report */
     if (fd >= 0)
-        close(fd);
-    shm_unlink(name);
+        (void)close(fd);
+    (void)shm_unlink(name);
     return rc != 0 ? rc : EIO;
 }
 
@@ -207,7 +207,8 @@ void stats_destroy(void)
     /* 2. Readers with an old mapping must not trust it any more; then destroy the mutex; 3. unmap. */
     __atomic_store_n(&ctl->magic, 0, __ATOMIC_RELEASE);
     (void)pthread_mutex_destroy(&ctl->lock);      /* EBUSY if a reader still holds it: nothing more to do */
-    munmap(ctl, map_len);
+    if (munmap(ctl, map_len) < 0)
+        fprintf(stderr, "stats: munmap of the shared counters failed: %s\n", strerror(errno));   /* log_msg is not used by this file */
     map_len = 0;
 }
 
