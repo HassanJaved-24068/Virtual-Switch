@@ -95,7 +95,7 @@ modified. A fix was tried and reverted (8 consecutive passes with it): wait unti
   unless `--peer-config` changes them. `--persist-mac` cannot be combined with `--pair`.
 * Part 20: the valgrind variant does not run the supervisor scenarios. A table recovered after a CLEAN exit keeps only the entries of ports that never had a host (teardown flushes the rest): by design, a crash is
   what the table survives. Entries of a recovered table keep their old time stamps (CLOCK_MONOTONIC of the same boot); a different boot has no /dev/shm object anyway.
-* **Known flake:** `tests/test_reconfig.py` scenario 7 (Part 16) fails about 1 run in 4 (test-side, bug #34); `make test` can therefore fail spuriously until its fix is approved.
+* The flake of `tests/test_reconfig.py` scenario 7 (Part 16, test-side, bug #34) was fixed afterwards with the owner's approval (see section 9).
 * Parts 21 (benchmark) and 22 (report/README final) were not started, as instructed.
 
 ## 8. Parts 1-20 completion table
@@ -110,3 +110,8 @@ Status of Parts 1-15 comes from their own commits (all pushed before this sessio
 | 18 | complete | see section 4 | 993d75e, tag tier2 | pushed |
 | 19 | complete | see section 4 | c8a8d87 | pushed |
 | 20 | complete | see section 4 | 5266fbc | pushed |
+
+## 9. Follow-up: the test_reconfig flake
+
+Applied with the owner's approval: scenario 7 now waits until every host has received the three learn broadcasts of the others before it resets the frame counters (one added check, 156 checks
+instead of 155). Before: about 1 failure in 4 runs. After: 12 consecutive normal runs passed (156/156), the TSan variant passed (122/122) and the valgrind variant passed (17/17).

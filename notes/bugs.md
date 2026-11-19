@@ -488,10 +488,10 @@ program that ignores SIGINT.
 - A reason for the layout of the recovery: a crash can leave the free list pointing into the chains, a wrong count, a cycle or an out-of-range index (a thread killed between pool_get and the
   chain insert, or in remove_entry); test_macshm.c damages a table in each of these ways and checks that recovery makes it consistent (mac_check_counts).
 
-## 34. Part 16's test_reconfig.py scenario 7 is flaky (test-side race, found during the Part 20 verification; NOT changed: historical tests are not edited)
+## 34. Part 16's test_reconfig.py scenario 7 was flaky (test-side race, found during the Part 20 verification; fixed in the test with the owner's approval)
 - Symptom: `FAIL: host 4 received all N unicast frames of host 3 (N+1)`, about 1 run in 4 on this machine, always exactly one frame over; it passed in every earlier full run.
 - Cause (test only): the scenario waits for `len(macs(sw)) == 4` and then sets every host's frame counter to 0. That only proves the switch has PROCESSED the four learn broadcasts; a copy can
   still be on its way to a host and is then counted as one of the unicast frames.
 - Proof: with the counters reset only after every host had received the three broadcasts of the others (`wait_for(lambda: all(h.frames == 3 for h in hs))`) 8 consecutive runs passed (156 checks).
-  That change was tried and then reverted, because historical tests are not touched; it is the proposed fix and needs the owner's approval.
+  It was first tried and reverted (historical tests are not edited without approval), then applied after the owner approved it.
 - The switch is not involved: no frame is duplicated (the surplus frame is the late broadcast), and the same scenario passed in the Parts 18 and 19 full runs.

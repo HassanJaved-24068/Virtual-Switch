@@ -305,6 +305,9 @@ def test_untouched_ports():
     for h in hs:
         h.send(BCAST, 1, b"learn")
     check(wait_for(lambda: len(macs(sw)) == 4), "four MACs")
+    # "four MACs learned" only says that the switch has PROCESSED the four broadcasts: their copies may still be on their way to the hosts. Each host must have received the
+    # three broadcasts of the others BEFORE its counter is reset, or a late copy is counted as one of the unicast frames below (a flaw of the test: 1 run in about 4 was one frame over).
+    check(wait_for(lambda: all(h.frames == 3 for h in hs), 30), "every host received the three learn broadcasts of the others")
     for h in hs:
         h.frames = 0
     stop = threading.Event()
