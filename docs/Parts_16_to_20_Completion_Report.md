@@ -59,7 +59,11 @@ Full suites (every run on the tree that was then committed):
 |---|---|---|---|
 | Part 18 (993d75e) | EXIT 0, 20 scripts + unit suite | EXIT 0, 19 scripts | EXIT 0, 19 scripts |
 | Part 19 (c8a8d87) | EXIT 0 | EXIT 0 | EXIT 0 |
-| Part 20 | see section 5 | EXIT 0, 19 scripts (run on the Part 20 sources) | EXIT 0, 19 scripts (run on the Part 20 sources) |
+| Part 20 (5266fbc) | EXIT 0 on the 3rd run (see the note below) | EXIT 0, 19 scripts | EXIT 0, 19 scripts |
+
+Note on the Part 20 `make test`: the 1st run failed at `tests/test_persist.py valgrind` (a race in my own new test, fixed; 3 valgrind passes afterwards); the 2nd failed in
+`tests/test_reconfig.py` scenario 7 (Part 16, historical): a pre-existing test-side race, about 1 run in 4, one frame over (notes/bugs.md item 34); the 3rd passed. The historical test was NOT
+modified. A fix was tried and reverted (8 consecutive passes with it): wait until every host has received the three learn broadcasts before resetting the frame counters; it needs your approval.
 
 `make test-tsan` / `make test-valgrind` run the integration scripts under the sanitizer; the unit tests with TSan / valgrind variants are inside `make test` (run_unit.sh).
 `idle.sh` is skipped under valgrind (valgrind's own CPU use).
@@ -72,7 +76,7 @@ Full suites (every run on the tree that was then committed):
 | 17 | 217ff67 | yes, same push |
 | 18 | 993d75e (+ tag `tier2`) | yes, main and tag `tier2` both 993d75e |
 | 19 | c8a8d87 | yes, origin/main = c8a8d87 |
-| 20 | PART20_HASH | PART20_PUSH |
+| 20 | 5266fbc | yes, origin/main = 5266fbc |
 
 ## 6. Bugs found
 
@@ -91,6 +95,7 @@ Full suites (every run on the tree that was then committed):
   unless `--peer-config` changes them. `--persist-mac` cannot be combined with `--pair`.
 * Part 20: the valgrind variant does not run the supervisor scenarios. A table recovered after a CLEAN exit keeps only the entries of ports that never had a host (teardown flushes the rest): by design, a crash is
   what the table survives. Entries of a recovered table keep their old time stamps (CLOCK_MONOTONIC of the same boot); a different boot has no /dev/shm object anyway.
+* **Known flake:** `tests/test_reconfig.py` scenario 7 (Part 16) fails about 1 run in 4 (test-side, bug #34); `make test` can therefore fail spuriously until its fix is approved.
 * Parts 21 (benchmark) and 22 (report/README final) were not started, as instructed.
 
 ## 8. Parts 1-20 completion table
@@ -104,4 +109,4 @@ Status of Parts 1-15 comes from their own commits (all pushed before this sessio
 | 17 | complete | full suite + test_mirror.c/.py + mirror.sh, 3 variants | 217ff67 | pushed |
 | 18 | complete | see section 4 | 993d75e, tag tier2 | pushed |
 | 19 | complete | see section 4 | c8a8d87 | pushed |
-| 20 | complete | see section 4 | PART20_HASH | PART20_PUSH |
+| 20 | complete | see section 4 | 5266fbc | pushed |
