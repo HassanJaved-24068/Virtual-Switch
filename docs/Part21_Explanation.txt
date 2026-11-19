@@ -28,7 +28,7 @@ tests/test_bench.py (permanent), tests/test_part21.py (TEMPORARY dedicated runne
 * bench warms up by REPEATING each host's broadcast until every host has heard every other (the switch accepts connections one at a time, so an early broadcast can miss a host); broadcasts are never
   counted; the counted frames are unicast. bench_mac checks every lookup answer and mac_check_counts() at the end, so a variant that is fast but wrong cannot pass.
 * matplotlib and gnuplot are not installed here (and installing software was not asked for): plot.py draws the graph and the report with PIL, which is. It is a function of the CSV files only (the test
-  checks that two runs give byte-identical output); the text of the report is generated from the numbers.
+  checks that two runs give byte-identical results.csv and PNG; the PDF page renders identically, the file differs only by the creation date PIL embeds); the text of the report is generated from the numbers.
 * Machine: 2 logical CPUs (i7-6600U). Points above 2 threads / hosts are oversubscribed; the report says so.
 
 4. RESULT (bench/report.pdf, bench/results.csv; 5 s per point, median of 3)

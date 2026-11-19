@@ -201,7 +201,7 @@ bench/run.sh                # the whole benchmark (about 9 minutes; --quick: a 1
 * **`bench/run.sh`** runs every point 3 times (the three variants one after the other, so a drift of the machine hits them alike) and writes `bench/raw_mac.csv`, `bench/raw_net.csv`,
   `bench/machine.txt`; **`bench/plot.py`** takes the median and writes `bench/results.csv`, **`bench/throughput.png`** (the graph) and the one-page **`bench/report.pdf`** (machine, method,
   graph, tables, an explanation generated from the numbers). Neither matplotlib nor gnuplot is installed on the project's machine, so `plot.py` draws with PIL; the same CSV files always
-  give the same picture. Run it on a quiet machine, and not while another switch runs (the switches use the fixed shared-memory name `/vswitch_stats_P`).
+  give the same results.csv and the same picture (the PDF page renders identically; the file itself only differs by the creation date PIL writes into it). Run it on a quiet machine, and not while another switch runs (the switches use the fixed shared-memory name `/vswitch_stats_P`).
 * **Result on the project's machine** (2 cores, i7-6600U, -O0): in-process, striped locking scales (6.5M operations/s with 1 thread, about 10M with 2 or more), the global lock falls to
   about half with 2 threads (3.4M) and the single rwlock to about an eighth (0.85M; every reader updates the same lock word and the 10 % learns block everybody); in the whole switch the three
   variants are indistinguishable within the noise (one frame costs about 20 us, a table operation about 140 ns). Details and the explanation: `bench/report.pdf`.
