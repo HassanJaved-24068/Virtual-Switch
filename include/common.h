@@ -55,6 +55,7 @@
                                        * variable VSWITCH_LOG_FILE may name another file */
 
 #define MAC_LEN 6                     /* bytes in a MAC address */
+#define MAC_SHM_FMT "/vswitch_mac_%d"   /* Part 20: the shared-memory MAC table of a switch started with --persist-mac, named by its TCP port */
 #define MAC_STR_LEN 18                /* "aa:bb:cc:dd:ee:ff" + '\0' */
 
 /* A MAC address is just 6 bytes. */

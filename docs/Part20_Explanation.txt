@@ -1,0 +1,59 @@
+=====================================================================
+PART 20 - BONUS: SUPERVISOR AND A CRASH-SURVIVING MAC TABLE
+=====================================================================
+
+1. WHAT THE ROADMAP ASKS
+------------------------
+supervisor.c: ./supervisor ./switch <tcp_port> <num_ports> [opts] forks; the child execv()s the switch with --persist-mac, the parent loops on waitpid. A switch with --persist-mac
+places the Part 6 MAC region in shm_open("/vswitch_mac_P"). Attach: O_CREAT, no O_EXCL; if size, magic, K and nbuckets match, reuse the table (log "MAC table recovered: N entries"),
+else initialise it. Robust bucket mutexes (EOWNERDEAD -> pthread_mutex_consistent). The entry count is recomputed by a scan after recovery and every port's mac_count is rebuilt from
+the entries. Stale entries point to ports that are not UP: lookups flood, reconnecting hosts relearn, entries age out. Restart policy: killed by a signal other than SIGINT/SIGTERM, or
+non-zero exit -> restart after 1 s; give up after 5 restarts within 60 s; a clean exit 0 ends the supervisor. SIGINT/SIGTERM to the supervisor: forward to the child, waitpid,
+shm_unlink the segment, exit. A switch with --persist-mac does not unlink the segment itself.
+
+2. WHAT WAS DONE (files)
+------------------------
+src/supervisor.c  new program (single-threaded; poll() on a signalfd for SIGCHLD / SIGINT / SIGTERM: no handlers, no sleeping; the 1 s restart delay is the poll timeout).
+                  Restart budget: 5 restarts in a 60 s window. Clean-up at the end: the MAC segment always; if the last switch died by itself, also /vswitch_stats_P and /tmp/vswitch_<port>.sock.
+src/mactable.c    mac_attach_shm() (shm_open O_CREAT, size check, mmap, header check, recover or mac_init), recover_table() (robust locks, chain validation, free list / count / mac_count
+                  rebuilt by a scan, damaged entries dropped, time stamps from the future clamped), mac_detach(); mac_init writes the magic LAST.
+src/switch.c      --persist-mac (a flag; refused together with --pair); the table comes from mac_attach_shm; the shutdown does mac_detach + munmap instead of mac_destroy + free;
+                  the log says "MAC table recovered: N entries".
+include/mactable.h, include/port.h (mac_persist, mac_region_len), include/common.h (MAC_SHM_FMT "/vswitch_mac_%d"), Makefile (supervisor, test_macshm).
+tests/test_macshm.c (unit: fork-and-die scenarios), tests/test_persist.py (end to end), tests/test_part20.py (TEMPORARY dedicated runner), tests/run_unit.sh, README.md, notes/.
+
+3. DESIGN DECISIONS
+-------------------
+* The segment is named by the TCP port (/vswitch_mac_<tcp_port>), not a fixed "P": two switches on different ports never find each other's table, and a table from another run on the same
+  port is only reused when K and the bucket count match (--persist-mac is opt-in). The counters of Part 14 keep their fixed name.
+* The recovery does not trust anything a half-finished update can damage: the free list, the count and the per-port counts are REBUILT; a chain is validated entry by entry (range, reached
+  once, right bucket, a port that exists) and cut or unlinked where it is wrong; an entry that was taken from the pool but not yet chained goes back to the free list by itself.
+* The bucket locks are taken with lock_robust (EOWNERDEAD -> consistent), exactly as in normal operation: a lock held by a dead thread of the crashed process cannot hang the new switch.
+* A clean exit does not destroy the mutexes (a destroyed mutex cannot be locked again), and the magic is written last so that an unfinished table is never recovered.
+* mac_count of every port is rebuilt, so port security (M) starts from the real number of entries; the entries of ports with no host stay until they age out.
+* Supervisor: poll on a signalfd instead of signal handlers + waitpid, so that a SIGINT during the restart delay is handled at once, and the delay needs no sleeping call.
+* The valgrind variant of the end-to-end test starts the switch directly (the supervisor execv()s one program, it cannot run "valgrind ./switch"); the supervisor itself is covered in the
+  normal and TSan variants, and by the static checks.
+
+4. TESTS
+--------
+tests/test_macshm.c (135 checks; normal, TSan, valgrind): create / reuse / resize / bad magic / bad names; a child dies holding a bucket lock AND the pool lock; the same with a wrong count and a
+free list running into the chains, a cycle, an out-of-range index, an entry in the wrong bucket, an entry of a port that does not exist: the parent recovers without hanging, mac_check_counts() is
+happy, mac_count of the ports and the entry count are rebuilt, the table keeps working (the free pool is full again).
+tests/test_persist.py (56 checks normal and TSan, 25 valgrind): kill -9 and restart without the supervisor (4 entries recovered, same ports, MAC counts rebuilt, a stale port floods, a clean exit leaves
+the segment); the supervisor: kill -SEGV (SIGKILL under TSan) -> restarted, "recovered: 4 entries", show mac the same, SIGINT leaves nothing in /dev/shm or /tmp; a clean end of the switch ends the
+supervisor; SIGTERM during the restart delay; giving up after 5 restarts (port in use, program that cannot be executed); bad command lines.
+
+5. RESULTS
+----------
+make (clean build, -Werror): no warnings. Final runs on 2026-11-19:
+  tests/test_macshm.c      normal 135/135, TSan 135/135, valgrind 135/135
+  tests/test_persist.py    normal 56/56, TSan 56/56, valgrind 25/25 (no supervisor scenarios)
+  make test                EXIT 0 (unit + regression suite of Parts 1-20, 20 integration scripts)
+  make test-tsan           EXIT 0 (19 scripts, no ThreadSanitizer report)
+  make test-valgrind       EXIT 0 (19 scripts, no valgrind error or leak)
+  tests/static_checks.py   clean (supervisor.c: poll on a signalfd, no sleeping call, every result handled)
+Honest notes on the verification: the FIRST `make test` of this part failed at tests/test_persist.py valgrind (a race in my new test: the log is cumulative over restarts, so the test did not wait for
+the new host; fixed, 3 consecutive valgrind passes afterwards). The SECOND failed once in tests/test_reconfig.py scenario 7 (Part 16, a historical test): a pre-existing test-side race that fails
+about 1 run in 4 by exactly one frame (notes/bugs.md item 34; the switch is not involved). That test was NOT modified (historical tests are not edited); the THIRD full `make test` passed.
+The TSan and valgrind `make` targets ran on the same sources (only tests/test_persist.py changed afterwards).

@@ -108,7 +108,9 @@ typedef struct {
     int queue_capacity;            /* frames per priority class (startup only) */
     _Atomic long mac_aging_sec;    /* T          (reloadable) */
     _Atomic int max_macs_per_port; /* M          (reloadable) */
-    void *mac_region;              /* memory of the MAC table (heap now, shared memory in Part 20) */
+    void *mac_region;              /* memory of the MAC table: heap, or with --persist-mac (Part 20) the mapping of the shared-memory object */
+    size_t mac_region_len;         /* Part 20: size of that mapping */
+    bool mac_persist;              /* Part 20: --persist-mac */
     pthread_t aging;               /* aging thread */
 
     const char *config_path;       /* from -c; NULL = no file (the defaults) */

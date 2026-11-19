@@ -8,10 +8,14 @@
 #include "port.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define LEARN_RETRIES 3                 /* evictions tried when the pool is empty */
 #define MAX_BUCKETS (1 << 20)
@@ -120,7 +124,6 @@ int mac_init(void *region, int K, int nbuckets)
 
     memset(region, 0, size);
     mactable_t *t = region;
-    t->magic = MAC_TABLE_MAGIC;
     t->K = K;
     t->nbuckets = nbuckets;
     t->count = 0;
@@ -142,6 +145,7 @@ int mac_init(void *region, int K, int nbuckets)
     }
     t->free_head = 0;
 
+    __atomic_store_n(&t->magic, MAC_TABLE_MAGIC, __ATOMIC_RELEASE);   /* LAST: a table that was being built when the process died is never "recovered" */
     mt = t;
     return 0;
 }
@@ -154,6 +158,148 @@ void mac_destroy(void)
         CHECK_PT(pthread_mutex_destroy(&buckets(mt)[i].lock));
     CHECK_PT(pthread_mutex_destroy(&mt->pool_lock));
     mt->magic = 0;
+    mt = NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Part 20: the table in shared memory, and its recovery               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * The table `t` was written by a switch that is gone (it may have crashed in the middle of an update). Make it consistent and return the number of entries kept (or -ENOMEM).
+ * Nothing else uses it yet (no thread exists). `mt` must already point to t (bucket_of uses it).
+ */
+static int recover_table(mactable_t *t)
+{
+    mac_bucket_t *bk = buckets(t);
+    mac_entry_t *ents = entries(t);
+    uint8_t *seen = calloc((size_t)t->K, 1);
+    int kept = 0, dropped = 0;
+
+    if (seen == NULL)
+        return -ENOMEM;
+    for (int i = 0; i < t->nbuckets; i++) {
+        mac_bucket_t *b = &bk[i];
+        int32_t prev = -1, j;
+
+        lock_robust(&b->lock);                               /* EOWNERDEAD (the owner crashed holding it) is handled here */
+        for (j = b->first; j != -1;) {
+            mac_entry_t *e = &ents[0];
+            bool bad = j < 0 || j >= t->K;                   /* out of range, or reached twice (a cycle or two chains share it): cut the chain here */
+
+            if (!bad && seen[j]) {
+                bad = true;
+            }
+            if (bad) {
+                if (prev < 0)
+                    b->first = -1;
+                else
+                    ents[prev].next = -1;
+                dropped++;
+                break;
+            }
+            e = &ents[j];
+            const int32_t next = e->next;
+            mac_t m;
+            memcpy(m, e->mac, MAC_LEN);
+            if (e->port < 0 || e->port > MAX_PORTS || (e->port > sw.num_ports) || bucket_of(e->vlan, m) != i) {
+                if (prev < 0)                                /* an entry that does not belong here (half written): unlink it, it goes back to the pool */
+                    b->first = next;
+                else
+                    ents[prev].next = next;
+                dropped++;
+                j = next;
+                continue;
+            }
+            seen[j] = 1;
+            e->used = true;
+            e->next = next;
+            struct timespec now = now_mono();
+            if (e->last_seen.tv_sec > now.tv_sec)            /* a time stamp from the future cannot be right: it would never age */
+                e->last_seen = now;
+            atomic_fetch_add(&sw.ports[e->port].mac_count, 1);
+            kept++;
+            prev = j;
+            j = next;
+        }
+        bucket_unlock(b);
+    }
+
+    lock_robust(&t->pool_lock);                              /* the free list and the count are rebuilt, never trusted */
+    t->free_head = -1;
+    for (int32_t k = t->K - 1; k >= 0; k--) {
+        if (!seen[k]) {
+            ents[k].used = false;
+            ents[k].next = t->free_head;
+            t->free_head = k;
+        }
+    }
+    t->count = kept;
+    CHECK_PT(pthread_mutex_unlock(&t->pool_lock));
+    free(seen);
+    if (dropped > 0)
+        log_msg(LOG_WARN, "MAC table recovery: %d damaged entr%s dropped", dropped, dropped == 1 ? "y" : "ies");
+    return kept;
+}
+
+int mac_attach_shm(const char *name, int K, int nbuckets, void **region, size_t *len, int *recovered)
+{
+    const size_t size = mac_region_size(K, nbuckets);
+    struct stat st;
+    int rc = 0;
+
+    if (size == 0 || name == NULL || name[0] != '/')           /* a POSIX shared-memory name starts with '/' */
+        return EINVAL;
+    int fd = shm_open(name, O_CREAT | O_RDWR, 0600);           /* no O_EXCL: an existing table is reused */
+    if (fd < 0)
+        return errno;
+    if (fstat(fd, &st) < 0) {
+        rc = errno;
+        (void)close(fd);                                         /* error path: the fstat error is the one to report */
+        return rc;
+    }
+    const bool fits = (size_t)st.st_size == size;
+    if (!fits && (ftruncate(fd, 0) < 0 || ftruncate(fd, (off_t)size) < 0)) {   /* the wrong size: start from zeroed pages */
+        rc = errno;
+        (void)close(fd);
+        return rc;
+    }
+    void *m = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    rc = m == MAP_FAILED ? errno : 0;
+    if (close(fd) < 0 && rc == 0)
+        rc = errno;
+    if (m == MAP_FAILED)
+        return rc;
+    if (rc != 0) {
+        (void)munmap(m, size);
+        return rc;
+    }
+
+    mactable_t *t = m;
+    if (fits && __atomic_load_n(&t->magic, __ATOMIC_ACQUIRE) == MAC_TABLE_MAGIC && t->K == K && t->nbuckets == nbuckets) {
+        mt = t;
+        int n = recover_table(t);
+        if (n < 0) {
+            mt = NULL;
+            (void)munmap(m, size);
+            return -n;
+        }
+        *recovered = n;
+    } else {
+        rc = mac_init(m, K, nbuckets);
+        if (rc != 0) {
+            (void)munmap(m, size);
+            return rc;
+        }
+        *recovered = -1;
+    }
+    *region = m;
+    *len = size;
+    return 0;
+}
+
+void mac_detach(void)
+{
     mt = NULL;
 }
 

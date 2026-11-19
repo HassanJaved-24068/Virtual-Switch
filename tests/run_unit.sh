@@ -137,4 +137,13 @@ if command -v valgrind >/dev/null; then
     run python3 tests/test_pair.py valgrind                                # Part 19: both processes under valgrind, no errors, no leaks
 fi
 
-echo "Parts 1-19 unit and regression tests passed."
+run ./build/test_macshm                   # Part 20: the MAC table in shared memory: reuse, a dead lock owner (EOWNERDEAD), damaged tables recovered
+run $NOASLR ./build/test_macshm_tsan      # Part 20: the same under ThreadSanitizer
+run python3 tests/test_persist.py         # Part 20: --persist-mac, the supervisor: kill -9 / kill -SEGV, restart, recovered entries, giving up, clean-up
+run env SWITCH="setarch -R ./switch_tsan" python3 tests/test_persist.py tsan   # Part 20: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_persist.py valgrind                             # Part 20: --persist-mac under valgrind (no supervisor: it cannot exec valgrind)
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_macshm
+fi
+
+echo "Parts 1-20 unit and regression tests passed."

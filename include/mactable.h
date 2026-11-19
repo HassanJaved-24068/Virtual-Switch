@@ -90,6 +90,19 @@ int mac_init(void *region, int K, int nbuckets);
 void mac_destroy(void);
 
 /*
+ * Part 20 (--persist-mac): put the table in the POSIX shared-memory object `name` instead of the heap. shm_open(O_CREAT, no O_EXCL); if the object has exactly the size of
+ * a K / nbuckets table and the header matches (magic, K, nbuckets), the table is REUSED and recovered, otherwise the object is resized and initialised from scratch.
+ * Recovery (the switch is not running any thread yet): every bucket lock is taken (a lock held by the dead process comes back as EOWNERDEAD and is made consistent),
+ * every chain is walked and checked (index in range, entry reached once, right bucket, valid port: a bad entry is dropped, the chain is cut there), the free list
+ * and the entry count are REBUILT by a scan, and the mac_count of every port is rebuilt from the entries. *recovered = number of entries kept, or -1 for a fresh table.
+ * On success *region / *len are the mapping (the caller munmaps it after mac_detach). Returns 0 or an errno value.
+ */
+int mac_attach_shm(const char *name, int K, int nbuckets, void **region, size_t *len, int *recovered);
+
+/* Forget the table WITHOUT destroying its mutexes (a shared table is reused by the next switch; destroyed mutexes could not be locked again). */
+void mac_detach(void);
+
+/*
  * Learn the source MAC `mac` of a frame that came in on `port` (1..MAX_PORTS;
  * 0 is the bonus trunk). The caller must NOT pass a multicast or broadcast
  * source. mac_learn_ex() reports a move instead of logging it (so a caller

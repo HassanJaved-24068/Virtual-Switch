@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 19** (bonus: two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 20** (bonus: the supervisor and the crash-surviving MAC table, `--persist-mac`; before it Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-The remaining bonus items of Tier 3 (the supervisor and the benchmark) are not implemented yet; where the configuration file already accepts their keys
+The last bonus item of Tier 3 (the benchmark, Part 21) is not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -21,7 +21,8 @@ make test       # the whole test suite (about 8 minutes); see "Tests"
 ## Run
 
 ```
-./switch <tcp_port> <num_ports> [-c vswitch.conf] [--pair <tcp_port_b> [--peer-config b.conf]]
+./switch <tcp_port> <num_ports> [-c vswitch.conf] [--pair <tcp_port_b> [--peer-config b.conf]] [--persist-mac]
+./supervisor ./switch <tcp_port> <num_ports> [switch options]
 ./host   <switch_ip> <tcp_port> <mac> [--noread] [--partial] [--quiet] [--flood N --to <mac>] [--die-midframe]
 ```
 
@@ -33,6 +34,7 @@ make test       # the whole test suite (about 8 minutes); see "Tests"
   switch prints the reason (with the line numbers) on stderr and exits with status 1 before it listens.
 * `Ctrl+C` (`SIGINT`) or `SIGTERM` shuts the switch down cleanly (exit status 0).
 * `--pair <tcp_port_b>` (Part 19) starts **two** switches joined by a trunk, see "Two switches joined by pipes" below.
+* `--persist-mac` (Part 20) keeps the MAC table in shared memory, see "The supervisor and the crash-surviving MAC table" below (not combinable with `--pair`).
 
 The host program reads commands from stdin: `send <dst_mac|bcast> <text>`, `sendx <dst_mac|bcast> <vlan> <prio> <text>`, `quit`.
 
@@ -154,6 +156,29 @@ shut down or reconfigured with `swctl` (ports 1..N only). A frame (at most 1517 
   `SIGTERM` from the kernel (`PR_SET_PDEATHSIG`) and stops instead of living on as an orphan.
 * `swctl -p <tcp_port_b> ...` talks to B (its socket and, for `stats`, `/vswitch_stats_P_<tcp_port_b>`; every other port number falls back to the fixed `/vswitch_stats_P`).
 * Limits: one link, no spanning tree; `mac_dump_file` and the other file names of the configuration are shared by the two switches unless `--peer-config` changes them.
+
+## The supervisor and the crash-surviving MAC table (Part 20)
+
+`./supervisor ./switch 9000 8 -c vswitch.conf` forks; the child `execv`s `./switch 9000 8 -c vswitch.conf --persist-mac` and the parent waits for it. With `--persist-mac` the
+MAC table of Part 6 (one region, indices instead of pointers, process-shared robust mutexes) lives in the POSIX shared-memory object **`/vswitch_mac_<tcp_port>`**
+(the counters of Part 14 keep their fixed name `/vswitch_stats_P`) instead of the heap.
+
+* **Attach:** `shm_open(O_CREAT)` without `O_EXCL`. If the object has exactly the size of a table with the configured `mac_table_size` and its header matches (magic, K, number of
+  buckets) the table is **reused** and the log says `MAC table recovered: N entries`; otherwise (nothing there, another size, a header that was never completed) a new table is
+  created (`MAC table: no usable shared table found, a new one was created`).
+* **Recovery** (before any thread exists): every bucket lock is taken (a lock held by the crashed process comes back as `EOWNERDEAD` and is made consistent with
+  `pthread_mutex_consistent`), every chain is walked and checked (index in range, entry reached once, right bucket, a port this switch has), a damaged entry is dropped
+  (`MAC table recovery: N damaged entries dropped`), the **free list and the entry count are rebuilt by a scan**, and every port's `mac_count` is rebuilt from the entries.
+* The entries name ports whose TCP connections died with the crash. A lookup that finds a port that is not UP floods (Part 6); hosts that reconnect relearn their MACs (or a
+  `MAC moved` is logged); stale entries age out after `mac_aging_seconds`. Entries of ports that had a host when the switch ended **cleanly** are gone (the teardown of a port
+  flushes its MACs); a crash flushes nothing, which is the point.
+* A switch started with `--persist-mac` never unlinks the object (and does not destroy its mutexes: the next switch must be able to lock them).
+* **Restart policy:** the switch exited with a non-zero status or was killed by a signal other than `SIGINT` / `SIGTERM` -> restart after 1 s; after 5 restarts within 60 s the
+  supervisor gives up (exit status 1). A clean exit (status 0, or a switch ended by `SIGINT` / `SIGTERM`) ends the supervisor.
+* **`SIGINT` / `SIGTERM` to the supervisor:** forwarded to the switch; once the switch is reaped the supervisor unlinks `/vswitch_mac_<tcp_port>` and exits 0. If the switch had
+  crashed (it could not clean up after itself) its counters `/vswitch_stats_P` and its admin socket are removed as well, so `/dev/shm` is left empty.
+* The supervisor is a single-threaded process that waits in `poll()` on a `signalfd` (`SIGCHLD`, `SIGINT`, `SIGTERM`): no signal handlers and no sleeping; the one-second restart
+  delay is the `poll()` timeout, so a signal during the delay is handled at once.
 
 ## Counters in shared memory
 
@@ -303,6 +328,8 @@ python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / 
 ./build/test_mirror                                    # port mirroring without sockets (after `make build/test_mirror`)
 python3 tests/test_mirror.py [tsan|valgrind]           # port mirroring with the real switch and sniffers (Part 17)
 python3 tests/test_pair.py [tsan|valgrind]             # two switches joined by two pipes: VLANs across the link, peer death, stalled peer, SIGINT (Part 19)
+./build/test_macshm                                    # the shared MAC table: reuse, a dead lock owner, damaged tables (after `make build/test_macshm`; Part 20)
+python3 tests/test_persist.py [tsan|valgrind]          # --persist-mac and the supervisor: kill -9 / -SEGV, recovery, restarts, giving up, clean-up (Part 20)
 ./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
 python3 tests/static_checks.py                         # no sleep() in the switch; no ignored result of a system / pthread call (Part 18; runs first in make test)
 ./tests/hostile.sh                                     # 32 hosts: --noread, --partial, kill -9 mid-stream, dying mid-frame, with admin commands and signals (Part 18)

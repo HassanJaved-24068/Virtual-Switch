@@ -2,7 +2,7 @@
  * switch.c - the switch program: argument parsing, listening socket and the
  * accept thread.
  *
- *   ./switch <tcp_port> <num_ports> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]]
+ *   ./switch <tcp_port> <num_ports> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]] [--persist-mac]
  *
  * Part 3: accept hosts, give each one a port and a receiver thread.
  * Part 4: every port also gets an output queue and a sender thread, and
@@ -32,6 +32,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/socket.h>
@@ -47,7 +48,7 @@
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s <tcp_port 1-65535> <num_ports 1-%d> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]]\n",
+    fprintf(stderr, "usage: %s <tcp_port 1-65535> <num_ports 1-%d> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]] [--persist-mac]\n",
             prog, MAX_PORTS);
 }
 
@@ -376,8 +377,14 @@ static void shutdown_switch(const started_t *st)
     }
 
     /* 8-13. No thread is left: destroy things, each exactly once. */
-    mac_destroy();
-    free(sw.mac_region);
+    if (sw.mac_persist) {                  /* Part 20: the table stays in shared memory for the next switch; its mutexes must NOT be destroyed */
+        mac_detach();
+        if (munmap(sw.mac_region, sw.mac_region_len) < 0)
+            log_msg(LOG_ERR, "shutdown: munmap of the shared MAC table failed: %s", strerror(errno));
+    } else {
+        mac_destroy();
+        free(sw.mac_region);
+    }
     sw.mac_region = NULL;
     switch_destroy();                      /* semaphore, locks, condition variables, listen_fd, wake_efd */
     stats_destroy();
@@ -484,7 +491,7 @@ int main(int argc, char **argv)
     int rc;
     pid_t peer = -1;                       /* switch A: the pid of B (Part 19) */
     int link_r = -1, link_w = -1;          /* the pipe ends of port 0 (Part 19) */
-    bool pair = false;
+    bool pair = false, persist_mac = false;
 
     memset(&st, 0, sizeof st);
 
@@ -500,7 +507,12 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return EXIT_FAILURE;
     }
-    for (int i = 3; i < argc; i += 2) {    /* options, each with one value */
+    for (int i = 3; i < argc; i += 2) {    /* options, each with one value (except the flag --persist-mac) */
+        if (strcmp(argv[i], "--persist-mac") == 0 && !persist_mac) {
+            persist_mac = true;
+            i--;                           /* a flag: the loop adds 2, the next option starts one further */
+            continue;
+        }
         if (i + 1 >= argc) {
             usage(argv[0]);
             return EXIT_FAILURE;
@@ -530,6 +542,10 @@ int main(int argc, char **argv)
     }
     if (parse_range(argv[2], 1, MAX_PORTS, &num_ports) < 0) {
         fprintf(stderr, "switch: bad number of ports '%s' (must be 1-%d)\n", argv[2], MAX_PORTS);
+        return EXIT_FAILURE;
+    }
+    if (persist_mac && pair) {
+        fprintf(stderr, "switch: --persist-mac cannot be combined with --pair\n");
         return EXIT_FAILURE;
     }
     if (pair && tcp_port_b == tcp_port) {
@@ -634,27 +650,43 @@ int main(int argc, char **argv)
     else
         log_msg(LOG_INFO, "no configuration file: using the defaults");
 
-    /* The MAC table lives in one region (heap now; shared memory in the bonus Part 20). */
-    size_t mac_size = mac_region_size(sw.mac_table_size, sw.mac_buckets);
-    sw.mac_region = malloc(mac_size);
-    if (sw.mac_region == NULL) {
-        fprintf(stderr, "switch: cannot allocate the MAC table\n");
-        admin_close(false, st.admin_thread);
-        log_stop();
-        stats_destroy();
-        return EXIT_FAILURE;
+    /* The MAC table lives in one region: the heap, or with --persist-mac (Part 20) the shared-memory object /vswitch_mac_<tcp_port>, which a restarted
+     * switch finds again (recovered below). */
+    sw.mac_persist = persist_mac;
+    int recovered = -1;
+    if (persist_mac) {
+        char mac_name[64];
+
+        snprintf(mac_name, sizeof mac_name, MAC_SHM_FMT, (int)tcp_port);
+        rc = mac_attach_shm(mac_name, sw.mac_table_size, sw.mac_buckets, &sw.mac_region, &sw.mac_region_len, &recovered);
+        if (rc != 0)
+            fprintf(stderr, "switch: cannot attach the shared MAC table %s: %s\n", mac_name, strerror(rc));
+    } else {
+        sw.mac_region = malloc(mac_region_size(sw.mac_table_size, sw.mac_buckets));
+        if (sw.mac_region == NULL) {
+            fprintf(stderr, "switch: cannot allocate the MAC table\n");
+            rc = ENOMEM;
+        } else {
+            rc = mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets);
+            if (rc != 0)
+                fprintf(stderr, "switch: cannot initialise the MAC table: %s\n", strerror(rc));
+        }
     }
-    rc = mac_init(sw.mac_region, sw.mac_table_size, sw.mac_buckets);
     if (rc != 0) {
-        fprintf(stderr, "switch: cannot initialise the MAC table: %s\n", strerror(rc));
         admin_close(false, st.admin_thread);
         log_stop();
         stats_destroy();
         return EXIT_FAILURE;
     }
-    log_msg(LOG_INFO, "MAC table: %d entries, %d buckets, aging %lds, at most %d MACs per port",
+    log_msg(LOG_INFO, "MAC table: %d entries, %d buckets, aging %lds, at most %d MACs per port%s",
             sw.mac_table_size, sw.mac_buckets, atomic_load(&sw.mac_aging_sec),
-            atomic_load(&sw.max_macs_per_port));
+            atomic_load(&sw.max_macs_per_port), persist_mac ? " (in shared memory, --persist-mac)" : "");
+    if (persist_mac) {
+        if (recovered >= 0)
+            log_msg(LOG_INFO, "MAC table recovered: %d entries", recovered);
+        else
+            log_msg(LOG_INFO, "MAC table: no usable shared table found, a new one was created");
+    }
 
     /*
      * Threads. The signal thread comes first so that a SIGINT during start-up is

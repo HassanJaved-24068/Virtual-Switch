@@ -68,3 +68,11 @@ order. What is new is only how its two threads are woken: `shutdown(fd)` does no
 and sender, which wait in `poll()` on `{pipe, wake_fd}` with no lock held, return. `port_attach_pipe` (startup, before accept) takes the `ports_lock` write lock exactly like
 `port_start`. Port 0 is never in the free-port semaphore, so `sem_post` / `sem_trywait` are never called for it. The fork happens before any thread or lock is created, so no lock
 is ever copied into the child in a held state.
+
+## Part 20: the MAC table in shared memory (--persist-mac)
+
+The locks do not change: the bucket locks and `pool_lock` are the same process-shared ROBUST mutexes, now inside a shared mapping that outlives the process. Three rules follow.
+(1) `lock_robust` already turns `EOWNERDEAD` into `pthread_mutex_consistent`, so a lock held by a crashed switch cannot hang the next one. (2) Recovery runs before any thread exists, takes
+the bucket locks ONE AT A TIME in ascending order and then `pool_lock` (never together: the order bucket -> pool is not even needed), and rebuilds what a half-finished update can
+leave wrong (free list, `count`, chains, per-port `mac_count`) by a scan instead of trusting it. (3) A clean exit must NOT `pthread_mutex_destroy` the mutexes (`mac_detach` instead of
+`mac_destroy`): a destroyed mutex cannot be locked again by the next switch. The magic number is written LAST by `mac_init`, so a table that was being built when the process died is never "recovered".

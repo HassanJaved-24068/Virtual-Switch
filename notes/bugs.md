@@ -478,3 +478,20 @@ program that ignores SIGINT.
   reaper writes the eventfd. The same reasoning gave the pidfd-based wait for the peer process in switch A: a peer stopped with SIGSTOP must not hang A (killed after 15 s).
 - Test-side mistake: the first two hosts of a switch get ports 1 and 2; the test configuration had put them in different VLANs, so the "A's hosts still talk" checks failed (3 checks).
   The tests that need two same-VLAN hosts now use a configuration with both in VLAN 10.
+
+## 33. Part 20: no defect in the switch; three test expectations were wrong (and one real gap in the first draft of mac_attach_shm)
+- Gap found by test_macshm.c: `shm_open("no-slash")` succeeds on Linux (it creates /dev/shm/no-slash), so mac_attach_shm accepted a name without a leading '/' and left an object behind
+  (stats.c already refused such names). It now returns EINVAL.
+- Test expectations corrected: (a) a clean exit flushes the MACs of every port that had a host (the teardown of Part 5), so a table recovered after a CLEAN exit is not full; only the
+  crash case keeps the entries. (b) The hosts must still be connected when the switch is killed (a disconnect flushes too). (c) Under TSan `kill -SEGV` is caught by TSan's own handler
+  (a report, exit status 66, not death by signal 11): that variant crashes the switch with SIGKILL, which the supervisor treats the same way.
+- A reason for the layout of the recovery: a crash can leave the free list pointing into the chains, a wrong count, a cycle or an out-of-range index (a thread killed between pool_get and the
+  chain insert, or in remove_entry); test_macshm.c damages a table in each of these ways and checks that recovery makes it consistent (mac_check_counts).
+
+## 34. Part 16's test_reconfig.py scenario 7 is flaky (test-side race, found during the Part 20 verification; NOT changed: historical tests are not edited)
+- Symptom: `FAIL: host 4 received all N unicast frames of host 3 (N+1)`, about 1 run in 4 on this machine, always exactly one frame over; it passed in every earlier full run.
+- Cause (test only): the scenario waits for `len(macs(sw)) == 4` and then sets every host's frame counter to 0. That only proves the switch has PROCESSED the four learn broadcasts; a copy can
+  still be on its way to a host and is then counted as one of the unicast frames.
+- Proof: with the counters reset only after every host had received the three broadcasts of the others (`wait_for(lambda: all(h.frames == 3 for h in hs))`) 8 consecutive runs passed (156 checks).
+  That change was tried and then reverted, because historical tests are not touched; it is the proposed fix and needs the owner's approval.
+- The switch is not involved: no frame is duplicated (the surplus frame is the late broadcast), and the same scenario passed in the Parts 18 and 19 full runs.
