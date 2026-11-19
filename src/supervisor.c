@@ -99,10 +99,8 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return EXIT_FAILURE;
     }
-    char *end;
-    errno = 0;
-    long port = strtol(argv[2], &end, 10);
-    if (errno != 0 || *end != '\0' || port < 1 || port > 65535) {
+    long port;
+    if (parse_uint(argv[2], 1, 65535, &port) < 0) {
         fprintf(stderr, "supervisor: bad TCP port '%s'\n", argv[2]);
         return EXIT_FAILURE;
     }

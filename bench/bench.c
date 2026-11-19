@@ -19,6 +19,9 @@
 #include "frame.h"
 
 #include <arpa/inet.h>
+#include <ctype.h>
+#include <limits.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
@@ -145,23 +148,24 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     char *end;
-    long port = strtol(argv[2], &end, 10);
-    if (*end != '\0' || port < 1 || port > 65535)
+    long port, h, pl;
+    if (parse_uint(argv[2], 1, 65535, &port) < 0)
         return fprintf(stderr, "bench: bad port\n"), EXIT_FAILURE;
-    long h = strtol(argv[3], &end, 10);
-    if (*end != '\0' || h < 2 || h > MAX_HOSTS)
+    if (parse_uint(argv[3], 2, MAX_HOSTS, &h) < 0)
         return fprintf(stderr, "bench: hosts must be 2-%d\n", MAX_HOSTS), EXIT_FAILURE;
-    double seconds = strtod(argv[4], &end);
-    if (*end != '\0' || seconds <= 0)
+    errno = 0;
+    double seconds = isdigit((unsigned char)argv[4][0]) ? strtod(argv[4], &end) : 0;    /* a digit first: no sign, no white space, no "nan" / "inf" */
+    if (!isdigit((unsigned char)argv[4][0]) || *end != '\0' || errno != 0 || !isfinite(seconds) || seconds <= 0 || seconds > 86400)
         return fprintf(stderr, "bench: bad seconds\n"), EXIT_FAILURE;
-    long pl = strtol(argv[5], &end, 10);
-    if (*end != '\0' || pl < 0 || pl > MAX_PAYLOAD)
+    if (parse_uint(argv[5], 0, MAX_PAYLOAD, &pl) < 0)
         return fprintf(stderr, "bench: payload must be 0-%d\n", MAX_PAYLOAD), EXIT_FAILURE;
     unsigned long long seed = 12345;
     if (argc == 7) {
-        seed = strtoull(argv[6], &end, 10);
-        if (*end != '\0')
+        long sd;
+
+        if (parse_uint(argv[6], 0, LONG_MAX, &sd) < 0)
             return fprintf(stderr, "bench: bad seed\n"), EXIT_FAILURE;
+        seed = (unsigned long long)sd;
     }
     nhosts = (int)h;
     payload_len = (int)pl;

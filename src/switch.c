@@ -52,19 +52,10 @@ static void usage(const char *prog)
             prog, MAX_PORTS);
 }
 
-/* Parse a whole string as a decimal long in [lo, hi]. Returns 0 or -1. */
+/* Parse a whole string as a decimal number in [lo, hi]: digits only, see parse_uint() (a sign or white space is refused, unlike strtol). Returns 0 or -1. */
 static int parse_range(const char *s, long lo, long hi, long *out)
 {
-    char *end;
-
-    if (s == NULL || *s == '\0')
-        return -1;
-    errno = 0;
-    long v = strtol(s, &end, 10);
-    if (errno != 0 || *end != '\0' || v < lo || v > hi)
-        return -1;
-    *out = v;
-    return 0;
+    return parse_uint(s, (unsigned long)lo, (unsigned long)hi, out);
 }
 
 /* Non-blocking TCP listening socket on INADDR_ANY. Exits on failure (startup). */

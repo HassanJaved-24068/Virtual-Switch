@@ -88,6 +88,15 @@ typedef uint8_t mac_t[MAC_LEN];
         }                                                                  \
     } while (0)
 
+/* ---- Strict numeric command-line arguments (util.c) ---- */
+/*
+ * Parse an unsigned decimal number: ONLY the characters '0'-'9' (so no sign, no white space, no "0x", no decimal point), at least one, any number of leading zeros.
+ * strtol() is not used because it accepts leading white space and a '+' or '-' sign. Overflow is detected while the digits are accumulated, and the value must be in
+ * [lo, hi] (hi <= LONG_MAX). Returns 0 and stores the value in *out, or -1 with errno = EINVAL (empty / NULL / not only digits) or ERANGE (too big or outside [lo, hi]);
+ * *out is untouched on an error.
+ */
+int parse_uint(const char *s, unsigned long lo, unsigned long hi, long *out);
+
 /* ---- MAC helpers (util.c) ---- */
 int mac_parse(const char *str, mac_t out);                /* 0 ok, -1 bad */
 int mac_format(const mac_t mac, char *out, size_t outlen);/* 0 ok, -1 small */

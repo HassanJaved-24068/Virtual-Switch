@@ -6,7 +6,7 @@ make -s all switch_small build/test_util build/test_frame build/test_queue build
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
         build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
         build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan \
-        build/test_admin build/test_admin_tsan build/test_swctl build/test_mirror build/test_mirror_tsan build/test_macshm build/test_macshm_tsan || exit 1
+        build/test_admin build/test_admin_tsan build/test_swctl build/test_mirror build/test_mirror_tsan build/test_macshm build/test_macshm_tsan build/test_parse || exit 1
 
 run() {
     echo "=== $* ==="
@@ -155,5 +155,14 @@ run ./build/test_mactable_rwlock          # Part 21: ... and against the RWLOCK 
 run env TSAN_OPTIONS=report_destroy_locked=0 $NOASLR ./build/test_mactable_global_tsan   # Part 21: the same under ThreadSanitizer
 run env TSAN_OPTIONS=report_destroy_locked=0 $NOASLR ./build/test_mactable_rwlock_tsan   # Part 21: the same under ThreadSanitizer
 run python3 tests/test_bench.py           # Part 21: forward.sh with every variant, bench / bench_mac, bad arguments, run.sh --quick, plot / report
+
+# Strict numeric command-line arguments (CLI-01 of the independent verification: "+9000" and " 9000" were taken for a TCP port; see docs/CLI_Argument_Validation_Fix.md)
+run ./build/test_parse                    # parse_uint(): digits only, overflow, ranges, errno
+run python3 tests/test_cli_args.py        # every numeric argument of switch, supervisor, host, swctl and bench: good and bad forms, the real programs
+run env SWITCH="$NOASLR ./switch_tsan" HOST="$NOASLR ./host_tsan" python3 tests/test_cli_args.py tsan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_cli_args.py valgrind                            # the real switch under valgrind: refused arguments leave nothing behind, accepted ones end cleanly
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_parse
+fi
 
 echo "Parts 1-21 unit and regression tests passed."

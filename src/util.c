@@ -4,6 +4,7 @@
 #include "common.h"
 
 #include <ctype.h>
+#include <limits.h>
 
 /* ------------------------------------------------------------------ */
 /* MAC helpers                                                         */
@@ -16,6 +17,36 @@ static int hex_value(char c)
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
+}
+
+/* See common.h: strict unsigned decimal, overflow-safe, range-checked. */
+int parse_uint(const char *s, unsigned long lo, unsigned long hi, long *out)
+{
+    unsigned long v = 0;
+
+    if (s == NULL || *s == '\0' || hi > (unsigned long)LONG_MAX) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (const char *p = s; *p != '\0'; p++) {
+        if (*p < '0' || *p > '9') {                       /* a sign, white space, a letter, '.', ... */
+            errno = EINVAL;
+            return -1;
+        }
+        const unsigned long d = (unsigned long)(*p - '0');
+
+        if (v > (ULONG_MAX - d) / 10) {                   /* v * 10 + d would not fit: more than ULONG_MAX */
+            errno = ERANGE;
+            return -1;
+        }
+        v = v * 10 + d;
+    }
+    if (v < lo || v > hi) {
+        errno = ERANGE;
+        return -1;
+    }
+    *out = (long)v;
+    return 0;
 }
 
 /*

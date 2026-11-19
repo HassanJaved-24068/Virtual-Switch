@@ -543,3 +543,12 @@ program that ignores SIGINT.
 - Item 38: the control check of `test_starvation` (tests/test_qos.c) no longer uses a producer thread and a 1.2 s window. `control_run()` is single-threaded: the consumer refills the high ring after every pop and
   counts the frames popped before the low frame. With weights 1000:1:1 and no aging it is exactly 1000 on every run; the check is `n_before > 500`. Normal, TSan and valgrind: 1293 checks, 0 failures; 10 runs next to
   4 CPU burners: 10 x 1293/0.
+
+## 39. CLI-01 of the independent verification: `./switch +9000 4` and `./switch " 9000" 4` were accepted (genuine defect in start-up argument parsing, fixed)
+- Symptom: the switch started and listened on 9000 for `+9000` and `" 9000"`. Found by `verification/t_cfg.py` (CLI-01). Reproduced before the fix, and NOT limited to the TCP port: the number of ports (`+4`, `" 4"`),
+  the `--pair` port, `supervisor`, `host` (port, `--flood`, `sendx` vlan / priority), `swctl -p` and the benchmark programs had the same weakness; `swctl shutdown " 1"` was accepted because swctl joins its words with spaces.
+- Cause: five private copies of "strtol + check end + check range"; `strtol` skips leading white space and accepts a `+` / `-` sign, so the checks on `end` and on the range never saw them.
+- Fix: one shared `parse_uint()` (src/util.c, include/common.h): digits only, overflow detected while accumulating, range checked, errno EINVAL / ERANGE; all callers use it; swctl refuses an argument that is empty or begins / ends with white space (white space inside one, `swctl 'show ports'`, is still accepted: tests/test_admin.py relies on it; my first version refused it and `make test` caught that).
+  Tests: tests/test_parse.c (55 checks) and tests/test_cli_args.py (283 checks, normal / TSan / valgrind; against the old code it reports 36 failures). Details: docs/CLI_Argument_Validation_Fix.md.
+- Already strict, unchanged: the admin thread (`parse_num`: digits only, at most 6) and the configuration parser (`parse_long`: first character a digit or `-`).
+

@@ -33,7 +33,7 @@ make test-valgrind   # the integration scripts with the switch under valgrind (f
 ./bench/bench <ip> <tcp_port> <hosts> <seconds> <payload> [seed]   # see "Benchmark"
 ```
 
-* `tcp_port` 1-65535, `num_ports` 1-64. Hosts take the lowest free port; when all ports are taken a new host
+* `tcp_port` 1-65535, `num_ports` 1-64. **Every numeric command-line argument is strict** (`parse_uint`, `src/util.c`): only the digits `0`-`9` (leading zeros are fine, `09000` is 9000); a sign (`+9000`, `-1`), white space (`" 9000"`, `"9000 "`), letters, a decimal point, an empty string or a number that overflows is a start-up error (message on stderr, exit status 1, nothing is started). This holds for the TCP port, the number of ports, the `--pair` port, `supervisor`, `host` (port, `--flood`, the vlan and priority of `sendx`), `swctl -p` and the benchmark programs; `swctl` also refuses an argument that is empty or begins or ends with white space (`" 1"`, `"1 "`); white space inside one (`swctl 'show ports'`) still works. Hosts take the lowest free port; when all ports are taken a new host
   waits up to `port_wait_timeout` seconds and then receives the "switch full" frame (the `host` program prints
   `SWITCH FULL` and exits with status 2).
 * `-c vswitch.conf` names a configuration file (see below). Without it the defaults are used.

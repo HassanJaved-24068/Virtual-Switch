@@ -135,6 +135,8 @@ static const char *parse_long(const char *s, long lo, long hi, long *out)
 
     if (*s == '\0' || (!isdigit((unsigned char)*s) && *s != '-'))
         return "not a number";
+    if (*s == '-' && lo >= 0)                      /* no setting has a negative value: "-5" is out of range, and so is "-0" (strtol would turn it into 0, in range) */
+        return "out of range";
     errno = 0;
     v = strtol(s, &end, 10);
     if (end == s || *end != '\0')

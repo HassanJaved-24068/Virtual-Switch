@@ -16,6 +16,9 @@
 #include "mactable.h"
 #include "port.h"
 
+#include <ctype.h>
+#include <limits.h>
+#include <math.h>
 #include <stdatomic.h>
 
 #ifndef BENCH_VARIANT
@@ -105,17 +108,20 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
     char *end;
-    long t = strtol(argv[1], &end, 10);
-    if (*end != '\0' || t < 1 || t > MAX_THREADS)
+    long t;
+    if (parse_uint(argv[1], 1, MAX_THREADS, &t) < 0)
         return fprintf(stderr, "bench_mac: threads must be 1-%d\n", MAX_THREADS), EXIT_FAILURE;
-    double seconds = strtod(argv[2], &end);
-    if (*end != '\0' || seconds <= 0)
+    errno = 0;
+    double seconds = isdigit((unsigned char)argv[2][0]) ? strtod(argv[2], &end) : 0;    /* a digit first: no sign, no white space, no "nan" / "inf" */
+    if (!isdigit((unsigned char)argv[2][0]) || *end != '\0' || errno != 0 || !isfinite(seconds) || seconds <= 0 || seconds > 86400)
         return fprintf(stderr, "bench_mac: bad seconds\n"), EXIT_FAILURE;
     unsigned long long seed = 12345;
     if (argc == 4) {
-        seed = strtoull(argv[3], &end, 10);
-        if (*end != '\0')
+        long sd;
+
+        if (parse_uint(argv[3], 0, LONG_MAX, &sd) < 0)
             return fprintf(stderr, "bench_mac: bad seed\n"), EXIT_FAILURE;
+        seed = (unsigned long long)sd;
     }
 
     switch_init(NPORTS);                                  /* the port table the MAC table reports to (mac_count) */

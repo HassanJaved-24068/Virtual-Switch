@@ -16,6 +16,8 @@
  * mapped PROT_READ only, so swctl cannot change a counter even by mistake.
  */
 #include "common.h"
+
+#include <ctype.h>
 #include "admin.h"
 #include "stats.h"
 
@@ -334,15 +336,12 @@ int main(int argc, char **argv)
     int i = 1;
 
     if (i < argc && strcmp(argv[i], "-p") == 0) {
-        char *end;
         long v;
         if (i + 1 >= argc) {
             usage();
             return EXIT_ERR;
         }
-        errno = 0;
-        v = strtol(argv[i + 1], &end, 10);
-        if (errno != 0 || *argv[i + 1] == '\0' || *end != '\0' || v < 1 || v > 65535) {
+        if (parse_uint(argv[i + 1], 1, 65535, &v) < 0) {
             fprintf(stderr, "swctl: bad TCP port '%s' (1-65535)\n", argv[i + 1]);
             return EXIT_ERR;
         }
@@ -369,6 +368,13 @@ int main(int argc, char **argv)
     line[0] = '\0';
     for (; i < argc; i++) {
         size_t n = strlen(argv[i]);
+        /* The words of the command are joined by single spaces and the switch splits the line at white space again: an argument that is empty or begins or ends with white
+         * (" 1", "1 ") would silently become the word "1", so it is refused here, like a sign in a number. White space INSIDE an argument is allowed: `swctl 'show ports'` (one
+         * argument) has always worked and still does. */
+        if (n == 0 || isspace((unsigned char)argv[i][0]) || isspace((unsigned char)argv[i][n - 1])) {
+            fprintf(stderr, "swctl: bad argument '%s': it must not be empty or begin or end with white space\n", argv[i]);
+            return EXIT_ERR;
+        }
         if (len + n + 2 > ADMIN_MAX_LINE) {
             fprintf(stderr, "swctl: the command is too long (maximum %d bytes)\n", ADMIN_MAX_LINE - 1);
             return EXIT_ERR;
