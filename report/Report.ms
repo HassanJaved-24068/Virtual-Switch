@@ -220,5 +220,7 @@ the benchmark of global vs striped vs rwlock MAC table locking with a graph and 
 indistinguishable in the whole switch).
 .H1 "6. Verification (what was actually run)"
 .LP
-On a clean unpacking of the submission: \f(CWmake\fP with \f(CW-std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread\fP (no warning), \f(CWmake clean\fP, \f(CWmake tsan\fP, \f(CWmake test\fP, \f(CWmake test-tsan\fP and \f(CWmake test-valgrind\fP:
-the results are in \f(CWdocs/Final_Submission_Check.md\fP of the repository. Known limits: single link for \f(CW--pair\fP; \f(CW--persist-mac\fP only with the striped table and not with \f(CW--pair\fP; the benchmark was measured on a 2-core machine at \f(CW-O0\fP.
+The submission archive (\f(CWmake dist\fP, commit \f(CWb86fa52\fP) was unpacked into an empty directory and, there, in this order: \f(CWmake\fP with \f(CW-std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread\fP (0 warnings),
+\f(CWmake clean\fP (no object file or program left), \f(CWmake\fP again, \f(CWmake tsan\fP, \f(CWmake test\fP (unit and regression suites of all parts, including their ThreadSanitizer and valgrind unit runs, plus 19 integration scripts),
+\f(CWmake test-tsan\fP (19 of 19 integration scripts under ThreadSanitizer) and \f(CWmake test-valgrind\fP (19 of 19 under valgrind with full leak check): every command exited 0 and every suite reported "All tests passed". Details: \f(CWdocs/Final_Submission_Check.md\fP.
+Known limits: no official public tests were supplied (\f(CWforward.sh\fP and \f(CWbroadcast.sh\fP are our own); \f(CW--pair\fP has one link; \f(CW--persist-mac\fP needs the striped table and cannot be combined with \f(CW--pair\fP; the benchmark ran on a 2-core machine at \f(CW-O0\fP.
