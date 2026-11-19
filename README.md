@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 16** (live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 17** (port mirroring; before it Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (port mirroring, Part 17) are not implemented yet; where the configuration file already accepts their keys
+Features of later parts (the bonus items of Tier 3) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -143,7 +143,7 @@ switch runs and not after it stopped), so that another process can read them. `s
 
 `PAGE` is `sysconf(_SC_PAGESIZE)` (4096 on x86-64); the object is `PAGE + round_up(sizeof(stats_data_t), PAGE)` bytes (8192), mode **0600** (same user
 only). `in` counts frames received from the host of the port, `out` frames written to it, `dropped` frames lost because its queue was full (and
-invalid trunk frames), `mirrored` is reserved for Part 17. `state` (0 FREE, 1 UP, 2 CLOSING, 3 DISABLED), `vlan` and `mirror_to` are copied in whenever
+invalid trunk frames), `mirrored` counts the mirrored copies queued for a sniffer (Part 17, counted on the mirrored port). `state` (0 FREE, 1 UP, 2 CLOSING, 3 DISABLED), `vlan` and `mirror_to` are copied in whenever
 the port changes, for `swctl show ports` (Part 15).
 
 The lock is a **process-shared, robust** mutex that only the switch initialises, before it writes the magic. Every counter update takes it (it is the last
@@ -179,8 +179,16 @@ Exit status: **0** `OK`, **1** `ERR` (also bad arguments and system errors), **2
 `ECONNREFUSED`, or no shared-memory object: message `switch not running`).
 
 * **Done:** `show mac`, `show ports`, `clear mac`, `stats`, `stats --watch` (Part 15) and `shutdown`, `up`, `vlan` (Part 16, below).
-* **Parsed and validated only:** `mirror <port> <sniffer>|off` (port 1..N, source != sniffer, the sniffer is not the trunk). What it does belongs to Part 17; until
-  then a valid one answers `ERR not implemented yet (Part 17)` (exit 1). Nothing pretends to succeed.
+* **Port mirroring (Part 17):** `mirror <port> <sniffer>` sends a copy of **all** traffic of `<port>` to `<sniffer>`: every frame received on the port and every frame
+  queued to it (both directions). The copy is the same shared frame (no copy of the data), the VLAN filter does not apply to it (the sniffer may be in its own VLAN) and it is
+  never sent back to the frame's own ingress port. Both ports must have a host (UP), the ports must differ and the sniffer must not be the trunk. `mirror <port> off` stops it (OK
+  also if it was off). The copy goes into the sniffer's own bounded queue: a sniffer that is slow or never reads only loses copies (counted as `dropped` on the sniffer's port); it never
+  slows the mirrored port. `swctl stats` shows `MIRRORED` (copies queued, counted on the mirrored port) and `show ports` the target in the `MIRROR` column. Mirroring ends by itself
+  (and is logged) when the mirrored host or the sniffer goes away, also by `swctl shutdown`; a new host on those ports is not mirrored. There is no de-duplication: a sniffer that
+  is itself in the VLAN of the mirrored traffic gets a flooded frame twice (normally and as a copy); give it its own VLAN. Frames that the switch drops before forwarding (broadcast
+  source, invalid trunk VLAN, port-security violation) are not mirrored.
+* `./host <ip> <port> <mac> --sniff` is a plain host that only prints (`RX src=... dst=... vlan=... data=...` per frame): it sends nothing, reads no stdin, and ends when the switch
+  closes the connection or on a signal.
 
 **Live reconfiguration (Part 16), safe under traffic:**
 * `shutdown <port>`: an UP port is torn down by the reaper (the host is disconnected, its MAC entries are flushed) and ends **DISABLED**; the command answers
@@ -266,6 +274,8 @@ python3 tests/test_shm.py [tsan|valgrind]              # the segment of the real
 ./build/test_swctl              # swctl against a segment: read-only data mapping, robust mutex (after `make build/test_swctl`)
 python3 tests/test_admin.py [tsan|valgrind]            # admin socket and swctl with the real switch (Part 15)
 python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / clear mac with the real switch (Part 16)
+./build/test_mirror                                    # port mirroring without sockets (after `make build/test_mirror`)
+python3 tests/test_mirror.py [tsan|valgrind]           # port mirroring with the real switch and sniffers (Part 17)
 ./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```

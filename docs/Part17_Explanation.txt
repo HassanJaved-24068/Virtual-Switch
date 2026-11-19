@@ -1,0 +1,59 @@
+=====================================================================
+PART 17 - PORT MIRRORING
+=====================================================================
+
+1. WHAT PART 17 IMPLEMENTS
+--------------------------
+swctl mirror <x> <s> copies all traffic of port x to the sniffer port s without slowing x; swctl mirror <x> off stops it; ./host --sniff is a host that only
+prints. Roadmap: port.mirror_to (an atomic int, 0 = off), admin_mirror(x, s), a copy = frame_ref + outq_try_push(s) in both directions, validation, and the
+references are cleared by the reaper when x or s goes down.
+
+Files:   src/forward.c    mirror_copy() and its two call sites in forward_frame()
+         src/port.c, include/port.h   admin_mirror(), admin_mirror_off(), the clearing of references in teardown_port()
+         src/admin.c      the commands call them (the Part 15 placeholder "not implemented yet (Part 17)" is gone)
+         src/host.c       --sniff
+         tests/test_mirror.c, tests/test_mirror.py   the Part 17 tests (permanent; run_unit.sh -> make test); Makefile: build/test_mirror(_tsan)
+         tests/test_part17.py   TEMPORARY dedicated runner (deleted when Part 18 starts); tests/test_part16.py deleted (its tests are permanent in test_reconfig.py, reconfig_stress.sh)
+         README.md, notes/locks.md (the locks of the mirroring), docs/Part17_Explanation.txt
+
+2. THE DATA PATH (forward.c)
+----------------------------
+"All traffic of port X" means both directions: (a) every frame RECEIVED on X, (b) every frame successfully QUEUED to X. After the normal forwarding loop (still under
+the ports_lock read lock) forward_frame calls mirror_copy(x, ingress, f, drops):
+   s = x.mirror_to (an atomic read);  nothing if s is 0 or out of range, s is the frame's own ingress port, or s is not UP;
+   frame_ref(f); if outq_try_push(s.q, f) -> count "mirrored" on x; else frame_unref(f) and count "dropped" on s (logged on the 1st and every 1000th drop, as before).
+(a) is called once for the ingress port; (b) once for every port whose queue took the frame (sent[i], set in the normal loop). The VLAN filter is NOT applied (the sniffer may be
+in its own VLAN); the VLAN field of the frame is the one stamped at ingress. The frame is shared, never copied: one more reference per copy, released by the sniffer's sender.
+Because the copy goes into the sniffer's OWN bounded queue, a slow sniffer can only lose copies (counted on its port); the receiver of x never waits, so x is not slowed.
+Decisions: (1) no de-duplication, as the roadmap's algorithm says: a sniffer that is in the VLAN of the traffic gets a flooded frame twice (normally and as a copy), and the
+"mirrored" counter rises for every copy; a sniffer in its own VLAN sees every frame once. My first version skipped the copy when the frame was already queued to the
+sniffer; the smoke test showed that this left "mirrored" at 0 for broadcasts in the sniffer's VLAN, against the roadmap's criterion "the mirrored counter rises". (2) frames that
+the switch drops before the forwarding decision (broadcast source, invalid trunk VLAN, port-security violation) are not mirrored.
+
+3. THE COMMANDS (port.c)
+------------------------
+admin_mirror(x, s): under the ports_lock WRITE lock: x != s ("a port cannot mirror to itself"); s is not the trunk (port flag or configuration); x is UP; s is UP (a sniffer must
+be running: the mirroring lives as long as both hosts do; port_reset clears mirror_to of a new host anyway). Then atomic_store(mirror_to), stats_set_mirror (the shared copy
+for show ports / stats). A new target replaces the old one. admin_mirror_off(x): clears it; OK if it was already off (a script can always call it).
+Clearing (teardown_port, step 8): in the SAME write-locked step that sets the final state of the port, every mirror_to that equals the port is set to 0 (and its shared copy), and one
+log line per port is written after the unlock ("port X: mirroring to port S stopped (port S went down)"). The port's own mirror_to is cleared by port_reset. So nothing can queue to a
+port that is not UP: forward_frame checks the state under the read lock, and the state and the references change together under the write lock.
+
+4. TESTS AND RESULTS
+--------------------
+test_mirror.c (281 checks; TSan; valgrind): validation, (a), (b), the SAME frame object in two queues and live-frame accounting, VLAN ignored, never back to the ingress port,
+a full sniffer queue (100 frames: 64 copies, 36 drops counted on the sniffer, 0 on the mirrored port), sniffer not UP / bad target, two mirrored ports, no de-duplication, 3 forwarding
+threads while the mirror is toggled 2000 times.
+test_mirror.py (99 checks; TSan; valgrind): the sniffer receives the traffic of port 1 in both directions with unchanged addresses and VLAN field; errors; mirroring ends when the
+sniffer, the mirrored host, or (shutdown) the sniffer's port goes away; a sniffer that never reads (A sent 2775 frames: 1525 mirrored + 1250 dropped on the sniffer = 2775, 0 drops on the
+mirrored port and on B's port, B received every frame); the real ./host --sniff; SIGINT with a stuck sniffer; a storm of ~30 000 operations with churning hosts (every reference points at a live
+port, none is left at the end).
+Mutation checks (deliberate breakages in a copy of the sources, all caught): no ingress copy, no egress copy, VLAN filter applied to the copy, copy sent back to the ingress port, references
+not cleared by the reaper, the drop counted on the wrong port, a copy without frame_ref.
+
+5. RESULTS OF THE FULL SUITES
+-----------------------------
+Dedicated (python3 tests/test_part17.py): test_mirror.c normal / TSan / valgrind, test_mirror.py normal / TSan / valgrind: ALL PASSED.
+make test:           12 of 12 groups (Parts 1-17 suite + the 11 integration scripts): PASS (811 s).
+make test-tsan:      11 of 11 scripts, 0 ThreadSanitizer reports (74 s).
+make test-valgrind:  11 of 11 scripts, 0 errors (134 s).

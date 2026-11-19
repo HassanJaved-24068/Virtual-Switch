@@ -31,7 +31,7 @@ enum stat_kind {
     STAT_IN,       /* frames received from the host on this port */
     STAT_OUT,      /* frames written to the host on this port */
     STAT_DROP,     /* frames dropped because this port's queue was full */
-    STAT_MIRROR,   /* mirrored copies (used from Part 17) */
+    STAT_MIRROR,   /* mirrored copies queued for the sniffer of this port (Part 17) */
     STAT_KINDS
 };
 

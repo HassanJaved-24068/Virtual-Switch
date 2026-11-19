@@ -440,3 +440,11 @@ program that ignores SIGINT.
 - Working-practice note: a first mutation attempt on the real source tree broke `src/port.c` (a mutation text that opened a `/*` comment) while the backup
   directory had been cleaned up by the session; it was restored by reversing the exact replacement and verified by a build and the tests. Mutation checks now run
   in a separate copy of the project.
+
+## 29. Part 17: no defect in the code found by the tests; one design correction and two test-side mistakes
+- Design: the first version did not queue a mirrored copy to a sniffer that had already got the frame through the normal forwarding (no duplicates). The smoke test showed that
+  `mirrored` then stayed at 0 for broadcasts when the sniffer shares the VLAN, against the roadmap's "the mirrored counter rises"; the roadmap's algorithm has no such rule (only
+  "s is not the frame's ingress port"). Removed; the duplicate for a sniffer inside the VLAN is documented (README, forward.c, docs/Part17_Explanation.txt).
+- Test (mutation harness): a mutation that left a parameter unused failed to compile under -Werror and the harness silently ran the binary of the previous mutation (a wrong "caught").
+  Mutations that must compile now keep every variable used; the result of every mutation is the result of ITS OWN build.
+- Test (test_mirror.c): the first null-safe version released only one of the two references to the shared frame (a == b), which leaked and failed the live-frame check; both are released.

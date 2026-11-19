@@ -7,7 +7,7 @@
  *   - main thread: reads commands from stdin and sends frames
  *   - receiver thread: reads frames from the socket and prints them
  *
- * Options: --noread  --partial  --flood N --to <mac>  --die-midframe  --quiet
+ * Options: --noread  --partial  --flood N --to <mac>  --die-midframe  --quiet  --sniff (Part 17: a plain host that only prints)
  * Exit codes: 0 normal, 1 error, 2 "switch full".
  */
 #include "common.h"
@@ -23,7 +23,7 @@
 
 /* Settings from the command line. */
 static struct {
-    bool noread, partial, die_midframe, quiet, flood;
+    bool noread, partial, die_midframe, quiet, flood, sniff;
     long flood_count;
     mac_t me;        /* our own MAC: used as src of every frame */
     mac_t flood_to;
@@ -56,7 +56,7 @@ static void usage(const char *prog)
 {
     fprintf(stderr,
             "usage: %s <ip> <port> <mac> [--noread] [--partial] [--quiet]\n"
-            "          [--flood N --to <mac>] [--die-midframe]\n"
+            "          [--flood N --to <mac>] [--die-midframe] [--sniff]\n"
             "stdin commands: send <dst|bcast> <text>\n"
             "                sendx <dst|bcast> <vlan> <prio> <text>\n"
             "                quit\n", prog);
@@ -371,6 +371,8 @@ static void parse_args(int argc, char **argv, struct in_addr *ip, long *port)
             opt.quiet = true;
         } else if (strcmp(argv[i], "--die-midframe") == 0) {
             opt.die_midframe = true;
+        } else if (strcmp(argv[i], "--sniff") == 0) {
+            opt.sniff = true;
         } else if (strcmp(argv[i], "--flood") == 0) {
             if (i + 1 >= argc || parse_long(argv[i + 1], 0, 1000000000L, &opt.flood_count) < 0) {
                 fprintf(stderr, "host: --flood needs a number N >= 0\n");
@@ -393,6 +395,10 @@ static void parse_args(int argc, char **argv, struct in_addr *ip, long *port)
     }
     if (opt.flood != have_to) {
         fprintf(stderr, "host: --flood and --to must be used together\n");
+        exit(1);
+    }
+    if (opt.sniff && (opt.noread || opt.partial || opt.die_midframe || opt.flood)) {
+        fprintf(stderr, "host: --sniff only prints: it cannot be combined with --noread, --partial, --die-midframe or --flood\n");
         exit(1);
     }
 }
@@ -437,6 +443,13 @@ int main(int argc, char **argv)
             snprintf(text, sizeof text, "flood %ld", i);
             send_or_die(opt.flood_to, DEFAULT_VLAN, 1, text);
         }
+    }
+
+    if (opt.sniff) {
+        /* A sniffer sends nothing and reads no commands (its stdin may be /dev/null): the receiver thread prints every frame; this thread sleeps
+         * in pause() until a signal ends the program or the switch closes the connection (the receiver then calls host_finish). */
+        for (;;)
+            pause();
     }
 
     command_loop();         /* returns on quit or on end of stdin */

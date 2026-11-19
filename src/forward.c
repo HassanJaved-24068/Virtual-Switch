@@ -8,6 +8,7 @@
  * a frame whose VLAN is outside 1..4094 (counted). A frame is then sent only to UP ports that are the trunk or
  * have that VLAN, for unicast and flooding alike, and the MAC lookup is keyed by (VLAN, MAC). The frame is
  * never copied: it is shared by every output queue, so the zero-copy broadcast is kept.
+ * Part 17: port mirroring (mirror_copy): copies of the traffic of a mirrored port are queued to its sniffer port.
  */
 #include "forward.h"
 
@@ -20,14 +21,40 @@
 /* Log a "queue full" message for the 1st drop and then every 1000th. */
 #define DROP_LOG_EVERY 1000
 
+/*
+ * Part 17: send one mirrored copy of f for port x (roadmap: frame_ref + outq_try_push). The caller holds the ports_lock read lock, so the states cannot change
+ * under us. The sniffer s = x.mirror_to gets the SAME frame (one more reference, no copy) if it is UP and is not the ingress port of this frame; the VLAN is
+ * ignored on purpose. Success counts "mirrored" on x; a full queue of the sniffer unrefs and counts "dropped" on s: the copy goes into the sniffer's own bounded
+ * queue, so a slow sniffer can only lose copies, it never slows x. There is no de-duplication: a sniffer that is itself in the VLAN of the mirrored traffic
+ * receives a flooded frame twice (once normally, once mirrored); give the sniffer its own VLAN to see every frame once.
+ */
+static void mirror_copy(const port_t *x, int ingress, frame_t *f, unsigned long long *drops)
+{
+    const int s = atomic_load(&x->mirror_to);
+
+    if (s <= 0 || s > sw.num_ports || s == ingress || sw.ports[s].state != PORT_UP)
+        return;
+    frame_ref(f);
+    if (outq_try_push(&sw.ports[s].q, f)) {
+        stats_inc(x->id, STAT_MIRROR);
+    } else {
+        frame_unref(f);
+        unsigned long long n = stats_inc(s, STAT_DROP);
+        if (n == 1 || n % DROP_LOG_EVERY == 0)
+            drops[s] = n;
+    }
+}
+
 enum learn_rc forward_frame(port_t *in_port, frame_t *f)
 {
     unsigned long long drops[MAX_PORTS + 1];     /* counts worth logging, 0 = nothing */
+    bool sent[MAX_PORTS + 1];                    /* Part 17: the ports whose queue took the frame (their mirroring, direction (b)) */
     struct mac_move move;
     enum learn_rc lr = LEARN_OK;
     bool first_bad_prio = false;
 
     memset(drops, 0, sizeof drops);
+    memset(sent, 0, sizeof sent);
     move.moved = false;
 
     /* The read lock keeps ports from being torn down while we use their queues. */
@@ -97,8 +124,16 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
             unsigned long long n = stats_inc(i, STAT_DROP);
             if (n == 1 || n % DROP_LOG_EVERY == 0)
                 drops[i] = n;
+        } else {
+            sent[i] = true;
         }
     }
+
+    /* Part 17, mirroring: "all traffic of port X" = (a) every frame received on X and (b) every frame successfully queued to X. */
+    mirror_copy(in_port, in_port->id, f, drops);                             /* (a) */
+    for (int i = 1; i <= sw.num_ports; i++)
+        if (sent[i])
+            mirror_copy(&sw.ports[i], in_port->id, f, drops);                /* (b) */
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
 
     /* Logging is done after the lock is released. */

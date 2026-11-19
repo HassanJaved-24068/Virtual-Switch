@@ -352,19 +352,18 @@ static const char *execute(const admin_cmd_t *c, obuf_t *out, int *cleared)
             ob_printf(out, "port %d: VLAN %d\n", c->port, c->arg);
         return why;
     }
-    case CMD_MIRROR:
-        /* Validation that needs the switch's state (the roadmap, Part 17: the sniffer is not the trunk). */
-        config_t cfg;
-        config_snapshot(&cfg);
-        bool trunk = cfg.trunk_port == c->arg;
-        CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
-        trunk = trunk || sw.ports[c->arg].trunk;
-        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
-        if (trunk)
-            return "the sniffer port is the trunk";
-        return "not implemented yet (Part 17)";
-    case CMD_MIRROR_OFF:
-        return "not implemented yet (Part 17)";
+    case CMD_MIRROR: {
+        const char *why = admin_mirror(c->port, c->arg);
+        if (why == NULL)
+            ob_printf(out, "port %d mirrored to port %d\n", c->port, c->arg);
+        return why;
+    }
+    case CMD_MIRROR_OFF: {
+        const char *why = admin_mirror_off(c->port);
+        if (why == NULL)
+            ob_printf(out, "port %d is not mirrored\n", c->port);
+        return why;
+    }
     }
     return "internal error";
 }

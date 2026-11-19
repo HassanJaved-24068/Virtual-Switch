@@ -45,7 +45,7 @@ typedef struct port {
     uint16_t vlan_admin;       /* Part 16: VLAN set by "swctl vlan" (0 = none). Survives teardown, so a free port keeps it for the next host; a
                                 * configuration reload that changes this port's VLAN clears it. Protected by sw.ports_lock. */
     bool trunk;
-    _Atomic int mirror_to;     /* used from Part 17 */
+    _Atomic int mirror_to;     /* Part 17: the sniffer port that gets a copy of this port's traffic, 0 = off (changed under the write lock) */
     _Atomic int mac_count;     /* used from Part 6 */
     _Atomic unsigned long bad_prio;  /* Part 11: frames received with a priority above 2 (queued as low) */
     pthread_t rx;              /* receiver thread: reads frames and forwards them */
@@ -215,6 +215,19 @@ void port_apply_rate(int id, int rate);
  *                   its MAC entries of the old VLAN are flushed.
  *   admin_clear_mac mac_clear(): buckets one at a time, ascending; returns how many entries were removed.
  */
+
+/*
+ * Port mirroring (Part 17). admin_mirror(x, s): every frame received on port x and every frame successfully queued to port x is also queued to the
+ * sniffer port s (forward.c, mirror_copy: the same shared frame, no copy, VLAN filtering ignored, never back to the frame's own ingress port; there is no
+ * de-duplication: a sniffer that also got the frame normally receives it twice). The copy goes into s's own bounded queue, so a slow sniffer only drops on s
+ * and never slows x.
+ * Both ports must be UP (the mirroring lives as long as both hosts do) and x != s; s must not be the trunk. When x or s goes down the reaper clears every
+ * reference to it under the write lock, in the same step that changes the state. admin_mirror_off(x) switches it off (OK if it was off).
+ * Both return NULL on success or a static error text.
+ */
+const char *admin_mirror(int x, int s);
+const char *admin_mirror_off(int x);
+
 #define ADMIN_DOWN_TIMEOUT_MS 5000
 const char *admin_shutdown(int id);
 const char *admin_up(int id);

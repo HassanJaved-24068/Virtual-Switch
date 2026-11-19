@@ -274,8 +274,18 @@ static void teardown_port(port_t *p)
         p->vlan = p->vlan_admin;                         /* Part 16: a VLAN set with swctl stays with the port */
     stats_set_state(id, final_state);                    /* Part 14 */
     stats_set_vlan(id, p->vlan);                         /* port_reset restored the default VLAN */
-    stats_set_mirror(id, atomic_load(&p->mirror_to));
+    stats_set_mirror(id, atomic_load(&p->mirror_to));    /* port_reset cleared this port's own mirroring (0) */
+    /* Part 17: no port may keep sending copies to this one, in the same locked step that changes its state. */
+    int cleared[MAX_PORTS + 1], ncleared = 0;
+    for (int i = 1; i <= sw.num_ports; i++)
+        if (atomic_load(&sw.ports[i].mirror_to) == id) {
+            atomic_store(&sw.ports[i].mirror_to, 0);
+            stats_set_mirror(i, 0);
+            cleared[ncleared++] = i;
+        }
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    for (int k = 0; k < ncleared; k++)
+        log_msg(LOG_INFO, "port %d: mirroring to port %d stopped (port %d went down)", cleared[k], id, id);
 
     /* 9. A FREE port gives its token back. A DISABLED port keeps it (it
      *    stays out of circulation until an admin brings the port up). */
@@ -667,4 +677,43 @@ const char *admin_vlan(int id, int vlan)
 int admin_clear_mac(void)
 {
     return mac_clear();
+}
+
+const char *admin_mirror(int x, int s)
+{
+    config_t cfg;
+
+    if (x == s)
+        return "a port cannot mirror to itself";
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    config_snapshot(&cfg);                                /* config_lock is a leaf: fine under ports_lock */
+    const port_t *px = &sw.ports[x], *ps = &sw.ports[s];
+    const char *why = NULL;
+
+    if (ps->trunk || cfg.trunk_port == s)
+        why = "the sniffer port is the trunk";
+    else if (px->state != PORT_UP)
+        why = "the mirrored port has no host (it is not UP)";
+    else if (ps->state != PORT_UP)
+        why = "the sniffer port has no host (start the sniffer first: it is not UP)";
+    else {
+        atomic_store(&sw.ports[x].mirror_to, s);
+        stats_set_mirror(x, s);
+    }
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    if (why == NULL)
+        log_msg(LOG_INFO, "port %d: mirrored to port %d by an admin", x, s);
+    return why;
+}
+
+const char *admin_mirror_off(int x)
+{
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    const int was = atomic_load(&sw.ports[x].mirror_to);
+    atomic_store(&sw.ports[x].mirror_to, 0);
+    stats_set_mirror(x, 0);
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    if (was != 0)
+        log_msg(LOG_INFO, "port %d: mirroring to port %d switched off by an admin", x, was);
+    return NULL;
 }

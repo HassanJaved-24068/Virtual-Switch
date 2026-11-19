@@ -57,3 +57,6 @@ not a lock (its operations are non-blocking where a lock is held; the only block
 | `vlan` | write `ports_lock` (+ `config_lock` as a leaf, + `stats`), release; then `mac_flush_port` (bucket locks, one at a time, no other lock) |
 | `clear mac` | `mac_clear`: the bucket locks one at a time, ascending, no other lock |
 | teardown (reaper) | no lock for the joins; `mac_flush_port` (bucket locks); write `ports_lock` for the reset and the state; `port_down_lock` (leaf) for the notification |
+| `mirror <x> <s>` / `mirror <x> off` | write `ports_lock`: both states checked, `mirror_to` stored (atomic), `config_lock` (leaf) for the trunk test, `stats` (last), release |
+| mirroring in `forward_frame` | under the `ports_lock` READ lock the receiver reads `mirror_to` (atomic), checks that the sniffer is UP and takes one queue lock at a time (`outq_try_push`, never blocks); the drop is counted with `stats` (last) |
+| clearing the references (reaper, last step of a teardown) | the same write-locked step that changes the state of the port: every `mirror_to` equal to the port is set to 0, so nothing can queue to a port that is not UP |

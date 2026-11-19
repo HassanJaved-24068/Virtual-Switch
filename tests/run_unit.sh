@@ -1,12 +1,12 @@
 #!/bin/bash
-# Parts 1-16 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-17 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
         build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
         build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan \
-        build/test_admin build/test_admin_tsan build/test_swctl || exit 1
+        build/test_admin build/test_admin_tsan build/test_swctl build/test_mirror build/test_mirror_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -115,4 +115,13 @@ if command -v valgrind >/dev/null; then
     run python3 tests/test_reconfig.py valgrind                            # Part 16: no errors, no leaks, no descriptor left open
 fi
 
-echo "Parts 1-16 unit and regression tests passed."
+run ./build/test_mirror                   # Part 17: mirroring without sockets: both directions, the same frame, VLAN ignored, not back to the ingress port, full sniffer queue, threads
+run $NOASLR ./build/test_mirror_tsan      # Part 17: the same under ThreadSanitizer
+run python3 tests/test_mirror.py          # Part 17: the real switch: what the sniffer receives, errors, mirroring ends with either host, a stuck sniffer, ./host --sniff, SIGINT, storm
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_mirror.py tsan   # Part 17: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_mirror.py valgrind                              # Part 17: no errors, no leaks, no descriptor left open
+    run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_mirror
+fi
+
+echo "Parts 1-17 unit and regression tests passed."
