@@ -370,18 +370,23 @@ def test_quiet():
 
 def test_sigpipe():
     print("host: SIGPIPE is ignored")
-    f = Fake("--noread")
-    # close the switch side with a reset, then keep sending
-    f.conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-    f.conn.close()
-    time.sleep(0.1)
-    for _ in range(5):
-        try:
-            f.say("send bcast after-close\n")
-        except BrokenPipeError:
+    # Once in about 7 runs on a loaded machine the host's own connect() ended in "Connection reset by peer" (environment: the fake switch's ephemeral port; notes/bugs.md
+    # item 36): then the host never got to send and the checks below say nothing about SIGPIPE. That attempt is repeated (at most 3 times); a real failure still fails.
+    for attempt in range(3):
+        f = Fake("--noread")
+        # close the switch side with a reset, then keep sending
+        f.conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        f.conn.close()
+        time.sleep(0.1)
+        for _ in range(5):
+            try:
+                f.say("send bcast after-close\n")
+            except BrokenPipeError:
+                break
+            time.sleep(0.05)
+        rc, out, err = f.finish()
+        if "host: connect to" not in err:
             break
-        time.sleep(0.05)
-    rc, out, err = f.finish()
     check(rc != -signal.SIGPIPE, "host was not killed by SIGPIPE (rc=%r)" % rc)
     check(rc == 1, "host exits with code 1 after a failed send (rc=%r)" % rc)
     check("send failed" in err, "error message printed: %r" % err.strip()[:80])

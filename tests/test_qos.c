@@ -479,6 +479,41 @@ static double starvation_run(long aging_ms, double limit_s)
     return got;
 }
 
+/* No-aging control, deterministic: weights 1000:1:1, the high ring is kept non-empty by the consumer itself. Returns the number of frames popped before the low frame, or 2000
+ * if it did not come within 2000 pops. */
+static int control_run(void)
+{
+    static const int w1000[3] = {1000, 1, 1};
+    outq_t q;
+    int n = 2000;
+
+    outq_set_sched(w1000, NEVER_AGE);
+    CHECK_PT(outq_init(&q, 64));
+    for (int i = 0; i < 32; i++) {
+        frame_t *f = mkf(0, 1);
+
+        if (!outq_try_push(&q, f))
+            frame_unref(f);
+    }
+    CHECK_PT(outq_try_push(&q, mkf(2, 777)) ? 0 : EINVAL);
+    for (int i = 0; i < 2000; i++) {
+        int tag = 0;
+        frame_t *f = mkf(0, 1);
+
+        if (pop_class(&q, &tag) == OUTQ_LOW && tag == 777) {
+            n = i;
+            frame_unref(f);
+            break;
+        }
+        if (!outq_try_push(&q, f))
+            frame_unref(f);
+    }
+    outq_close(&q);
+    outq_drain(&q);
+    outq_destroy(&q);
+    return n;
+}
+
 static void test_starvation(void)
 {
     printf("continuous high traffic: with 1000:1:1 and aging 200 ms a low frame still leaves within about 200 ms + one write\n");
@@ -488,11 +523,13 @@ static void test_starvation(void)
     printf("  low frame left after %.0f ms\n", t * 1000);
     EXPECT(t >= 0 && t < 0.200 + 0.003 + 0.4);       /* aging time + one write + scheduling slack (slow variants) */
     EXPECT(t >= 0.15);                               /* and not earlier than the aging time: it did not jump the queue by weight */
-    /* control: without aging the weights alone would make it wait for ~1000 high frames (3+ s) */
-    double c = starvation_run(NEVER_AGE, 1.2);
+    /* control: without aging the weights alone make the low frame wait for ~1000 high frames. Counted in frames, not in seconds (a wall-clock window made this check
+     * depend on the load of the machine: a starved producer lets the high ring run dry and the low frame is then legitimately taken; notes/bugs.md item 38).
+     * One thread: after every pop a new high frame is pushed, so the high ring is never empty. */
+    int n_before = control_run();
 
-    printf("  control (no aging): %s\n", c < 0 ? "not sent within 1.2 s" : "sent");
-    EXPECT(c < 0);
+    printf("  control (no aging): the low frame left after %d high frames\n", n_before);
+    EXPECT(n_before > 500);
     outq_set_sched(W531, 200);
     EXPECT(frame_live_count() == base);
 }

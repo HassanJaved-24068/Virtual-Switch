@@ -102,4 +102,4 @@ live reconfiguration (`shutdown`, `up`, `vlan`, `clear mac`); port mirroring; th
 of global vs striped vs rwlock locking with a graph and a one-page report (`bench/report.pdf`).
 
 **Verification:** `make test`, `make test-tsan` and `make test-valgrind` all pass on a clean tree (see `docs/Parts_16_to_20_Completion_Report.md` section 10 and `docs/Part22_Final_Check.md`).
-Known limits: the roadmap v2 PDF was not available (v1 used); `test_host.py` (Part 2) and `test_qos.c` (Part 11) are load-sensitive and can fail spuriously on a busy 2-core machine (items 36 and 38).
+Known limit: the roadmap v2 PDF was not available (v1 used). Two historical tests that were sensitive to machine load (`test_host.py`, `test_qos.c`) were made robust afterwards (notes/bugs.md items 36 and 38).

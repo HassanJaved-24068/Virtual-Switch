@@ -513,7 +513,7 @@ program that ignores SIGINT.
   its start; it had only passed because the binary had been built by hand. A clean checkout's `make test` would have failed at `./build/test_macshm: No such file`. The Part 20 commit (5266fbc)
   therefore has this gap; fixed in the Part 21 commit by adding both programs to the build line. Lesson: run `make clean` before the final full verification of every part.
 
-## 36. Part 2's test_host.py: one run in about 7 failed (test-side, environment; NOT changed: historical tests are not edited)
+## 36. Part 2's test_host.py: one run in about 7 failed (test-side, environment; fixed in the test with the owner's approval)
 - Symptom (once, during the Part 21 verification, right after `make clean` and a full rebuild): `FAIL: error message printed: 'host: connect to 127.0.0.1:<port> failed: Connection reset by peer'`.
   The test connects to a port that nobody listens on and expects a "refused" message; 6 further runs on their own passed (109 checks).
 - Likely cause (not proven): the "closed" port comes from the ephemeral range; on a loaded machine another connection can briefly own it, and the connect then ends in a reset instead of a refusal.
@@ -529,9 +529,17 @@ program that ignores SIGINT.
 - Handling: the historical test is not edited; the two variant runs in tests/run_unit.sh use TSAN_OPTIONS=report_destroy_locked=0, which switches off exactly that report kind and nothing else.
   The robust recovery of the global lock itself (lock_robust on `global_lock`) is therefore not exercised at unit level; it is the same helper that the bucket locks use.
 
-## 38. Part 11's test_qos.c control check failed once under load (test-side, timing; NOT changed: historical tests are not edited)
+## 38. Part 11's test_qos.c control check failed once under load (test-side, timing; fixed in the test with the owner's approval)
 - Symptom (once, in the 4th full `make test` of the Part 21 verification, a clean rebuild with the desktop's indexers running): `FAIL line 495: c < 0` ("control (no aging)": the low-priority frame was
   SENT within 1.2 s although, without aging, 5:3:1 weights make it wait for about 1000 high frames). 8 consecutive runs on their own passed (1293 checks each); queue.c, queue.h and the test are unchanged.
 - Likely cause (not proven): the producers of the high-priority frames are ordinary threads; on a busy machine they are starved, the high queue runs dry and the low frame is then legitimately taken.
   Proposed fix, for the owner to approve: count the frames sent before the low one (the weights are the claim) instead of using a wall-clock window.
 - Together with items 34 (fixed with approval) and 36, this is the third historical test that is sensitive to machine load; the full suite is therefore only meaningful on a quiet machine.
+
+### Correction and fixes of items 36 and 38 (applied with the owner's approval, Part 22 follow-up)
+- Item 36: the check that failed is `check("send failed" in err, "error message printed: ...")` of `test_sigpipe` (tests/test_host.py), not the "connection refused" test as written above: the host's own connect to
+  the fake switch ended in "Connection reset by peer", so it never sent anything. The cause is still unproven and the failure could NOT be reproduced again (10 quiet runs and 25 runs next to 4 CPU burners: 0 failures).
+  Fix: `test_sigpipe` repeats the attempt (at most 3 times) when the host's stderr says `host: connect to`; any other outcome is checked as before. This hides the environmental reset only.
+- Item 38: the control check of `test_starvation` (tests/test_qos.c) no longer uses a producer thread and a 1.2 s window. `control_run()` is single-threaded: the consumer refills the high ring after every pop and
+  counts the frames popped before the low frame. With weights 1000:1:1 and no aging it is exactly 1000 on every run; the check is `n_before > 500`. Normal, TSan and valgrind: 1293 checks, 0 failures; 10 runs next to
+  4 CPU burners: 10 x 1293/0.
