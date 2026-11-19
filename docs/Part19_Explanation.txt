@@ -1,0 +1,54 @@
+=====================================================================
+PART 19 - BONUS: TWO SWITCHES JOINED BY A TWO-PIPE TRUNK
+=====================================================================
+
+1. WHAT THE ROADMAP ASKS
+------------------------
+./switch <tcpA> <num_ports> --pair <tcpB> [-c a.conf] [--peer-config b.conf]: two pipes, fork; the child is switch B (own TCP port, shm, socket, log named by its TCP port),
+the parent is A. Each side attaches its pipe ends to port 0 as a trunk with rfd != wfd. A uses pipe1 to write and pipe2 to read, B the opposite; each closes the two unused
+ends right after the fork. Port 0 uses the same receiver, sender, queue, VLAN and trunk logic, is not counted in num_ports or the semaphore, is exempt from port security, is not
+reachable by accept. Learning across the link is automatic. A dead peer: EOF / EPIPE, port 0 DISABLED and logged, the local switch keeps working. SIGINT reaches both; A calls
+waitpid for B. The child resets the signal mask and set-up exactly like main; fork before creating any thread.
+
+2. WHAT WAS DONE (files)
+------------------------
+src/switch.c   option parsing (-c, --pair, --peer-config in any order, each at most once); both configuration files are validated BEFORE the fork; make_pair() (pipe2 O_CLOEXEC, fork,
+               each side closes its two unused ends; the child calls signal_setup() again, sets PR_SET_PDEATHSIG so that B stops if A is killed); B's TCP port, config, log file
+               (A's log name + ".<tcpB>") and shared-counter name (/vswitch_stats_P_<tcpB>); port_attach_pipe() after all threads exist; reap_peer() after A's own shutdown
+               (SIGTERM, poll() on a pidfd with a 15 s limit, SIGKILL if B does not leave, waitpid, status logged); request_down_all_ports() includes port 0.
+src/port.c     port_attach_pipe(); port 0 always ends DISABLED (request_down_locked); a pipe port is woken by an eventfd (pipe_wait: poll on {pipe, eventfd}) in the receiver and the sender,
+               and its teardown closes both pipe ends and the eventfd; no semaphore token for port 0.
+src/forward.c  the loops start at port 0 (never UP in a single switch, so nothing changes there); a unicast to a MAC behind port 0 is valid.
+src/admin.c    show ports lists port 0 in a pair.            src/swctl.c   stats lists row 0 once attached; -p N tries /vswitch_stats_P_N first.
+include/port.h wake_fd, paired, port_attach_pipe.            include/stats.h  STATS_SHM_PAIR_FMT.
+tests/test_pair.py (permanent, in tests/run_unit.sh: normal, TSan, valgrind), tests/test_part19.py (TEMPORARY dedicated runner, deleted when Part 20 starts).
+README.md, notes/locks.md (port 0 adds no lock), docs/Part19_Explanation.txt.
+
+3. DESIGN DECISIONS
+-------------------
+* Pipes cannot be shutdown(): a receiver blocked in read() on a pipe would never wake for a local teardown. Both threads of port 0 therefore wait in poll() on {pipe, eventfd}; the
+  reaper writes the eventfd. A frame is one write() of at most 1517 bytes (< PIPE_BUF), which is atomic: once poll() says readable, the whole frame is there, so the following
+  read_full() cannot block on a half-sent frame. A sender polls POLLOUT first, so a stalled peer (full pipe) cannot keep it in write() when the teardown comes.
+* A peer that does not exit when A shuts down (SIGSTOPped, hung) must not hang A: poll() on a pidfd, 15 s, then SIGKILL. No sleeping, no spinning.
+* PR_SET_PDEATHSIG: a B whose A was killed with SIGKILL gets SIGTERM and shuts down cleanly (the signal is blocked and taken by B's signal thread).
+* Port 0 ends DISABLED, never FREE: nobody can connect to it, and there is no token to give back.
+* No lock is new; fork() happens before any lock or thread exists.
+
+4. TESTS (tests/test_pair.py, 76 checks per variant)
+----------------------------------------------------
+forwarding across the link in VLAN 10 and VLAN 20, no echo, vlan field kept, 1500-byte payload, show mac / show ports / stats rows for port 0, both shm segments and sockets,
+swctl -p <B>; port 0 exempt from port security (12 MACs behind it with a limit of 3); SIGINT to the process group, to A only, SIGTERM to B only; kill -9 B (A keeps switching, reports
+the signal); kill -9 A (B follows); SIGSTOP B while A floods (A exits, B killed after the grace period); a flood across the link then SIGINT; 6 bad command lines.
+
+5. RESULTS
+----------
+make (clean build, -Werror): no warnings. Final runs on 2026-11-19 after the last code change:
+  tests/test_pair.py   normal 76/76, TSan 76/76, valgrind 76/76 (both processes of the pair instrumented)
+  make test            EXIT 0   unit + regression suite of Parts 1-19 (incl. test_pair.py in 3 variants, static_checks.py), 20 integration scripts passed
+  make test-tsan       EXIT 0   19 integration scripts passed, no ThreadSanitizer report
+  make test-valgrind   EXIT 0   19 integration scripts passed (idle.sh skipped), no valgrind error or leak
+  static_checks.py: no sleeping call, no ignored call result in the new code (pidfd_open / poll / waitpid / close all checked).
+Defects found in the switch while testing: none. Test-side mistake: the first two A hosts land on ports 1 and 2, which the test configuration had put in different VLANs
+(3 checks failed until the test used a configuration with both in VLAN 10).
+Limitations: one link only (no spanning tree); swctl -p <B> stats falls back to the fixed segment name if B's own segment is absent (it then reads A's); the file names of the
+configuration (mac_dump_file) are shared by A and B unless --peer-config changes them.

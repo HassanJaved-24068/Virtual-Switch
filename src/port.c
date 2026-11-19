@@ -10,7 +10,9 @@
 #include "reload.h"
 #include "stats.h"
 
+#include <poll.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -63,6 +65,7 @@ void port_reset(port_t *p)
 {
     p->rfd = -1;
     p->wfd = -1;
+    p->wake_fd = -1;
     p->vlan = DEFAULT_VLAN;
     p->trunk = false;
     atomic_store(&p->mirror_to, 0);          /* atomic: other threads may read these */
@@ -194,7 +197,7 @@ static bool request_down_locked(port_t *p, enum port_state final_state)
 
     p->state = PORT_CLOSING;                             /* UP -> CLOSING */
     atomic_store(&p->closing, true);                     /* Part 18: the receiver must not work through the socket's backlog any more */
-    p->final_state = final_state;
+    p->final_state = p->id == 0 ? PORT_DISABLED : final_state;   /* Part 19: the link to the peer never becomes FREE (nobody can connect to it) */
     stats_set_state(p->id, PORT_CLOSING);                /* Part 14 */
 
     /* Lock order: ports_lock (1) first, then the reaper lock (4). */
@@ -224,6 +227,8 @@ static void teardown_port(port_t *p)
 {
     const int id = p->id;
     const int fd = p->rfd;
+    const int wfd = p->wfd;
+    const int wake = p->wake_fd;
     const enum port_state final_state = p->final_state;
     int rc;
 
@@ -235,8 +240,13 @@ static void teardown_port(port_t *p)
 
     /* 3. Wake a receiver blocked in read() and a sender blocked in write()
      *    to a frozen host. */
-    if (shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+    if (wake >= 0) {                                     /* Part 19: a pipe port: shutdown() does not work on a pipe; the eventfd wakes both threads (poll) */
+        const uint64_t one = 1;
+        if (write(wake, &one, sizeof one) < 0)
+            log_msg(LOG_WARN, "port %d: waking the pipe threads failed: %s", id, strerror(errno));
+    } else if (shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN) {
         log_msg(LOG_WARN, "port %d: shutdown failed: %s", id, strerror(errno));
+    }
 
     /* 4. Join both threads. No lock is held here. */
     if (p->rx_started) {
@@ -265,6 +275,12 @@ static void teardown_port(port_t *p)
      *    descriptor number cannot be reused while a thread could still use it. */
     if (close(fd) < 0)
         log_msg(LOG_WARN, "port %d: close failed: %s", id, strerror(errno));
+    if (wake >= 0) {                                     /* Part 19: the other pipe end (closing it gives the peer its EOF / EPIPE) and the eventfd */
+        if (close(wfd) < 0)
+            log_msg(LOG_WARN, "port %d: close of the write pipe failed: %s", id, strerror(errno));
+        if (close(wake) < 0)
+            log_msg(LOG_WARN, "port %d: close of the wake eventfd failed: %s", id, strerror(errno));
+    }
 
     /* 8. Reset the slot and set the final state. The state is set BEFORE the
      *    token is posted: a host that gets the token must find the port FREE. */
@@ -375,6 +391,25 @@ bool port_wait_down(int id, unsigned long since, long timeout_ms)
 /* ------------------------------------------------------------------ */
 
 /*
+ * Part 19, pipe ports: wait until `fd` is ready for `events` or the wake eventfd fires. Returns true when `fd` is ready (also on POLLHUP / POLLERR: the
+ * following read or write reports EOF / EPIPE), false when the wake fired (errno = 0) or poll failed (errno set). A frame is written with ONE write of at most
+ * PIPE_BUF bytes, which is atomic: once a frame has started to arrive, the rest is there, so the read after this wait does not block on a half-sent frame.
+ */
+static bool pipe_wait(int fd, short events, int wake_fd)
+{
+    struct pollfd pfd[2] = {{.fd = fd, .events = events}, {.fd = wake_fd, .events = POLLIN}};
+
+    for (;;) {
+        if (poll(pfd, 2, -1) >= 0)
+            break;
+        if (errno != EINTR)
+            return false;
+    }
+    errno = 0;
+    return !(pfd[1].revents & POLLIN) && pfd[0].revents != 0;
+}
+
+/*
  * Reads frames, counts them, logs them and floods them to the other ports.
  * It never writes to a socket and never waits for queue space. When the host
  * is gone or sends something invalid it asks for the teardown and returns:
@@ -395,6 +430,14 @@ void *receiver_main(void *arg)
     for (;;) {
         if (atomic_load(&p->closing))
             return NULL;                               /* the teardown was requested (by anybody): the reaper joins us; nothing more is read or forwarded */
+        if (p->wake_fd >= 0 && !pipe_wait(p->rfd, POLLIN, p->wake_fd)) {
+            if (atomic_load(&p->closing))
+                return NULL;                           /* Part 19: woken by the teardown */
+            log_msg(LOG_ERR, "port %d: poll failed: %s", p->id, strerror(errno));
+            if (port_request_down(p, PORT_DISABLED))
+                log_msg(LOG_ERR, "port %d: link to the peer closed after a poll error", p->id);
+            return NULL;
+        }
         frame_t *f = frame_new();
         if (f == NULL) {
             log_msg(LOG_ERR, "port %d: out of memory for a frame, closing the host", p->id);
@@ -488,6 +531,12 @@ void *sender_main(void *arg)
         log_msg(LOG_WARN, "port %d: cannot set sender thread name: %s", p->id, strerror(rc));
 
     while (outq_pop(&p->q, &f)) {
+        if (p->wake_fd >= 0 && !pipe_wait(fd, POLLOUT, p->wake_fd)) {   /* Part 19: a stalled peer must not keep this thread in write() when the teardown comes */
+            frame_unref(f);
+            if (!atomic_load(&p->closing) && port_request_down(p, PORT_DISABLED))
+                log_msg(LOG_ERR, "port %d: poll failed: %s", p->id, strerror(errno));
+            break;
+        }
         int wr = write_full(fd, f->wire, (size_t)HDR_LEN + f->len);
         int err = errno;
 
@@ -724,4 +773,51 @@ const char *admin_mirror_off(int x)
     if (was != 0)
         log_msg(LOG_INFO, "port %d: mirroring to port %d switched off by an admin", x, was);
     return NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* Part 19: port 0, the pipe trunk to the peer switch                  */
+/* ------------------------------------------------------------------ */
+
+int port_attach_pipe(int rfd, int wfd)
+{
+    port_t *p = &sw.ports[0];
+    int err;
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    port_reset(p);
+    p->rfd = rfd;
+    p->wfd = wfd;
+    p->rx_started = false;
+    p->vlan = DEFAULT_VLAN;
+    p->trunk = true;                                     /* keeps the VLAN of every frame; exempt from port security (mactable.c) */
+    p->wake_fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    err = p->wake_fd < 0 ? errno : outq_init(&p->q, sw.queue_capacity);
+    if (err != 0) {
+        if (p->wake_fd >= 0 && close(p->wake_fd) < 0)
+            log_msg(LOG_WARN, "port 0: close of the wake eventfd failed: %s", strerror(errno));
+        port_reset(p);
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return err;
+    }
+    outq_set_rate(&p->q, 0);                             /* the link is not rate limited */
+    err = pthread_create(&p->tx, NULL, sender_main, p);
+    if (err != 0) {
+        outq_destroy(&p->q);
+        if (close(p->wake_fd) < 0)
+            log_msg(LOG_WARN, "port 0: close of the wake eventfd failed: %s", strerror(errno));
+        port_reset(p);
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return err;
+    }
+    p->state = PORT_UP;
+    stats_set_state(0, PORT_UP);
+    stats_set_vlan(0, p->vlan);
+    err = pthread_create(&p->rx, NULL, receiver_main, p);
+    if (err == 0)
+        p->rx_started = true;
+    else
+        request_down_locked(p, PORT_DISABLED);           /* the sender runs: the reaper cleans up (it joins only threads that exist) */
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    return err;                                          /* on failure the reaper owns the descriptors: the caller must not close them */
 }

@@ -171,26 +171,33 @@ typedef struct {
 } segment_t;
 
 /* Open and map the segment. Returns 0, EXIT_NOT_RUNNING (no segment) or EXIT_ERR; prints the reason. */
-static int segment_open(segment_t *s)
+static int segment_open(segment_t *s, int tcp_port)
 {
+    char name[64];
     s->page = stats_page_size();
     s->len = stats_shm_size(s->page);
     if (s->len == 0) {
         fprintf(stderr, "swctl: unusable page size\n");
         return EXIT_ERR;
     }
-    int fd = shm_open(STATS_SHM_NAME, O_RDWR, 0);     /* O_RDWR: a mutex cannot be locked through a read-only mapping */
+    /* The second switch of a --pair (Part 19) has a segment named by its TCP port; every other switch uses the fixed name. */
+    snprintf(name, sizeof name, STATS_SHM_PAIR_FMT, tcp_port);
+    int fd = shm_open(name, O_RDWR, 0);               /* O_RDWR: a mutex cannot be locked through a read-only mapping */
+    if (fd < 0 && errno == ENOENT) {
+        snprintf(name, sizeof name, "%s", STATS_SHM_NAME);
+        fd = shm_open(name, O_RDWR, 0);
+    }
     if (fd < 0) {
         if (errno == ENOENT) {
             fprintf(stderr, "swctl: switch not running (no shared-memory segment %s)\n", STATS_SHM_NAME);
             return EXIT_NOT_RUNNING;
         }
-        fprintf(stderr, "swctl: cannot open %s: %s\n", STATS_SHM_NAME, strerror(errno));
+        fprintf(stderr, "swctl: cannot open %s: %s\n", name, strerror(errno));
         return EXIT_ERR;
     }
     struct stat st;
     if (fstat(fd, &st) < 0 || (size_t)st.st_size != s->len) {
-        fprintf(stderr, "swctl: %s has the wrong size (%ld bytes, expected %zu)\n", STATS_SHM_NAME, (long)st.st_size, s->len);
+        fprintf(stderr, "swctl: %s has the wrong size (%ld bytes, expected %zu)\n", name, (long)st.st_size, s->len);
         xclose(fd);
         return EXIT_ERR;
     }
@@ -199,7 +206,7 @@ static int segment_open(segment_t *s)
     int e = errno;
     xclose(fd);
     if (c == MAP_FAILED || d == MAP_FAILED) {
-        fprintf(stderr, "swctl: cannot map %s: %s\n", STATS_SHM_NAME, strerror(e));
+        fprintf(stderr, "swctl: cannot map %s: %s\n", name, strerror(e));
         if (c != MAP_FAILED)
             xmunmap(c, s->page);
         if (d != MAP_FAILED)
@@ -253,7 +260,7 @@ static int print_stats(const segment_t *s)
     }
 
     printf("%-4s %-8s %-4s %12s %12s %12s %12s\n", "PORT", "STATE", "VLAN", "IN", "OUT", "DROPPED", "MIRRORED");
-    for (int i = 1; i <= nports; i++)
+    for (int i = copy[0].state != 0 ? 0 : 1; i <= nports; i++)    /* Part 19: row 0 = the pipe trunk of a --pair (shown once it has been attached) */
         printf("%-4d %-8s %-4d %12llu %12llu %12llu %12llu\n", i, state_name(copy[i].state), copy[i].vlan,
                (unsigned long long)copy[i].in, (unsigned long long)copy[i].out,
                (unsigned long long)copy[i].dropped, (unsigned long long)copy[i].mirrored);
@@ -268,10 +275,10 @@ static void on_sigint(int sig)
     stop_watch = 1;
 }
 
-static int cmd_stats(bool watch)
+static int cmd_stats(bool watch, int tcp_port)
 {
     segment_t seg;
-    int rc = segment_open(&seg);
+    int rc = segment_open(&seg, tcp_port);
     if (rc != 0)
         return rc;
 
@@ -349,9 +356,9 @@ int main(int argc, char **argv)
 
     if (strcmp(argv[i], "stats") == 0) {
         if (i + 1 == argc)
-            return cmd_stats(false);
+            return cmd_stats(false, tcp_port);
         if (i + 2 == argc && strcmp(argv[i + 1], "--watch") == 0)
-            return cmd_stats(true);
+            return cmd_stats(true, tcp_port);
         fprintf(stderr, "swctl: usage: stats [--watch]\n");
         return EXIT_ERR;
     }

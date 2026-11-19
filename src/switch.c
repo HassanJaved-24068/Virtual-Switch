@@ -2,7 +2,7 @@
  * switch.c - the switch program: argument parsing, listening socket and the
  * accept thread.
  *
- *   ./switch <tcp_port> <num_ports> [-c <config>]
+ *   ./switch <tcp_port> <num_ports> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]]
  *
  * Part 3: accept hosts, give each one a port and a receiver thread.
  * Part 4: every port also gets an output queue and a sender thread, and
@@ -26,12 +26,16 @@
 #include "sig.h"
 #include "stats.h"
 
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <semaphore.h>
 #include <signal.h>
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define LISTEN_BACKLOG 64
@@ -43,7 +47,7 @@
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "usage: %s <tcp_port 1-65535> <num_ports 1-%d> [-c <config>]\n",
+    fprintf(stderr, "usage: %s <tcp_port 1-65535> <num_ports 1-%d> [-c <config>] [--pair <tcp_port_b> [--peer-config <config_b>]]\n",
             prog, MAX_PORTS);
 }
 
@@ -288,7 +292,7 @@ static void *accept_main(void *arg)
 
 /* Which threads exist (and must be joined). Set only after a successful pthread_create. */
 typedef struct {
-    bool sig, reaper, aging, timer, accept, admin;
+    bool sig, reaper, aging, timer, accept, admin, link;     /* link: port 0 (Part 19) was attached */
     pthread_t sig_thread, accept_thread, timer_thread, admin_thread;
 } started_t;
 
@@ -303,7 +307,7 @@ static void request_down_all_ports(void)
      * leaves UP in between is already CLOSING and queued; port_request_down()
      * then simply returns false for it. */
     CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
-    for (int i = 1; i <= sw.num_ports; i++)
+    for (int i = 0; i <= sw.num_ports; i++)              /* i = 0: the pipe trunk of a --pair (Part 19), FREE and skipped otherwise */
         if (sw.ports[i].state == PORT_UP)
             up[n++] = i;
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
@@ -350,8 +354,8 @@ static void shutdown_switch(const started_t *st)
 
     /* 4. Every UP port goes to the reaper. */
     if (st->reaper) {
-        if (st->accept)
-            request_down_all_ports();      /* no port can be UP unless accept ran */
+        if (st->accept || st->link)
+            request_down_all_ports();      /* no port can be UP unless accept ran (or port 0 was attached) */
         /* 5.+6. The reaper finishes everything queued (also ports that were already
          *       CLOSING), then exits, and is joined. */
         reaper_finish();
@@ -379,12 +383,108 @@ static void shutdown_switch(const started_t *st)
     stats_destroy();
 }
 
+/*
+ * Part 19: --pair. Two pipes, then fork() BEFORE any thread exists (a thread would not survive the fork, and the child must start with the clean state
+ * and the signal set-up of main). The child becomes switch B (its own TCP port, admin socket, shared counters and log file, all named by its TCP port);
+ * the parent stays switch A. Each side closes the two pipe ends it does not use right away, so that EOF and EPIPE work when the peer dies. A writes pipe 1
+ * and reads pipe 2; B the opposite. Returns the child's pid in the parent (*link_r / *link_w = its ends), 0 in the child, -1 on error (reported).
+ */
+static pid_t make_pair(int *link_r, int *link_w)
+{
+    int p1[2], p2[2];                                    /* [0] read end, [1] write end */
+
+    if (pipe2(p1, O_CLOEXEC) < 0 || pipe2(p2, O_CLOEXEC) < 0) {
+        fprintf(stderr, "switch: cannot create the pipes for --pair: %s\n", strerror(errno));
+        return -1;
+    }
+    const pid_t parent = getpid();
+    const pid_t pid = fork();
+    if (pid < 0) {
+        fprintf(stderr, "switch: fork failed: %s\n", strerror(errno));
+        return -1;
+    }
+    if (pid == 0) {                                      /* switch B: reads pipe 1, writes pipe 2 */
+        if (close(p1[1]) < 0 || close(p2[0]) < 0) {
+            fprintf(stderr, "switch: close of the unused pipe ends failed: %s\n", strerror(errno));
+            _exit(EXIT_FAILURE);
+        }
+        *link_r = p1[0];
+        *link_w = p2[1];
+        /* If A dies without telling us (kill -9), B stops too instead of living on as an orphan. The signal is blocked and taken by the signal thread. */
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent) {
+            fprintf(stderr, "switch: the parent switch is gone\n");
+            _exit(EXIT_FAILURE);
+        }
+        return 0;
+    }
+    if (close(p1[0]) < 0 || close(p2[1]) < 0)            /* switch A: writes pipe 1, reads pipe 2 */
+        fprintf(stderr, "switch: close of the unused pipe ends failed: %s\n", strerror(errno));
+    *link_r = p2[0];
+    *link_w = p1[1];
+    return pid;
+}
+
+/* The log file of switch B: the path of A's log (the file of the configuration, or VSWITCH_LOG_FILE) with ".<tcp_port_b>" appended. */
+static void peer_log_path(char *out, size_t len, const char *base, long tcp_port_b)
+{
+    snprintf(out, len, "%s.%ld", base, tcp_port_b);
+}
+
+/*
+ * Switch A, after its own shutdown: stop switch B and wait for it (Part 19). B normally has SIGINT from the terminal already; SIGTERM makes it shut down
+ * even if it did not. The wait is a poll() on a pidfd with a time limit (no sleeping, no spinning): a peer that does not exit in PEER_EXIT_WAIT_MS (stopped
+ * with SIGSTOP, hung) is killed, so that A can never wait for ever. Then waitpid() reaps it and its fate is logged.
+ */
+#define PEER_EXIT_WAIT_MS 15000
+
+static void reap_peer(pid_t peer)
+{
+    int status = 0;
+
+    if (kill(peer, SIGTERM) < 0 && errno != ESRCH)
+        log_msg(LOG_WARN, "shutdown: cannot signal the peer switch (pid %ld): %s", (long)peer, strerror(errno));
+
+    int pidfd = (int)syscall(SYS_pidfd_open, peer, 0);
+    if (pidfd >= 0) {
+        struct pollfd pfd = {.fd = pidfd, .events = POLLIN};
+        int n;
+
+        do
+            n = poll(&pfd, 1, PEER_EXIT_WAIT_MS);
+        while (n < 0 && errno == EINTR);
+        if (n == 0) {
+            log_msg(LOG_WARN, "shutdown: the peer switch (pid %ld) did not exit within %d ms: killing it", (long)peer, PEER_EXIT_WAIT_MS);
+            if (kill(peer, SIGKILL) < 0 && errno != ESRCH)
+                log_msg(LOG_ERR, "shutdown: cannot kill the peer switch: %s", strerror(errno));
+        } else if (n < 0) {
+            log_msg(LOG_ERR, "shutdown: poll on the peer switch failed: %s", strerror(errno));
+        }
+        if (close(pidfd) < 0)
+            log_msg(LOG_WARN, "shutdown: close of the pidfd failed: %s", strerror(errno));
+    } else {
+        log_msg(LOG_WARN, "shutdown: pidfd_open failed (%s): waiting for the peer switch without a time limit", strerror(errno));
+    }
+    while (waitpid(peer, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        log_msg(LOG_ERR, "shutdown: waitpid of the peer switch failed: %s", strerror(errno));
+        return;
+    }
+    if (WIFEXITED(status))
+        log_msg(LOG_INFO, "shutdown: the peer switch (pid %ld) exited with status %d", (long)peer, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        log_msg(LOG_INFO, "shutdown: the peer switch (pid %ld) was killed by signal %d", (long)peer, WTERMSIG(status));
+}
+
 int main(int argc, char **argv)
 {
-    long tcp_port, num_ports;
-    const char *config = NULL;
+    long tcp_port, num_ports, tcp_port_b = 0;
+    const char *config = NULL, *peer_config = NULL;
     started_t st;
     int rc;
+    pid_t peer = -1;                       /* switch A: the pid of B (Part 19) */
+    int link_r = -1, link_w = -1;          /* the pipe ends of port 0 (Part 19) */
+    bool pair = false;
 
     memset(&st, 0, sizeof st);
 
@@ -396,9 +496,32 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    if ((argc != 3 && argc != 5) ||
-        (argc == 5 && strcmp(argv[3], "-c") != 0)) {
+    if (argc < 3) {
         usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    for (int i = 3; i < argc; i += 2) {    /* options, each with one value */
+        if (i + 1 >= argc) {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+        if (strcmp(argv[i], "-c") == 0 && config == NULL) {
+            config = argv[i + 1];
+        } else if (strcmp(argv[i], "--peer-config") == 0 && peer_config == NULL) {
+            peer_config = argv[i + 1];
+        } else if (strcmp(argv[i], "--pair") == 0 && !pair) {
+            if (parse_range(argv[i + 1], 1, 65535, &tcp_port_b) < 0) {
+                fprintf(stderr, "switch: bad TCP port '%s' for --pair (must be 1-65535)\n", argv[i + 1]);
+                return EXIT_FAILURE;
+            }
+            pair = true;
+        } else {
+            usage(argv[0]);
+            return EXIT_FAILURE;
+        }
+    }
+    if (peer_config != NULL && !pair) {
+        fprintf(stderr, "switch: --peer-config needs --pair\n");
         return EXIT_FAILURE;
     }
     if (parse_range(argv[1], 1, 65535, &tcp_port) < 0) {
@@ -409,8 +532,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "switch: bad number of ports '%s' (must be 1-%d)\n", argv[2], MAX_PORTS);
         return EXIT_FAILURE;
     }
-    if (argc == 5)
-        config = argv[4];
+    if (pair && tcp_port_b == tcp_port) {
+        fprintf(stderr, "switch: the two switches of a --pair need different TCP ports\n");
+        return EXIT_FAILURE;
+    }
 
     /*
      * The configuration (Part 10): the defaults, then the file given with -c. A file with ANY bad line is a
@@ -425,6 +550,30 @@ int main(int argc, char **argv)
                 cerr.count == 1 ? "" : "s");
         return EXIT_FAILURE;
     }
+    config_t cfg_b;                        /* switch B's configuration (Part 19), checked here so that a bad file stops BOTH before anything is created */
+
+    config_defaults(&cfg_b, (int)num_ports);
+    if (peer_config != NULL && config_load(peer_config, &cfg_b, &cerr) != 0) {
+        fprintf(stderr, "switch: configuration file '%s': %s (%d error%s)\n", peer_config, cerr.msg, cerr.count,
+                cerr.count == 1 ? "" : "s");
+        return EXIT_FAILURE;
+    }
+
+    if (pair) {
+        peer = make_pair(&link_r, &link_w);
+        if (peer < 0)
+            return EXIT_FAILURE;
+        if (peer == 0) {                   /* switch B: from here on a switch of its own. No thread exists yet; the signal set-up is done again exactly as in main */
+            rc = signal_setup();
+            if (rc != 0) {
+                fprintf(stderr, "switch: cannot set up signal handling: %s\n", strerror(rc));
+                return EXIT_FAILURE;
+            }
+            tcp_port = tcp_port_b;
+            config = peer_config;
+            cfg = cfg_b;
+        }
+    }
 
     switch_init((int)num_ports);
     config_install(&cfg);                  /* the live configuration; no other thread exists yet */
@@ -436,8 +585,14 @@ int main(int argc, char **argv)
      * The file is log_file of the configuration (default switch.log); the environment variable
      * VSWITCH_LOG_FILE, if set, overrides it (the tests give every switch its own file that way). */
     const char *log_path = getenv("VSWITCH_LOG_FILE");
+    char log_path_b[CONFIG_PATH_LEN + 16];
     if (log_path == NULL || *log_path == '\0')
         log_path = cfg.log_file;
+    if (pair && peer == 0) {               /* switch B: its own log file, named by its TCP port (A's name + ".<port>") */
+        peer_log_path(log_path_b, sizeof log_path_b, log_path, tcp_port_b);
+        log_path = log_path_b;
+    }
+    sw.paired = pair;
     rc = log_start(log_path);
     if (rc != 0) {
         fprintf(stderr, "switch: cannot open the log file '%s': %s\n", log_path, strerror(rc));
@@ -446,9 +601,14 @@ int main(int argc, char **argv)
 
     /* The shared counters come AFTER everything that can fail for an outside reason (the TCP port is in use...):
      * a switch that cannot start must not replace, or remove, the segment of one that is running. */
-    rc = stats_init((int)num_ports);               /* num_ports of the header = the ports of this switch (swctl stats shows exactly these) */
+    char stats_name[64];
+    if (pair && peer == 0)
+        snprintf(stats_name, sizeof stats_name, STATS_SHM_PAIR_FMT, (int)tcp_port_b);   /* B: named by its TCP port; A keeps the fixed name */
+    else
+        snprintf(stats_name, sizeof stats_name, "%s", STATS_SHM_NAME);
+    rc = stats_init_named(stats_name, (int)num_ports);   /* num_ports of the header = the ports of this switch (swctl stats shows exactly these) */
     if (rc != 0) {
-        fprintf(stderr, "switch: cannot create the shared counters %s: %s\n", STATS_SHM_NAME, strerror(rc));
+        fprintf(stderr, "switch: cannot create the shared counters %s: %s\n", stats_name, strerror(rc));
         log_stop();
         return EXIT_FAILURE;
     }
@@ -540,10 +700,22 @@ int main(int argc, char **argv)
         failed = "signal";
     }
 
+    if (failed == NULL && pair) {          /* Part 19: the pipes become port 0, the trunk to the peer */
+        rc = port_attach_pipe(link_r, link_w);
+        st.link = true;                    /* on a failure after the first thread was started the reaper owns the pipe ends */
+        if (rc == 0)
+            log_msg(LOG_INFO, "port 0: trunk to the peer switch attached (%s, peer TCP port %ld)",
+                    peer == 0 ? "this is switch B" : "this is switch A", peer == 0 ? tcp_port : tcp_port_b);
+        else
+            failed = "peer link";
+    }
+
     if (failed != NULL) {
         fprintf(stderr, "switch: cannot start the %s thread: %s\n", failed, strerror(rc));
         request_shutdown();
         shutdown_switch(&st);
+        if (peer > 0)
+            reap_peer(peer);
         log_stop();                        /* the last thread: the messages above are written first */
         return EXIT_FAILURE;
     }
@@ -556,6 +728,8 @@ int main(int argc, char **argv)
     CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
 
     shutdown_switch(&st);
+    if (peer > 0)
+        reap_peer(peer);                   /* switch A: wait for B before exiting (Part 19) */
     log_msg(LOG_INFO, "shutdown: complete");
     log_stop();                            /* the logger is the LAST thread to stop: it writes everything above */
     return EXIT_SUCCESS;

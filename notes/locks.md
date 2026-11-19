@@ -60,3 +60,11 @@ not a lock (its operations are non-blocking where a lock is held; the only block
 | `mirror <x> <s>` / `mirror <x> off` | write `ports_lock`: both states checked, `mirror_to` stored (atomic), `config_lock` (leaf) for the trunk test, `stats` (last), release |
 | mirroring in `forward_frame` | under the `ports_lock` READ lock the receiver reads `mirror_to` (atomic), checks that the sniffer is UP and takes one queue lock at a time (`outq_try_push`, never blocks); the drop is counted with `stats` (last) |
 | clearing the references (reaper, last step of a teardown) | the same write-locked step that changes the state of the port: every `mirror_to` equal to the port is set to 0, so nothing can queue to a port that is not UP |
+
+## Part 19: port 0 (the pipe trunk to the peer switch) adds no lock
+
+Port 0 is an ordinary `port_t` (index 0 of the static array): the same `ports_lock`, queue lock, reaper, `stats` lock and `port_down_lock` protect the same data in the same
+order. What is new is only how its two threads are woken: `shutdown(fd)` does not work on a pipe, so the reaper writes the port's eventfd (`wake_fd`, no lock needed) and the receiver
+and sender, which wait in `poll()` on `{pipe, wake_fd}` with no lock held, return. `port_attach_pipe` (startup, before accept) takes the `ports_lock` write lock exactly like
+`port_start`. Port 0 is never in the free-port semaphore, so `sem_post` / `sem_trywait` are never called for it. The fork happens before any thread or lock is created, so no lock
+is ever copied into the child in a held state.

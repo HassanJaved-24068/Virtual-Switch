@@ -40,7 +40,9 @@ enum port_state {
 typedef struct port {
     int id;                    /* 1..num_ports (slot 0 is reserved for the bonus trunk) */
     enum port_state state;     /* protected by sw.ports_lock */
-    int rfd, wfd;              /* socket (rfd == wfd for a TCP host), -1 if none */
+    int rfd, wfd;              /* socket (rfd == wfd for a TCP host), -1 if none. Port 0 (Part 19): the two ends of the pipes to the peer switch (rfd != wfd) */
+    int wake_fd;               /* Part 19: eventfd of a pipe port (-1 for a TCP port). shutdown() does not work on a pipe, so the teardown writes it to wake the receiver
+                                * and the sender, which poll() it together with the pipe */
     uint16_t vlan;
     uint16_t vlan_admin;       /* Part 16: VLAN set by "swctl vlan" (0 = none). Survives teardown, so a free port keeps it for the next host; a
                                 * configuration reload that changes this port's VLAN clears it. Protected by sw.ports_lock. */
@@ -61,6 +63,7 @@ typedef struct {
     pthread_rwlock_t ports_lock;
     port_t ports[MAX_PORTS + 1];   /* static array: slots are never freed or moved */
     int num_ports;
+    bool paired;                   /* Part 19: this switch is one of a --pair; port 0 is the trunk to the peer. Set before any thread exists, then read-only */
 
     int listen_fd;                 /* non-blocking listening socket */
     int wake_efd;                  /* eventfd: request_shutdown() writes it to wake the accept thread */
@@ -178,6 +181,13 @@ void reaper_finish(void);
  */
 unsigned long port_down_count(int id);
 bool port_wait_down(int id, unsigned long since, long timeout_ms);
+
+/*
+ * Part 19: attach the two pipe ends to port 0 (the reserved index) as a trunk port, with its own queue, sender and receiver (the same code as any port).
+ * Port 0 is not counted in num_ports or in the semaphore, is exempt from port security, and is never given out by accept. When the peer goes away
+ * (EOF on the read pipe, EPIPE on the write pipe) it is torn down like any port and ends DISABLED. Returns 0 or an errno value; nothing is left behind on failure.
+ */
+int port_attach_pipe(int rfd, int wfd);
 
 /* Receiver thread: arg is a port_t *. */
 void *receiver_main(void *arg);

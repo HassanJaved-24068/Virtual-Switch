@@ -1,5 +1,5 @@
 /*
- * forward.c - forwarding decision.
+ * forward.c - forwarding decision. Part 19: port 0 (the pipe trunk to a peer switch) takes part like any trunk port: the loops start at 0.
  * Part 4: flooding. Part 6: MAC learning and unicast forwarding.
  * Part 11: the priority of a frame chooses the ring of every output queue (queue.c); a priority above 2
  * is queued as low priority and counted per ingress port (bad_prio), with one log line per port.
@@ -105,12 +105,12 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
 
         if (p == in_port->id)
             filtered = true;                     /* the destination is behind the ingress port */
-        else if (p >= 1 && p <= sw.num_ports && sw.ports[p].state == PORT_UP && port_vlan_ok(&sw.ports[p], f->vlan))
+        else if (p >= 0 && p <= sw.num_ports && sw.ports[p].state == PORT_UP && port_vlan_ok(&sw.ports[p], f->vlan))
             target = p;                          /* known, UP and in this VLAN (or the trunk): only that port */
         /* unknown, or its port is not UP / not in this VLAN: flood (inside the VLAN) */
     }
 
-    for (int i = 1; i <= sw.num_ports && !filtered; i++) {
+    for (int i = 0; i <= sw.num_ports && !filtered; i++) {      /* Part 19: i = 0 is the pipe trunk to the peer switch (never UP in a single switch) */
         port_t *dst = &sw.ports[i];
 
         if (dst == in_port || dst->state != PORT_UP || !port_vlan_ok(dst, f->vlan))
@@ -131,7 +131,7 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
 
     /* Part 17, mirroring: "all traffic of port X" = (a) every frame received on X and (b) every frame successfully queued to X. */
     mirror_copy(in_port, in_port->id, f, drops);                             /* (a) */
-    for (int i = 1; i <= sw.num_ports; i++)
+    for (int i = 0; i <= sw.num_ports; i++)
         if (sent[i])
             mirror_copy(&sw.ports[i], in_port->id, f, drops);                /* (b) */
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
@@ -142,7 +142,7 @@ enum learn_rc forward_frame(port_t *in_port, frame_t *f)
     if (first_bad_prio)
         log_msg(LOG_WARN, "port %d: bad_prio: a frame with priority %u (valid: 0-2) is queued as low priority; "
                 "further ones are only counted", in_port->id, (unsigned)f->prio);
-    for (int i = 1; i <= sw.num_ports; i++)
+    for (int i = 0; i <= sw.num_ports; i++)
         if (drops[i] != 0)
             log_msg(LOG_WARN, "port %d: output queue full, %llu frames dropped so far", i, drops[i]);
     return lr;

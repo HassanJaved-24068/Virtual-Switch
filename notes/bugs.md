@@ -471,3 +471,10 @@ program that ignores SIGINT.
 - Test: tests/test_backlog.py (now in tests/run_unit.sh; normal, TSan, valgrind): SIGINT with four flooders exits quickly and at most ~40 frames per port are forwarded after the request;
   `swctl shutdown` of a flooding port answers OK well inside 5 s and the other flooders keep forwarding. Before the fix: 1 failure (normal), 3 failures (valgrind); after: 21 checks, 0 failures
   in all three variants.
+
+## 32. Part 19: no defect in the switch found by the tests; one design point and one test-side mistake
+- Design point (found while designing, before the first run): `shutdown(fd)` is how the reaper wakes a receiver blocked in `read()` (Part 5), but it fails with ENOTSOCK on a pipe, so a pipe
+  port would never have been woken by a local teardown (admin shutdown of a peer link, SIGINT with a quiet peer). Port 0 therefore waits in `poll()` on {pipe, eventfd} in both threads and the
+  reaper writes the eventfd. The same reasoning gave the pidfd-based wait for the peer process in switch A: a peer stopped with SIGSTOP must not hang A (killed after 15 s).
+- Test-side mistake: the first two hosts of a switch get ports 1 and 2; the test configuration had put them in different VLANs, so the "A's hosts still talk" checks failed (3 checks).
+  The tests that need two same-VLAN hosts now use a configuration with both in VLAN 10.

@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 18** (the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; before it Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 19** (bonus: two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (the bonus items of Tier 3) are not implemented yet; where the configuration file already accepts their keys
+The remaining bonus items of Tier 3 (the supervisor and the benchmark) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -21,7 +21,7 @@ make test       # the whole test suite (about 8 minutes); see "Tests"
 ## Run
 
 ```
-./switch <tcp_port> <num_ports> [-c vswitch.conf]
+./switch <tcp_port> <num_ports> [-c vswitch.conf] [--pair <tcp_port_b> [--peer-config b.conf]]
 ./host   <switch_ip> <tcp_port> <mac> [--noread] [--partial] [--quiet] [--flood N --to <mac>] [--die-midframe]
 ```
 
@@ -32,6 +32,7 @@ make test       # the whole test suite (about 8 minutes); see "Tests"
 * A bad command line, an unreadable configuration file or **any** bad line in it is a start-up error: the
   switch prints the reason (with the line numbers) on stderr and exits with status 1 before it listens.
 * `Ctrl+C` (`SIGINT`) or `SIGTERM` shuts the switch down cleanly (exit status 0).
+* `--pair <tcp_port_b>` (Part 19) starts **two** switches joined by a trunk, see "Two switches joined by pipes" below.
 
 The host program reads commands from stdin: `send <dst_mac|bcast> <text>`, `sendx <dst_mac|bcast> <vlan> <prio> <text>`, `quit`.
 
@@ -130,6 +131,29 @@ is never delivered across VLANs. The frame is shared by all output queues (one c
 host sees the VLAN of the frame, an access host sees its own. The trunk is exempt from `max_macs_per_port`. `SIGHUP` moves a port to its new VLAN at
 once (`port_set_vlan`: VLAN set under the write lock, then the port's MAC entries are flushed); a host that connects later gets the VLAN from the
 configuration. `trunk_port` changes only at start-up.
+
+## Two switches joined by pipes (`--pair`, Part 19)
+
+`./switch 9000 8 --pair 9001 -c a.conf --peer-config b.conf` creates two pipes and `fork()`s, **before any thread exists**. The child becomes switch **B** (TCP port
+9001, its own admin socket `/tmp/vswitch_9001.sock`, its own counters `/vswitch_stats_P_9001`, its own log file: A's log file name + `.9001`); the parent is
+switch **A** (TCP port 9000, `/vswitch_stats_P`). B has the same number of ports as A and reads `--peer-config` (the defaults if absent); both files are checked
+before anything is created, so a bad file stops both. Each side closes the two pipe ends it does not use at once (so EOF and EPIPE work); A writes pipe 1 and reads
+pipe 2, B the opposite.
+
+Each side attaches its pipe ends to **port 0**, the reserved index, as a **trunk** port (`rfd != wfd`), with the same receiver, sender, queue, VLAN and trunk code as
+any port. Port 0 is not counted in `num_ports` or in the free-port semaphore, is exempt from port security, is never given out by `accept`, and cannot be
+shut down or reconfigured with `swctl` (ports 1..N only). A frame (at most 1517 bytes) is written with one `write`, so frames never interleave on a pipe; a pipe cannot be
+`shutdown()` like a socket, so the teardown writes an eventfd that wakes the receiver and the sender, which `poll()` it together with the pipe.
+
+* VLANs cross the link: a frame keeps its VLAN field on the trunk, so a VLAN 10 host of A reaches the VLAN 10 hosts of B by unicast and broadcast, and a VLAN 20 host never
+  sees it. MAC learning works across the link by itself: frames that arrive on port 0 teach "this MAC is behind port 0" (`swctl -p 9000 show mac` lists B's hosts on
+  port 0; `show ports` and `stats` list a row 0). With a single link there is no loop.
+* If the peer dies (EOF on the read pipe, EPIPE on the write pipe) port 0 is torn down like any port and ends **DISABLED**, logged; the local switch keeps working.
+* `SIGINT` from the terminal reaches both processes (same process group); each shuts down cleanly. A then sends B `SIGTERM` (harmless if B is already leaving), waits for it
+  with `poll()` on a pidfd and `waitpid()`, and logs B's exit status; a B that does not leave within 15 s (stopped, hung) is killed. If A is killed with `SIGKILL`, B receives
+  `SIGTERM` from the kernel (`PR_SET_PDEATHSIG`) and stops instead of living on as an orphan.
+* `swctl -p <tcp_port_b> ...` talks to B (its socket and, for `stats`, `/vswitch_stats_P_<tcp_port_b>`; every other port number falls back to the fixed `/vswitch_stats_P`).
+* Limits: one link, no spanning tree; `mac_dump_file` and the other file names of the configuration are shared by the two switches unless `--peer-config` changes them.
 
 ## Counters in shared memory
 
@@ -278,6 +302,7 @@ python3 tests/test_admin.py [tsan|valgrind]            # admin socket and swctl 
 python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / clear mac with the real switch (Part 16)
 ./build/test_mirror                                    # port mirroring without sockets (after `make build/test_mirror`)
 python3 tests/test_mirror.py [tsan|valgrind]           # port mirroring with the real switch and sniffers (Part 17)
+python3 tests/test_pair.py [tsan|valgrind]             # two switches joined by two pipes: VLANs across the link, peer death, stalled peer, SIGINT (Part 19)
 ./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
 python3 tests/static_checks.py                         # no sleep() in the switch; no ignored result of a system / pthread call (Part 18; runs first in make test)
 ./tests/hostile.sh                                     # 32 hosts: --noread, --partial, kill -9 mid-stream, dying mid-frame, with admin commands and signals (Part 18)

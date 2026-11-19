@@ -24,6 +24,7 @@
 #include "common.h"
 
 #define STATS_SHM_NAME "/vswitch_stats_P"
+#define STATS_SHM_PAIR_FMT "/vswitch_stats_P_%d"   /* Part 19: the second switch of a --pair (named by its TCP port); swctl -p N tries this name first */
 #define STATS_MAGIC    0x56535453u      /* "VSTS" */
 #define STATS_VERSION  1u
 

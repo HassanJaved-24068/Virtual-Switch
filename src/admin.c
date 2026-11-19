@@ -291,7 +291,7 @@ static const char *do_show_ports(obuf_t *out)
     config_snapshot(&cfg);                                  /* config_lock is a leaf; a copy, used after it is released */
 
     CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
-    for (int i = 1; i <= sw.num_ports; i++) {
+    for (int i = sw.paired ? 0 : 1; i <= sw.num_ports; i++) {      /* Part 19: port 0 is the pipe trunk to the peer switch */
         const port_t *p = &sw.ports[i];
         row[i].st = p->state;
         row[i].macs = atomic_load(&p->mac_count);
@@ -303,11 +303,13 @@ static const char *do_show_ports(obuf_t *out)
             row[i].vlan = p->vlan_admin ? p->vlan_admin : (unsigned)config_port_vlan(&cfg, i);   /* Part 16: swctl vlan wins */
             row[i].trunk = cfg.trunk_port == i;
         }
+        if (i == 0)
+            row[i].trunk = true;
     }
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
 
     ob_printf(out, "PORT STATE    VLAN TRUNK MACS MIRROR\n");
-    for (int i = 1; i <= sw.num_ports; i++) {
+    for (int i = sw.paired ? 0 : 1; i <= sw.num_ports; i++) {
         char vlan[8], mirror[8];
         if (row[i].trunk)
             snprintf(vlan, sizeof vlan, "-");               /* the trunk carries every VLAN */

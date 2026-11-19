@@ -131,4 +131,10 @@ if command -v valgrind >/dev/null; then
     run python3 tests/test_backlog.py valgrind                             # Part 18: under valgrind (where a slow switch shows the defect)
 fi
 
-echo "Parts 1-18 unit and regression tests passed."
+run python3 tests/test_pair.py            # Part 19: two switches joined by two pipes: forwarding, VLANs, port 0, peer death, stalled peer, SIGINT, bad command lines
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_pair.py tsan   # Part 19: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_pair.py valgrind                                # Part 19: both processes under valgrind, no errors, no leaks
+fi
+
+echo "Parts 1-19 unit and regression tests passed."
