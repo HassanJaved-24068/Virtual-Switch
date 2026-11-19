@@ -10,7 +10,7 @@ Take locks only in this order (a lower number first). A thread that holds a lock
 | 2 | `port[i].q.lock` | mutex; at most one held at a time (if two are ever needed: lowest port number first) |
 | 3 | MAC bucket locks (`bucket[b].lock`) | robust mutexes; lowest bucket first; the normal path holds only one |
 | 4 | `sw.reaper_lock` | mutex |
-| 5 | frame `ref_lock` | mutex of the frame pool / reference counts |
+| 5 | frame `ref_lock` | one mutex inside EVERY `frame_t`; it protects that frame's reference count |
 | 6 | logger queue lock | mutex |
 | 7 | stats mutex (in shared memory) | `PTHREAD_PROCESS_SHARED`, robust; ALWAYS LAST; `log_msg` is never called while it is held |
 
@@ -28,7 +28,7 @@ not a lock (its operations are non-blocking where a lock is held; the only block
 | `port[i].q.lock` (+ `q.cond`) | the three priority rings of one output queue, the token bucket (`tokens_milli`, `rate`), `closed` | one queue lock at a time; the sender waits on `q.cond` (no other lock held) |
 | MAC bucket lock | the hash chain of one bucket, its entries, the LRU/free-list links that belong to it | robust: the owner may die in Part 20 (`EOWNERDEAD` -> `pthread_mutex_consistent`) |
 | `sw.reaper_lock` (+ `reaper_cond`) | the ring of port ids waiting for teardown, `reaper_stop` | taken while `ports_lock` is held (rank 4 after rank 1) when a port is queued; the reaper itself holds it only to pop |
-| frame `ref_lock` | the reference count of the frames (`frame_ref` / `frame_unref`), the frame pool | last but one: a frame is unreferenced while queue locks were just released |
+| frame `ref_lock` | the reference count of ONE frame (`frame_ref` / `frame_unref`); each frame has its own lock, so frames never contend with each other | last but one: a frame is unreferenced while queue locks were just released |
 | logger queue lock | the ring of log records, the stop flag | `log_msg` takes it; it may be called while any lock of rank 1-5 is held, never with rank 7 |
 | stats mutex | the counters and the port fields of the shared segment (`/vswitch_stats_P`) | process-shared and robust; swctl locks it too; always the last lock taken |
 | `sw.config_lock` | `sw.cfg`, and the atomics copied from it at the same time | leaf; copied out, then released |

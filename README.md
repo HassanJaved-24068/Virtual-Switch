@@ -4,7 +4,7 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 21** (bonus: the benchmark of the MAC table locking, `make bench`; before it Part 20, the supervisor and the crash-surviving MAC table, `--persist-mac`; Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 22** (the final hand-in: README and `docs/Report.md`; before it Part 21, bonus: the benchmark of the MAC table locking, `make bench`; before it Part 20, the supervisor and the crash-surviving MAC table, `--persist-mac`; Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
 All the bonus items of Tier 3 are implemented; where the configuration file already accepts their keys
 this is said explicitly below.
@@ -14,16 +14,23 @@ this is said explicitly below.
 ```
 make            # switch, host, swctl (strict flags: -std=c11 -Wall -Wextra -Werror -g -O0 -D_GNU_SOURCE -pthread)
 make tsan       # the same with ThreadSanitizer: switch_tsan, host_tsan (+ switch_small_tsan for the tests)
-make clean
+make bench      # the benchmark programs of Part 21 (switch_global / switch_striped / switch_rwlock, bench/bench, bench/bench_mac_*); see "Benchmark"
+make clean      # removes every program and object file
 make test       # the whole test suite (about 8 minutes); see "Tests"
+make test-tsan  # the integration scripts with the switch under ThreadSanitizer
+make test-valgrind   # the integration scripts with the switch under valgrind (full leak check)
 ```
+
+`make` builds `switch`, `host`, `swctl` and `supervisor`. No program or object file is under version control (`.gitignore`); everything is built from the sources.
 
 ## Run
 
 ```
 ./switch <tcp_port> <num_ports> [-c vswitch.conf] [--pair <tcp_port_b> [--peer-config b.conf]] [--persist-mac]
 ./supervisor ./switch <tcp_port> <num_ports> [switch options]
-./host   <switch_ip> <tcp_port> <mac> [--noread] [--partial] [--quiet] [--flood N --to <mac>] [--die-midframe]
+./host   <switch_ip> <tcp_port> <mac> [--noread] [--partial] [--quiet] [--flood N --to <mac>] [--die-midframe] [--sniff]
+./swctl  [-p <tcp_port>] <command>        # see "Admin socket and swctl" (default tcp_port 9000)
+./bench/bench <ip> <tcp_port> <hosts> <seconds> <payload> [seed]   # see "Benchmark"
 ```
 
 * `tcp_port` 1-65535, `num_ports` 1-64. Hosts take the lowest free port; when all ports are taken a new host
@@ -36,7 +43,46 @@ make test       # the whole test suite (about 8 minutes); see "Tests"
 * `--pair <tcp_port_b>` (Part 19) starts **two** switches joined by a trunk, see "Two switches joined by pipes" below.
 * `--persist-mac` (Part 20) keeps the MAC table in shared memory, see "The supervisor and the crash-surviving MAC table" below (not combinable with `--pair`).
 
-The host program reads commands from stdin: `send <dst_mac|bcast> <text>`, `sendx <dst_mac|bcast> <vlan> <prio> <text>`, `quit`.
+### The `host` program
+
+`<mac>` is the host's own address (`aa:bb:cc:dd:ee:ff`), used as the source of every frame. The host reads commands from stdin and prints every received frame as
+`RX src=... dst=... vlan=... data=...`:
+
+| stdin command | effect |
+|---|---|
+| `send <dst_mac\|bcast> <text>` | one frame, VLAN 1, priority 1 |
+| `sendx <dst_mac\|bcast> <vlan> <prio> <text>` | one frame with the given VLAN 1-4094 (the switch overwrites it on an access port) and priority 0-2 |
+| `quit` | close the connection and exit |
+
+| option | effect |
+|---|---|
+| `--noread` | never read from the socket (a host that does not drain its connection: its output queue fills and the switch drops) |
+| `--partial` | write every frame one byte at a time, 1 ms apart (tests the partial-read code of the switch) |
+| `--quiet` | do not print the received frames; count them and print `RX_TOTAL <n>` when the host ends |
+| `--flood N --to <mac>` | (both options together) send `N` frames `flood <i>` to `<mac>` as fast as possible, then go on with stdin |
+| `--die-midframe` | send half of a frame and die (the switch must cope with an EOF in the middle of a frame) |
+| `--sniff` | a plain host that only prints (Part 17): sends nothing, reads no stdin; cannot be combined with the options above |
+
+Exit status: 0 normal, 1 error, 2 the switch answered "switch full".
+
+### The wire format and the "switch full" reply
+
+A frame is 17 header bytes followed by the payload, in network byte order, no padding: `len` (2 bytes, 0-1500), `src` (6), `dst` (6, `ff:ff:ff:ff:ff:ff` = broadcast), `vlan` (2), `prio` (1).
+When no port becomes free within `port_wait_timeout` seconds the switch writes ONE frame and closes the connection: `src` = `00:00:00:00:00:00`, `dst` = `ff:ff:ff:ff:ff:ff`, `vlan` 1,
+`prio` 0, payload the 11 bytes `switch full` (so `len` = 11). The `host` program prints `SWITCH FULL` and exits with status 2.
+
+### Names of files and shared-memory objects
+
+| name | what | who creates / removes it |
+|---|---|---|
+| `switch.log` (`log_file`, or `$VSWITCH_LOG_FILE`) | the log | switch, appended, never removed |
+| `mac_dump.txt` (`mac_dump_file`) | `SIGUSR1` dump of the MAC table | switch (`"w"`) |
+| `/tmp/vswitch_<tcp_port>.sock` | the admin socket (mode 0600) | switch at start / at shutdown |
+| `/dev/shm/vswitch_stats_P` | per-port counters (switch A) | switch (`O_EXCL`), `shm_unlink` at shutdown |
+| `/dev/shm/vswitch_stats_P_<tcp_port_b>` | counters of switch B with `--pair` | switch B |
+| `/dev/shm/vswitch_mac_<tcp_port>` | the MAC table with `--persist-mac` | switch, unlinked only by the supervisor at a clean end |
+| `<log_file>.<tcp_port_b>` | the log of switch B with `--pair` | switch B |
+| `bench/raw_*.csv`, `results.csv`, `throughput.png`, `report.pdf`, `machine.txt` | the benchmark data and report | `bench/run.sh`, `bench/plot.py` |
 
 ## Configuration file
 
