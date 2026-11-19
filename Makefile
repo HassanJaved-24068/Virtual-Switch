@@ -20,7 +20,7 @@ SMALL_TSAN_DIR = build/small_tsan
 COMMON_OBJ = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(COMMON_SRC))
 TSAN_OBJ   = $(patsubst src/%.c,$(TSAN_DIR)/%.o,$(COMMON_SRC))
 
-.PHONY: all tsan clean test test-valgrind test-tsan bench bench-clean
+.PHONY: all tsan clean test test-valgrind test-tsan bench bench-clean dist
 all: $(PROGRAMS)
 tsan: $(TSAN_PROGRAMS) switch_small_tsan
 
@@ -140,6 +140,12 @@ test-valgrind:
 
 test-tsan:
 	VARIANT=tsan ./tests/run_all.sh
+
+# make dist: the submission archive virtual-switch.tar.gz = exactly the committed files of the hand-in (sources, Makefile, README, report, notes and the design write-ups the README refers to); no binary, no object file.
+DIST_PATHS = Makefile README.md Report.pdf report src include tests bench config notes docs
+dist:
+	git archive --format=tar.gz --prefix=virtual-switch/ -o virtual-switch.tar.gz HEAD -- $(DIST_PATHS)
+	@tar -tzf virtual-switch.tar.gz | wc -l | sed 's/^/files in virtual-switch.tar.gz: /'
 
 clean:
 	rm -rf build $(PROGRAMS) $(TSAN_PROGRAMS) switch_small switch_small_tsan $(BENCH_SWITCHES) bench/bench $(BENCH_MAC) bench/*.d

@@ -4,7 +4,7 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 22** (the final hand-in: README and `docs/Report.md`; before it Part 21, bonus: the benchmark of the MAC table locking, `make bench`; before it Part 20, the supervisor and the crash-surviving MAC table, `--persist-mac`; Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 22** (the final hand-in: this README and the 2-3 page report `Report.pdf`, source `report/Report.ms`, built by `report/build.sh`; before it Part 21, bonus: the benchmark of the MAC table locking, `make bench`; before it Part 20, the supervisor and the crash-surviving MAC table, `--persist-mac`; Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
 All the bonus items of Tier 3 are implemented; where the configuration file already accepts their keys
 this is said explicitly below.
@@ -19,6 +19,7 @@ make clean      # removes every program and object file
 make test       # the whole test suite (about 8 minutes); see "Tests"
 make test-tsan  # the integration scripts with the switch under ThreadSanitizer
 make test-valgrind   # the integration scripts with the switch under valgrind (full leak check)
+make dist       # virtual-switch.tar.gz: the files of the hand-in (needs the files to be committed)
 ```
 
 `make` builds `switch`, `host`, `swctl` and `supervisor`. No program or object file is under version control (`.gitignore`); everything is built from the sources.

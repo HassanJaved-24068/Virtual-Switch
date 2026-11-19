@@ -30,3 +30,5 @@ core.*
 /bench/bench_mac_*
 /bench/*.d
 __pycache__/
+/virtual-switch.tar.gz
+report/Report.ps
