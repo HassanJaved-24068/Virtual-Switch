@@ -27,7 +27,7 @@ After the check only documents changed (`report/Report.ms`, `Report.pdf`, this f
 (`git diff --stat b86fa52 HEAD -- src include tests bench Makefile config` is empty).
 
 ## Earlier verification of the same code
-The independent suite (`verification/run.py`, 100 test cases, 743 checks) passed 100 of 100 on the code of commit 3c0ea20, which is the last commit that changed program code (docs/CLI_Argument_Validation_Fix.md).
+The independent suite (`verification/run.py`, 100 test cases, 743 checks) passed 100 of 100 on the code of commit 3c0ea20, which is the last commit that changed `src/`, `include/`, `tests/` or `bench/` (see docs/CLI_Argument_Validation_Fix.md); the Makefile later only gained the `dist` target.
 
 ## Limits
 No official public tests were supplied; `--pair` has one link; `--persist-mac` needs the striped table and cannot be combined with `--pair`; the benchmark was measured on a 2-core machine at `-O0`; the report was built with groff because no other typesetting tool was installed.
