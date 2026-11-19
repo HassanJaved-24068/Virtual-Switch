@@ -1,0 +1,73 @@
+=====================================================================
+PART 16 - LIVE RECONFIGURATION UNDER TRAFFIC
+=====================================================================
+
+1. WHAT PART 16 IMPLEMENTS
+--------------------------
+swctl shutdown <p>, up <p>, vlan <p> <v> and clear mac act on the running switch while hosts send frames. Roadmap: admin_shutdown(p), admin_up(p),
+admin_vlan(p, v), admin_clear_mac(), wired to swctl; the lock order and the lock list are in notes/locks.md.
+
+Files:   src/port.c, include/port.h   the four admin_* functions, the admin VLAN (port.vlan_admin), port_wait_down() that also stops on shutdown
+         src/sig.c        request_shutdown() also wakes the waiters of port_down_cond
+         src/admin.c      the commands call the functions; "show ports" shows the admin VLAN of a port without a host
+         notes/locks.md   the lock order, what each lock protects, why it cannot deadlock (also goes into the final report)
+         tests/test_reconfig.py       the semantics with the real switch (normal / TSan / valgrind)  - permanent, in make test
+         tests/reconfig_stress.sh     the roadmap's criterion: 500 random operations + SIGHUP/SIGUSR1 every 0.2 s  - in the integration scripts
+         tests/lib.sh     SW_ARGS (extra switch arguments), additive; tests/run_unit.sh, tests/run_all.sh
+         tests/test_part15.py         deleted (its tests stay in test_admin.c, test_swctl.c, test_admin.py, test_harness_cleanup.py)
+         tests/test_part16.py         TEMPORARY dedicated runner of the Part 16 tests (deleted when Part 17 starts)
+
+2. THE OPERATIONS
+-----------------
+shutdown <p>
+  UP:      under the write lock UP -> CLOSING with final state DISABLED (the same request_down_locked() that a host disconnect uses: only one
+           caller wins), release the lock, then wait WITHOUT any lock on port_down_cond (a leaf lock) until the reaper has finished (state
+           DISABLED), at most ADMIN_DOWN_TIMEOUT_MS = 5 s ("ERR timeout waiting for the port to shut down"). The wait also ends when the switch
+           shuts down (request_shutdown() broadcasts port_down_cond), so a SIGINT is never delayed by an admin command. The reaper runs the Part 5
+           sequence unchanged (mark, close the queue, shut the socket down, join, drain, flush the MACs, close, set the state, post nothing for DISABLED).
+  FREE:    under the write lock FREE -> DISABLED and one sem_trywait(free_ports). If it returns EAGAIN the accept thread holds the last token and is
+           about to call port_start(): that finds no FREE port (PS_NONE) and, as Part 5 decided, drops the token and answers "switch full". The
+           invariant "semaphore value + the accept thread's token = number of FREE ports" holds either way.
+  DISABLED / CLOSING: "ERR port is already disabled" / "ERR port is already closing" (a host that hung up at the same moment won the transition).
+up <p>     DISABLED -> FREE under the write lock (the state first), then sem_post (a host that gets the token must find the port FREE). The port-security
+           counter is 0 (the teardown flushed the MACs). FREE / UP / CLOSING: "ERR port is not disabled (it is ...)".
+vlan <p> <v>
+  Any state. port.vlan_admin keeps the value (0 = none): a free or disabled port keeps the VLAN for its next host, because port_start() uses
+  vlan_admin when it is set and the configuration otherwise, and the teardown restores it after port_reset(). A connected port moves at once and
+  mac_flush_port() runs AFTER the lock is released, so the entries learned in the old VLAN vanish. The trunk is refused ("ERR port is the trunk").
+  A configuration reload that changes the port's VLAN goes through port_set_vlan(), which clears vlan_admin: the newer explicit decision wins; a reload
+  that does not touch this port's VLAN leaves the admin value alone.
+clear mac  mac_clear(): bucket locks one at a time, ascending, no other lock; the per-port MAC counts follow the removals. Receivers keep running; their next
+           frames for the cleared MACs flood and relearn.
+
+3. WHY IT CANNOT DEADLOCK (details: notes/locks.md)
+---------------------------------------------------
+The admin thread and the reaper never hold a lock while they join or wait. Receivers hold only the ports_lock read lock and short leaf locks and never
+block while holding them (a full queue is a drop). The ports_lock is writer-preferring, so the admin cannot be starved by a stream of readers. The three
+leaf locks (config_lock, shutdown_lock, port_down_lock) are never held together with another lock that could wait for them.
+
+4. DEFECTS FOUND ON THE WAY (notes/bugs.md item 28)
+---------------------------------------------------
+- TSan: admin_up chose its error text from port.state after it had released the write lock: a data race with port_start / teardown_port. Fixed (copy the
+  state under the lock). Found only by the targeted tests (up on non-disabled ports while hosts connect and leave), not by the stress script.
+- Mutation checks of the tests (five behaviours deliberately broken in a copy of the source): all caught after two tests were made stricter (the wait of the
+  host after a FREE shutdown; the LOG ORDER "teardown complete" before the admin's answer).
+
+5. TESTS AND RESULTS
+--------------------
+test_reconfig.py: 1 FREE port shutdown/up and the 'switch full' timing; 2 UP port shutdown (EOF for the host, MACs flushed, the port stays DISABLED, the
+next host gets another port, up gives it back, log order); 3 error replies; 4 eight parallel shutdowns of one port -> exactly one OK, and shutdown racing
+a host that hangs up; 5 VLAN: move, flush, free port keeps it, reload replaces it, unrelated reload keeps it; 6 clear mac; 7 hosts on untouched ports keep
+forwarding every frame (175 admin commands); 8 about 30 000 admin commands + connecting and leaving hosts for 12 s, then the semaphore still equals the
+number of FREE ports (4 hosts get the 4 ports, the 5th 'switch full'); 9 SIGINT while three clients send admin commands (5 timings): exit 0, never delayed;
+10 (valgrind) the lifecycle without errors or leaks.
+reconfig_stress.sh: 500 operations with SIGHUP and SIGUSR1 every 0.2 s: normal 13 checks (25 s), TSan 14 checks, valgrind 17 checks (48 s).
+(The results of the full suites are in section 6 at the end of this file.)
+
+6. RESULTS OF THE FULL SUITES
+-----------------------------
+Dedicated (python3 tests/test_part16.py): test_reconfig.py normal / TSan / valgrind, reconfig_stress.sh normal / TSan / valgrind: ALL PASSED.
+make test:           12 of 12 groups (Parts 1-16 suite + the 11 integration scripts, reconfig_stress among them): PASS (757 s).
+make test-tsan:      11 of 11 scripts, 0 ThreadSanitizer reports (91 s).
+make test-valgrind:  11 of 11 scripts, 0 errors (197 s).
+TSan on the Part 16 tests: first run found the race of notes/bugs.md item 28 (fixed); three further runs: 0 reports.

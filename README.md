@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 15** (the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 16** (live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-Features of later parts (live reconfiguration by `swctl shutdown|up|vlan`, Part 16, and port mirroring, Part 17) are not implemented yet; where the configuration file already accepts their keys
+Features of later parts (port mirroring, Part 17) are not implemented yet; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -178,9 +178,19 @@ a client is silent; no lock is held during socket I/O.
 Exit status: **0** `OK`, **1** `ERR` (also bad arguments and system errors), **2** the switch is not running (connect fails with `ENOENT` or
 `ECONNREFUSED`, or no shared-memory object: message `switch not running`).
 
-* **Done in Part 15:** `show mac`, `show ports`, `clear mac`, `stats`, `stats --watch`.
-* **Parsed and validated only** (port 1..N, VLAN 1..4094, `mirror` source != sniffer, sniffer is not the trunk): `shutdown`, `up`, `vlan`, `mirror`. What they do
-  belongs to Parts 16 and 17; until then a valid one answers `ERR not implemented yet (Part 16|17)` (exit 1). Nothing pretends to succeed.
+* **Done:** `show mac`, `show ports`, `clear mac`, `stats`, `stats --watch` (Part 15) and `shutdown`, `up`, `vlan` (Part 16, below).
+* **Parsed and validated only:** `mirror <port> <sniffer>|off` (port 1..N, source != sniffer, the sniffer is not the trunk). What it does belongs to Part 17; until
+  then a valid one answers `ERR not implemented yet (Part 17)` (exit 1). Nothing pretends to succeed.
+
+**Live reconfiguration (Part 16), safe under traffic:**
+* `shutdown <port>`: an UP port is torn down by the reaper (the host is disconnected, its MAC entries are flushed) and ends **DISABLED**; the command answers
+  `OK` only after that (at most 5 s, else `ERR timeout ...`). A FREE port becomes DISABLED at once and leaves the free-port semaphore. A DISABLED or CLOSING port
+  answers `ERR` (only one of several simultaneous shutdowns, or of a shutdown and a host disconnect, wins the UP -> CLOSING transition).
+* `up <port>`: DISABLED -> FREE (and back into the semaphore); any other state is an `ERR`. Port security starts again from 0.
+* `vlan <port> <vlan>`: any state. A connected port moves at once and its MAC entries of the old VLAN are flushed; a FREE or DISABLED port keeps the VLAN for its next
+  host. The trunk is refused. A configuration reload that changes `port.N.vlan` replaces what `swctl` set; an unrelated reload keeps it.
+* `clear mac`: the table is emptied while the receivers keep running; their next frames flood and relearn.
+The locks involved and why this cannot deadlock are in `notes/locks.md`; the design is in `docs/Part16_Explanation.txt`.
 
 `stats` does not use the socket. `swctl` opens `/vswitch_stats_P` with `O_RDWR` and makes **two** mappings of it: the control page (offset 0, `PROT_READ|PROT_WRITE`:
 locking a mutex writes to it) and the data area (offset `PAGE`, `PROT_READ`: the counters cannot be changed by `swctl`, a write is a `SIGSEGV`). It checks
@@ -255,6 +265,8 @@ python3 tests/test_shm.py [tsan|valgrind]              # the segment of the real
 ./build/test_admin              # the admin command parser (after `make build/test_admin`)
 ./build/test_swctl              # swctl against a segment: read-only data mapping, robust mutex (after `make build/test_swctl`)
 python3 tests/test_admin.py [tsan|valgrind]            # admin socket and swctl with the real switch (Part 15)
+python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / clear mac with the real switch (Part 16)
+./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
 ./build/test_config             # the configuration parser (after `make build/test_config`)
 ```
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Parts 1-15 unit and regression tests (called by run_all.sh). Each part added its tests here.
+# Parts 1-16 unit and regression tests (called by run_all.sh). Each part added its tests here.
 cd "$(dirname "$0")/.." || exit 1
 
 make -s all switch_small build/test_util build/test_frame build/test_queue build/test_refcount \
@@ -109,4 +109,10 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_admin
 fi
 
-echo "Parts 1-15 unit and regression tests passed."
+run python3 tests/test_reconfig.py        # Part 16: swctl shutdown / up / vlan / clear mac with the real switch: FREE and UP ports, one winner, VLAN rules, semaphore invariant, SIGINT during admin commands
+run env SWITCH="$NOASLR ./switch_tsan" python3 tests/test_reconfig.py tsan   # Part 16: under TSan
+if command -v valgrind >/dev/null; then
+    run python3 tests/test_reconfig.py valgrind                            # Part 16: no errors, no leaks, no descriptor left open
+fi
+
+echo "Parts 1-16 unit and regression tests passed."

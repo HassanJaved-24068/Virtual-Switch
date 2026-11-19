@@ -300,7 +300,7 @@ static const char *do_show_ports(obuf_t *out)
             row[i].vlan = p->vlan;                          /* what the connected host really has (SIGHUP and Part 16 change it) */
             row[i].trunk = p->trunk;
         } else {                                            /* no host: the VLAN and role the next host will get (port.c applies them on connect) */
-            row[i].vlan = (unsigned)config_port_vlan(&cfg, i);
+            row[i].vlan = p->vlan_admin ? p->vlan_admin : (unsigned)config_port_vlan(&cfg, i);   /* Part 16: swctl vlan wins */
             row[i].trunk = cfg.trunk_port == i;
         }
     }
@@ -331,14 +331,27 @@ static const char *execute(const admin_cmd_t *c, obuf_t *out, int *cleared)
     case CMD_SHOW_PORTS:
         return do_show_ports(out);
     case CMD_CLEAR_MAC:
-        *cleared = mac_clear();
+        *cleared = admin_clear_mac();
         ob_printf(out, "cleared %d MAC entr%s\n", *cleared, *cleared == 1 ? "y" : "ies");
         return NULL;
-    case CMD_SHUTDOWN:
-    case CMD_UP:
-        return "not implemented yet (Part 16)";
-    case CMD_VLAN:
-        return "not implemented yet (Part 16)";
+    case CMD_SHUTDOWN: {
+        const char *why = admin_shutdown(c->port);
+        if (why == NULL)
+            ob_printf(out, "port %d disabled\n", c->port);
+        return why;
+    }
+    case CMD_UP: {
+        const char *why = admin_up(c->port);
+        if (why == NULL)
+            ob_printf(out, "port %d is FREE again\n", c->port);
+        return why;
+    }
+    case CMD_VLAN: {
+        const char *why = admin_vlan(c->port, c->arg);
+        if (why == NULL)
+            ob_printf(out, "port %d: VLAN %d\n", c->port, c->arg);
+        return why;
+    }
     case CMD_MIRROR:
         /* Validation that needs the switch's state (the roadmap, Part 17: the sniffer is not the trunk). */
         config_t cfg;

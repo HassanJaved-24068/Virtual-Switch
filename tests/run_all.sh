@@ -1,15 +1,15 @@
 #!/bin/bash
 # run_all.sh - the Tier 1 checkpoint (Part 8).
 #
-#   ./tests/run_all.sh                     normal variant: Parts 1-15 suite + the ten integration scripts
-#   VARIANT=valgrind ./tests/run_all.sh    the ten scripts with the switch under valgrind
-#   VARIANT=tsan ./tests/run_all.sh        the ten scripts with the ThreadSanitizer build of the switch
-#   ./tests/run_all.sh forward mac_move    only the named scripts (no Parts 1-15 suite)
+#   ./tests/run_all.sh                     normal variant: Parts 1-16 suite + the integration scripts
+#   VARIANT=valgrind ./tests/run_all.sh    the integration scripts with the switch under valgrind
+#   VARIANT=tsan ./tests/run_all.sh        the integration scripts with the ThreadSanitizer build of the switch
+#   ./tests/run_all.sh forward mac_move    only the named scripts (no Parts 1-16 suite)
 #
 # Variables: VARIANT (normal|valgrind|tsan), TMO (seconds for each command and wait inside a
 # script, default 30), SCRIPT_TIMEOUT (seconds for one whole script, default 300; a script
 # can legitimately take longer than one command: port_full and many_hosts wait for the 5 s
-# port timeout), LEGACY=0 (skip the Parts 1-15 suite in the normal variant).
+# port timeout), LEGACY=0 (skip the Parts 1-16 suite in the normal variant).
 # Exit status: 0 only if everything passed. The failed scripts are listed at the end.
 cd "$(dirname "$0")/.." || exit 1
 
@@ -17,7 +17,7 @@ VARIANT=${VARIANT:-normal}
 SCRIPT_TIMEOUT=${SCRIPT_TIMEOUT:-300}
 export VARIANT
 
-ALL=(forward broadcast slow_host partial midframe_disconnect port_full mac_aging mac_move port_security many_hosts)
+ALL=(forward broadcast slow_host partial midframe_disconnect port_full mac_aging mac_move port_security many_hosts reconfig_stress)
 if [ $# -gt 0 ]; then SCRIPTS=("$@"); else SCRIPTS=("${ALL[@]}"); fi
 
 case "$VARIANT" in
@@ -32,8 +32,8 @@ failed=()
 passed=()
 
 if [ "$VARIANT" = normal ] && [ "${LEGACY:-1}" != 0 ] && [ $# -eq 0 ]; then
-    echo "################ Parts 1-15 unit and regression tests ################"
-    if timeout 3000 ./tests/run_unit.sh; then passed+=(parts-1-15); else failed+=(parts-1-15); fi
+    echo "################ Parts 1-16 unit and regression tests ################"
+    if timeout 3000 ./tests/run_unit.sh; then passed+=(parts-1-16); else failed+=(parts-1-16); fi
 fi
 
 echo "################ Part 8 integration scripts, VARIANT=$VARIANT ################"

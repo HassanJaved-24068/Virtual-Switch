@@ -6,7 +6,7 @@
  * "OK" or "ERR <reason>", and closes the connection.
  *
  * Commands:  show mac | show ports | clear mac | shutdown <port> | up <port> | vlan <port> <vlan> | mirror <port> <sniffer> | mirror <port> off
- * The four write commands (shutdown, up, vlan, mirror) are parsed and validated here; what they DO belongs to Parts 16 and 17 (until then a valid one
+ * shutdown, up and vlan (Part 16) act through admin_shutdown/admin_up/admin_vlan in port.c; mirror (Part 17) is parsed and validated here and (until then a valid one
  * answers "ERR not implemented yet (Part N)"). "stats" and "stats --watch" are not commands of the socket: swctl reads the shared-memory counters itself.
  *
  * Lock order: the handlers take ports_lock for reading (show ports) or only the MAC table locks (mac_foreach, mac_clear); no lock is held while writing

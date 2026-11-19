@@ -48,6 +48,12 @@ void request_shutdown(void)
     CHECK_PT(pthread_cond_broadcast(&sw.shutdown_cond));
     CHECK_PT(pthread_mutex_unlock(&sw.shutdown_lock));
 
+    /* Part 16: an admin command that waits for a teardown (port_wait_down) must not delay the shutdown. port_down_lock is a leaf
+     * lock; shutdown_lock was released above, so the two are never held together. */
+    CHECK_PT(pthread_mutex_lock(&sw.port_down_lock));
+    CHECK_PT(pthread_cond_broadcast(&sw.port_down_cond));
+    CHECK_PT(pthread_mutex_unlock(&sw.port_down_lock));
+
     /* 6: wake the accept thread out of poll(). A second call just adds 1 to the
      * counter; EAGAIN would mean the counter is already at its maximum, i.e. the
      * eventfd is readable, which is all we need. */

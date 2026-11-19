@@ -149,7 +149,7 @@ enum port_start_rc port_start(int fd, int *port_id, int *err)
 
             config_snapshot(&cfg);                       /* config_lock is a leaf: fine under ports_lock */
             outq_set_rate(&p->q, config_port_rate(&cfg, p->id));   /* before the sender exists */
-            p->vlan = (uint16_t)config_port_vlan(&cfg, p->id);     /* Part 13: VLAN and trunk role, fixed here */
+            p->vlan = p->vlan_admin ? p->vlan_admin : (uint16_t)config_port_vlan(&cfg, p->id);   /* Part 13: from the configuration, Part 16: unless swctl set it */
             p->trunk = cfg.trunk_port == p->id;
             if (p->q.rate > 0)
                 log_msg(LOG_INFO, "port %d: rate limit %d frames/s", p->id, p->q.rate);
@@ -270,6 +270,8 @@ static void teardown_port(port_t *p)
     port_reset(p);
     p->rx_started = false;
     p->state = final_state;
+    if (p->vlan_admin)
+        p->vlan = p->vlan_admin;                         /* Part 16: a VLAN set with swctl stays with the port */
     stats_set_state(id, final_state);                    /* Part 14 */
     stats_set_vlan(id, p->vlan);                         /* port_reset restored the default VLAN */
     stats_set_mirror(id, atomic_load(&p->mirror_to));
@@ -347,7 +349,7 @@ bool port_wait_down(int id, unsigned long since, long timeout_ms)
     if (id < 0 || id > MAX_PORTS)
         return false;
     CHECK_PT(pthread_mutex_lock(&sw.port_down_lock));
-    while (sw.port_down_gen[id] == since && rc == 0)
+    while (sw.port_down_gen[id] == since && rc == 0 && !atomic_load(&sw.shutting_down))   /* request_shutdown() broadcasts port_down_cond */
         rc = pthread_cond_timedwait(&sw.port_down_cond, &sw.port_down_lock, &deadline);
     done = (sw.port_down_gen[id] != since);
     CHECK_PT(pthread_mutex_unlock(&sw.port_down_lock));
@@ -558,7 +560,111 @@ void port_set_vlan(port_t *p, uint16_t vlan)
 {
     CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
     p->vlan = vlan;
+    p->vlan_admin = 0;                       /* Part 16: a configuration that changes this port's VLAN replaces what swctl set */
     stats_set_vlan(p->id, vlan);             /* Part 14: shared copy for "show ports" */
     CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
     (void)mac_flush_port(p->id);             /* after the unlock: old-VLAN entries of this port vanish */
+}
+
+/* ------------------------------------------------------------------ */
+/* Live reconfiguration (Part 16)                                      */
+/* ------------------------------------------------------------------ */
+
+const char *admin_shutdown(int id)
+{
+    port_t *p = &sw.ports[id];
+    unsigned long since = port_down_count(id);           /* before the request: the leaf lock is never taken under ports_lock */
+    struct timespec deadline = deadline_mono(ADMIN_DOWN_TIMEOUT_MS);
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    switch (p->state) {
+    case PORT_DISABLED:
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return "port is already disabled";
+    case PORT_CLOSING:
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return "port is already closing";                 /* a host disconnect (or security) won the UP -> CLOSING transition */
+    case PORT_FREE:
+        p->state = PORT_DISABLED;
+        stats_set_state(id, PORT_DISABLED);
+        /* One FREE port less means one token less. EAGAIN: the accept thread holds the last token and is about to call port_start(),
+         * which will find no FREE port (PS_NONE) and drop that token: the invariant (tokens = FREE ports) holds either way. */
+        if (sem_trywait(&sw.free_ports) < 0 && errno != EAGAIN)
+            log_msg(LOG_ERR, "port %d: sem_trywait failed: %s", id, strerror(errno));
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        log_msg(LOG_INFO, "port %d: disabled by an admin (it had no host)", id);
+        return NULL;
+    case PORT_UP:
+        break;
+    }
+    request_down_locked(p, PORT_DISABLED);                /* we hold the write lock and the port is UP: we win */
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+
+    /* The reaper does the teardown (Part 5). Wait for it without any lock. */
+    for (;;) {
+        CHECK_PT(pthread_rwlock_rdlock(&sw.ports_lock));
+        const enum port_state st = p->state;
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+
+        if (st == PORT_DISABLED) {
+            log_msg(LOG_INFO, "port %d: disabled by an admin", id);
+            return NULL;
+        }
+        if (atomic_load(&sw.shutting_down))
+            return "the switch is shutting down";
+        const long left = ts_diff_ms(deadline, now_mono());
+        if (left <= 0)
+            return "timeout waiting for the port to shut down";
+        (void)port_wait_down(id, since, left);
+        since = port_down_count(id);                      /* an older teardown may have finished: look at the state again */
+    }
+}
+
+const char *admin_up(int id)
+{
+    port_t *p = &sw.ports[id];
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    if (p->state != PORT_DISABLED) {
+        const enum port_state st = p->state;              /* read WHILE the lock is held: the state changes as soon as it is released */
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return st == PORT_FREE ? "port is not disabled (it is FREE)" :
+               st == PORT_UP ? "port is not disabled (it is UP)" : "port is not disabled (it is closing)";
+    }
+    atomic_store(&p->mac_count, 0);                       /* port security starts again from zero (the flush already did it) */
+    p->state = PORT_FREE;                                 /* DISABLED -> FREE, then the token: a host that gets it finds the port FREE */
+    stats_set_state(id, PORT_FREE);
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    if (sem_post(&sw.free_ports) < 0)
+        log_msg(LOG_ERR, "port %d: sem_post failed: %s", id, strerror(errno));
+    log_msg(LOG_INFO, "port %d: brought up by an admin (FREE)", id);
+    return NULL;
+}
+
+const char *admin_vlan(int id, int vlan)
+{
+    port_t *p = &sw.ports[id];
+    config_t cfg;
+    bool moved = false;
+
+    CHECK_PT(pthread_rwlock_wrlock(&sw.ports_lock));
+    config_snapshot(&cfg);                                /* config_lock is a leaf: fine under ports_lock */
+    if (p->trunk || cfg.trunk_port == id) {
+        CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+        return "port is the trunk (it carries every VLAN)";
+    }
+    p->vlan_admin = (uint16_t)vlan;                       /* kept for the next host of a free port */
+    moved = p->state == PORT_UP && p->vlan != (uint16_t)vlan;
+    p->vlan = (uint16_t)vlan;
+    stats_set_vlan(id, vlan);
+    CHECK_PT(pthread_rwlock_unlock(&sw.ports_lock));
+    if (moved)
+        (void)mac_flush_port(id);                         /* entries learned in the old VLAN vanish; no lock is held */
+    log_msg(LOG_INFO, "port %d: VLAN set to %d by an admin%s", id, vlan, moved ? " (its old MAC entries were flushed)" : "");
+    return NULL;
+}
+
+int admin_clear_mac(void)
+{
+    return mac_clear();
 }

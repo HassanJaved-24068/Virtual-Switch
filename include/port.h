@@ -42,6 +42,8 @@ typedef struct port {
     enum port_state state;     /* protected by sw.ports_lock */
     int rfd, wfd;              /* socket (rfd == wfd for a TCP host), -1 if none */
     uint16_t vlan;
+    uint16_t vlan_admin;       /* Part 16: VLAN set by "swctl vlan" (0 = none). Survives teardown, so a free port keeps it for the next host; a
+                                * configuration reload that changes this port's VLAN clears it. Protected by sw.ports_lock. */
     bool trunk;
     _Atomic int mirror_to;     /* used from Part 17 */
     _Atomic int mac_count;     /* used from Part 6 */
@@ -169,8 +171,8 @@ void reaper_finish(void);
 /*
  * Teardown notification for admin commands (Part 16): port_down_count() gives the
  * number of teardowns finished for a port; port_wait_down() waits until that
- * number is different from `since` (or the timeout ms ends). Returns true if a
- * teardown finished.
+ * number is different from `since`, the timeout ms ends, or the switch is shutting
+ * down (request_shutdown() wakes the waiters). Returns true if a teardown finished.
  */
 unsigned long port_down_count(int id);
 bool port_wait_down(int id, unsigned long since, long timeout_ms);
@@ -199,5 +201,24 @@ bool port_vlan_ok(const port_t *dst, uint16_t vlan);
 
 /* Apply a new rate to port `id` if it is UP (a port that starts later reads the configuration itself). */
 void port_apply_rate(int id, int rate);
+
+/*
+ * Live reconfiguration (Part 16), called by the admin thread. Each returns NULL on success or a static text that
+ * becomes "ERR <text>". None of them holds a lock while it waits or joins; the teardown itself is the reaper's.
+ *
+ *   admin_shutdown  UP: port_request_down(DISABLED), then wait up to ADMIN_DOWN_TIMEOUT_MS until the reaper has finished (state DISABLED).
+ *                   FREE: under the write lock set DISABLED and take one token (sem_trywait; EAGAIN means an accept is in progress,
+ *                   which then finds no slot: port_start answers PS_NONE and the token is dropped, so the Part 5 invariant holds).
+ *                   DISABLED or CLOSING: an error.
+ *   admin_up        DISABLED -> FREE under the write lock, then sem_post. Any other state: an error.
+ *   admin_vlan      any state (a free port keeps the VLAN for its next host); the trunk is refused. A connected port moves at once and
+ *                   its MAC entries of the old VLAN are flushed.
+ *   admin_clear_mac mac_clear(): buckets one at a time, ascending; returns how many entries were removed.
+ */
+#define ADMIN_DOWN_TIMEOUT_MS 5000
+const char *admin_shutdown(int id);
+const char *admin_up(int id);
+const char *admin_vlan(int id, int vlan);
+int admin_clear_mac(void);
 
 #endif /* PORT_H */

@@ -425,3 +425,18 @@ program that ignores SIGINT.
   failed check (the marker frames dropped on the 8-slot queue of the reading host while valgrind was slow) was NOT shown: the test prints no counters, and the log was not kept.
   Status: unexplained, not reproduced, test and switch unchanged. If it recurs, the first things to capture are the switch's `dropped` counters (`swctl stats`) at the moment of the
   failure and the run time of the test.
+
+## 28. Part 16: a data race in the new `admin_up`, found by TSan (genuine defect, fixed before the commit)
+- Symptom: `python3 tests/test_reconfig.py tsan` ended with status 66 and two ThreadSanitizer reports ("data race", `port_start` / `teardown_port` writing
+  `port.state` against `admin_up` reading it). The roadmap stress script under TSan did NOT show it; only the targeted tests that call `up` on ports that are
+  not disabled while hosts connect and leave did.
+- Cause: in the error path of `admin_up` the reply text was chosen with `p->state` AFTER `pthread_rwlock_unlock(&sw.ports_lock)`:
+  `return p->state == PORT_FREE ? ... `. The state changes as soon as the lock is released.
+- Fix: the state is copied into a local variable while the lock is held, the reply is chosen from the copy (src/port.c). Three further TSan runs: 0 reports.
+- Test-side lesson (mutation checks of the Part 16 tests): (1) "FREE shutdown forgets sem_trywait" was invisible to the first version of test 1 (the third
+  host gets 'switch full' either way), only to its timing: it now asserts that the host waited port_wait_timeout. (2) "shutdown answers before the teardown has
+  finished" cannot be seen by polling (the teardown is faster than the next round trip): the test now asserts the LOG ORDER (the reaper's "teardown
+  complete" precedes the admin's answer), which is deterministic. All five mutations are caught.
+- Working-practice note: a first mutation attempt on the real source tree broke `src/port.c` (a mutation text that opened a `/*` comment) while the backup
+  directory had been cleaned up by the session; it was restored by reversing the exact replacement and verified by a build and the tests. Mutation checks now run
+  in a separate copy of the project.

@@ -38,6 +38,7 @@ fi
 
 TMPD=$(mktemp -d "${TMPDIR:-/tmp}/vswitch.$SCRIPT.XXXXXX") || exit 2
 SWPID=""
+SW_ARGS=()                            # extra arguments for the switch, e.g. SW_ARGS=(-c file) before sw_start (Part 16)
 SWLOG=""
 SWERR=""
 PORT=0
@@ -122,7 +123,7 @@ sw_start() { # sw_start NPORTS [small]  (small = K=4 entries, aging 3 s, at most
     PORT=$(T python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     SWLOG=$TMPD/switch.$PORT.log          # the switch's log file (the logger thread writes it)
     SWERR=$TMPD/switch.$PORT.err          # its stderr: valgrind / ThreadSanitizer reports
-    VSWITCH_LOG_FILE="$SWLOG" "${SW_PRE[@]}" "$bin" "$PORT" "$n" 2>"$SWERR" &
+    VSWITCH_LOG_FILE="$SWLOG" "${SW_PRE[@]}" "$bin" "$PORT" "$n" ${SW_ARGS[@]+"${SW_ARGS[@]}"} 2>"$SWERR" &
     SWPID=$!
     if ! wait_file "$SWLOG" "listening on TCP port $PORT"; then
         bad "the switch did not start"
