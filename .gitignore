@@ -32,3 +32,4 @@ core.*
 __pycache__/
 /virtual-switch.tar.gz
 report/Report.ps
+report/Report.pdf
