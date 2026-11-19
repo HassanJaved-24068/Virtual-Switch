@@ -4,9 +4,9 @@ A multithreaded software network switch for Linux, written in C. Hosts connect o
 which MAC address is behind which port, forwards frames only where they have to go, floods unknown
 destinations and broadcasts, and manages its ports, MAC table, logging, signals and configuration.
 
-This README describes the switch as of **Part 20** (bonus: the supervisor and the crash-surviving MAC table, `--persist-mac`; before it Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
+This README describes the switch as of **Part 21** (bonus: the benchmark of the MAC table locking, `make bench`; before it Part 20, the supervisor and the crash-surviving MAC table, `--persist-mac`; Part 19, two switches joined by a two-pipe trunk, `--pair`; before it Part 18, the Tier 2 checkpoint: integration scripts, the hostile-host simulation and the source checks; Part 17, port mirroring; Part 16, live reconfiguration by `swctl shutdown|up|vlan|clear mac`; before it Part 15, the admin socket and `swctl`; before it the per-port counters in POSIX shared memory of Part 14, VLANs and the trunk port of
 Part 13, rate limiting of Part 12, the priority queues of Part 11 and the configuration file, `SIGHUP` reload and `SIGUSR1` MAC dump of Part 10).
-The last bonus item of Tier 3 (the benchmark, Part 21) is not implemented yet; where the configuration file already accepts their keys
+All the bonus items of Tier 3 are implemented; where the configuration file already accepts their keys
 this is said explicitly below.
 
 ## Build
@@ -180,6 +180,32 @@ MAC table of Part 6 (one region, indices instead of pointers, process-shared rob
 * The supervisor is a single-threaded process that waits in `poll()` on a `signalfd` (`SIGCHLD`, `SIGINT`, `SIGTERM`): no signal handlers and no sleeping; the one-second restart
   delay is the `poll()` timeout, so a signal during the delay is handled at once.
 
+## Benchmark: global lock vs striped locks vs rwlock (Part 21)
+
+`mactable.c` can be built with another locking strategy: `-DMAC_LOCK=STRIPED` (the default: one mutex per bucket, 256 of them), `GLOBAL` (one mutex for the whole table) or `RWLOCK` (one
+`pthread_rwlock_t`: `mac_lookup` takes the read lock, learn / age / flush / evict / clear the write lock). `pool_lock` and every other rule are the same, so the three are interchangeable;
+the switch uses STRIPED. The unit tests of the table (8-thread stress included) run against all three (`build/test_mactable_global`, `_rwlock`, and under TSan). `--persist-mac` needs the
+robust per-bucket mutexes of STRIPED: the other two refuse it.
+
+```
+make bench                  # switch_global, switch_striped, switch_rwlock, bench/bench, bench/bench_mac_{global,striped,rwlock}   (all -O0, like everything else)
+bench/run.sh                # the whole benchmark (about 9 minutes; --quick: a 1-minute check), then bench/plot.py
+./bench/bench <ip> <tcp_port> <hosts> <seconds> <payload> [seed]     # the load generator against a running switch (2-64 hosts)
+./bench/bench_mac_<variant> <threads> <seconds> [seed]               # the MAC table alone, 90 % lookup / 10 % learn
+```
+
+* **`bench/bench`** opens H connections; each host has a sender thread and a reader thread. It warms up (broadcasts are repeated until every host has received a broadcast of every other,
+  so every MAC is learned and the measured frames are unicast), then every sender sends unicast frames to random other hosts as fast as it can for the given time; the result is the
+  number of frames **received** per second. **`bench/bench_mac_*`** links `mactable.c` directly and measures the lock without the network, the logging and the system calls.
+  The random choices use fixed seeds.
+* **`bench/run.sh`** runs every point 3 times (the three variants one after the other, so a drift of the machine hits them alike) and writes `bench/raw_mac.csv`, `bench/raw_net.csv`,
+  `bench/machine.txt`; **`bench/plot.py`** takes the median and writes `bench/results.csv`, **`bench/throughput.png`** (the graph) and the one-page **`bench/report.pdf`** (machine, method,
+  graph, tables, an explanation generated from the numbers). Neither matplotlib nor gnuplot is installed on the project's machine, so `plot.py` draws with PIL; the same CSV files always
+  give the same picture. Run it on a quiet machine, and not while another switch runs (the switches use the fixed shared-memory name `/vswitch_stats_P`).
+* **Result on the project's machine** (2 cores, i7-6600U, -O0): in-process, striped locking scales (6.5M operations/s with 1 thread, about 10M with 2 or more), the global lock falls to
+  about half with 2 threads (3.4M) and the single rwlock to about an eighth (0.85M; every reader updates the same lock word and the 10 % learns block everybody); in the whole switch the three
+  variants are indistinguishable within the noise (one frame costs about 20 us, a table operation about 140 ns). Details and the explanation: `bench/report.pdf`.
+
 ## Counters in shared memory
 
 The per-port counters live in the POSIX shared-memory object **`/vswitch_stats_P`** (`ls -l /dev/shm` shows `vswitch_stats_P` while the
@@ -329,6 +355,8 @@ python3 tests/test_reconfig.py [tsan|valgrind]         # shutdown / up / vlan / 
 python3 tests/test_mirror.py [tsan|valgrind]           # port mirroring with the real switch and sniffers (Part 17)
 python3 tests/test_pair.py [tsan|valgrind]             # two switches joined by two pipes: VLANs across the link, peer death, stalled peer, SIGINT (Part 19)
 ./build/test_macshm                                    # the shared MAC table: reuse, a dead lock owner, damaged tables (after `make build/test_macshm`; Part 20)
+python3 tests/test_bench.py                            # the benchmark: forward.sh with every locking strategy, bench / bench_mac, run.sh --quick, plot / report (Part 21)
+./build/test_mactable_global  ./build/test_mactable_rwlock   # the MAC table unit tests against the other locking strategies (after `make build/test_mactable_global ...`; Part 21)
 python3 tests/test_persist.py [tsan|valgrind]          # --persist-mac and the supervisor: kill -9 / -SEGV, recovery, restarts, giving up, clean-up (Part 20)
 ./tests/reconfig_stress.sh                             # 500 random admin operations + SIGHUP/SIGUSR1 every 0.2 s under traffic (Part 16; VARIANT=tsan|valgrind too)
 python3 tests/static_checks.py                         # no sleep() in the switch; no ignored result of a system / pthread call (Part 18; runs first in make test)

@@ -1,0 +1,69 @@
+=====================================================================
+PART 21 - BONUS: BENCHMARK (GLOBAL LOCK VS STRIPED LOCKS VS RWLOCK)
+=====================================================================
+
+1. WHAT THE ROADMAP ASKS
+------------------------
+A compile-time switch in mactable.c: -DMAC_LOCK=STRIPED (default) | GLOBAL (one mutex) | RWLOCK (one pthread_rwlock_t; lookups take the read lock, learn and age the write lock). make bench builds
+switch_global, switch_striped, switch_rwlock. bench.c: ./bench <ip> <port> <hosts> <seconds> <payload>: H connections, each with a sender thread (unicast to random peers after a warm-up broadcast so
+that MACs are learned) and a reader thread counting frames; prints the total frames/s received. bench_mac: an in-process micro-benchmark linking mactable.c directly, T threads, 90/10 lookup/learn
+for a fixed time. bench/run.sh -> CSV for H or T = 1, 2, 4, 8, 16 -> plot.py or gnuplot -> bench/throughput.png and a 1-page bench/report.pdf. All builds -O0. Every point run 3 times, the median
+reported; fixed seeds; the report states the machine, the cores and the explanation. Completion: all three variants pass forward.sh; the graph and the report exist and the numbers can be reproduced.
+
+2. WHAT WAS DONE (files)
+------------------------
+src/mactable.c, include/mactable.h   MAC_LOCK = STRIPED | GLOBAL | RWLOCK: only bucket_lock / bucket_rdlock / bucket_unlock differ (mac_lookup is the only reader); the two extra locks
+                                     (global_lock, rw_lock) exist in every build, so the layout does not depend on the variant; the variants that cannot do the Part 20 recovery refuse --persist-mac.
+Makefile                             make bench; the three switches (same objects, only mactable.o differs); bench/bench; bench/bench_mac_<variant>; the MAC table unit tests against GLOBAL and RWLOCK
+                                     (also under TSan); `%.d: ;` and static pattern rules (see bugs.md item 35).
+bench/bench.c, bench/bench_mac.c, bench/run.sh, bench/plot.py      the load generator, the micro-benchmark, the driver, the graph / report generator.
+bench/raw_mac.csv, raw_net.csv, machine.txt, results.csv, throughput.png, report.pdf     the results of the real run (committed so that the report exists and its numbers can be checked).
+tests/test_bench.py (permanent), tests/test_part21.py (TEMPORARY dedicated runner), tests/run_unit.sh, README.md, notes/{bugs,locks}.md, .gitignore (the built programs, __pycache__).
+
+3. DESIGN DECISIONS
+-------------------
+* One source file, three builds: the callers of the lock are the same code, so the comparison is fair. The rule that makes it safe is the old one: at most ONE of these locks is held at a time.
+* The roadmap's "H or T = 1, 2, 4, 8, 16": the in-process benchmark uses T = 1, 2, 4, 8, 16; the network benchmark uses H = 2, 4, 8, 16, because with ONE host nothing can be delivered (there is no
+  peer) and the point would be a flat zero.
+* bench warms up by REPEATING each host's broadcast until every host has heard every other (the switch accepts connections one at a time, so an early broadcast can miss a host); broadcasts are never
+  counted; the counted frames are unicast. bench_mac checks every lookup answer and mac_check_counts() at the end, so a variant that is fast but wrong cannot pass.
+* matplotlib and gnuplot are not installed here (and installing software was not asked for): plot.py draws the graph and the report with PIL, which is. It is a function of the CSV files only (the test
+  checks that two runs give byte-identical output); the text of the report is generated from the numbers.
+* Machine: 2 logical CPUs (i7-6600U). Points above 2 threads / hosts are oversubscribed; the report says so.
+
+4. RESULT (bench/report.pdf, bench/results.csv; 5 s per point, median of 3)
+----------------------------------------------------------------------------
+MAC table alone (operations/s):  threads 1 / 2 / 4 / 8 / 16
+   global   7.20M / 3.36M / 3.29M / 3.48M / 5.35M
+   striped  6.50M / 9.80M / 10.09M / 9.80M / 10.15M
+   rwlock   7.35M / 0.85M / 2.46M / 2.98M / 2.80M
+Whole switch (frames received/s):  hosts 2 / 4 / 8 / 16
+   global   49.4k / 43.7k / 37.4k / 33.3k      striped  50.9k / 43.9k / 41.6k / 28.1k      rwlock  46.9k / 42.8k / 39.5k / 26.4k
+* Striped locking scales to the cores (1.5 x its 1-thread value on 2 cores); the global mutex loses about half at 2 threads; the single rwlock is the WORST (an eighth at 2 threads), contrary to the usual
+  expectation: all readers update the same lock word and the 10 % learns block everybody. The global lock recovers partly at 16 threads (oversubscribed machine; stated in the report).
+* In the whole switch the three variants are the same within the noise (the runs of one variant differ by up to 42 %): one delivered frame costs about 20 us of the machine, one table operation about
+  140 ns, so the lock is not the bottleneck of the switch; the micro-benchmark is what shows it.
+The numbers depend on the machine and on what else runs on it; the seeds, the method and the raw CSV files are in the repository.
+
+5. TESTS
+--------
+tests/test_bench.py (57 checks): the programs exist; EVERY variant passes tests/forward.sh (run unchanged in a scratch directory whose ./switch is the variant); bench_mac of every variant; bench against a real
+switch of every variant (frames received, warm-up completed, switch exits 0, no [ERR]); 8 bad-argument cases; bench/run.sh --quick writes every file, the report is one page, plot.py is byte-for-byte
+reproducible; --persist-mac is refused by GLOBAL and RWLOCK. build/test_mactable_global and build/test_mactable_rwlock (366 checks each, 8-thread stress included), normal and under TSan.
+
+6. RESULTS OF THE VERIFICATION
+------------------------------
+Final runs on 2026-11-19 on a CLEAN tree (make clean first), after the last change:
+  make test            EXIT 0  (unit + regression suite of Parts 1-21, 20 integration scripts; includes tests/test_bench.py 57/57 and the MAC table unit tests against GLOBAL / RWLOCK)
+  make test-tsan       EXIT 0  (19 scripts, no ThreadSanitizer report)
+  make test-valgrind   EXIT 0  (19 scripts, no valgrind error or leak)
+  make bench and `make` from clean and after `touch`: no warning, no error. tests/static_checks.py: clean.
+  bench/run.sh: one real run (5 s per point, 3 runs), the numbers of section 4.
+
+Honest account of the verification: `make test` was run FIVE times; the first four each stopped at a different problem, none of them a defect of the benchmark code:
+  1. tests/run_unit.sh never built build/test_macshm (a gap from Part 20, hidden by a binary built by hand): FIXED (notes/bugs.md item 35).
+  2. tests/test_host.py (Part 2), once: `Connection reset by peer` instead of a refusal, 6 runs alone passed: test-side flake, NOT edited (item 36).
+  3. build/test_mactable_global_tsan: TSan "destroy of a locked mutex" caused by the Part 6 test_robust on the variants that do not use the bucket mutexes (a test artifact; I had missed it
+     because my manual run only showed the last lines): handled with TSAN_OPTIONS=report_destroy_locked=0 for those two runs only (item 37).
+  4. build/test_qos (Part 11), once: a wall-clock control check failed under load, 8 runs alone passed: test-side timing flake, NOT edited (item 38).
+  The 5th run, on a clean tree, passed completely. Items 36 and 38 are historical tests that are sensitive to machine load; fixes are proposed in notes/bugs.md for the owner to approve.

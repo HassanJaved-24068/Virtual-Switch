@@ -6,7 +6,7 @@ make -s all switch_small build/test_util build/test_frame build/test_queue build
         build/test_port build/test_mactable build/test_queue_tsan build/test_refcount_tsan \
         build/test_port_tsan build/test_mactable_tsan build/test_log build/test_log_tsan build/test_config build/test_config_tsan build/test_qos build/test_qos_tsan \
         build/test_rate build/test_rate_tsan build/test_vlan build/test_vlan_tsan build/test_stats build/test_stats_tsan \
-        build/test_admin build/test_admin_tsan build/test_swctl build/test_mirror build/test_mirror_tsan || exit 1
+        build/test_admin build/test_admin_tsan build/test_swctl build/test_mirror build/test_mirror_tsan build/test_macshm build/test_macshm_tsan || exit 1
 
 run() {
     echo "=== $* ==="
@@ -146,4 +146,14 @@ if command -v valgrind >/dev/null; then
     run valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=all --error-exitcode=1 --track-fds=yes ./build/test_macshm
 fi
 
-echo "Parts 1-20 unit and regression tests passed."
+make -s bench build/test_mactable_global build/test_mactable_rwlock build/test_mactable_global_tsan build/test_mactable_rwlock_tsan || exit 1
+run ./build/test_mactable_global          # Part 21: the MAC table unit tests (8-thread stress included) against the GLOBAL locking strategy
+run ./build/test_mactable_rwlock          # Part 21: ... and against the RWLOCK strategy
+# Under TSan the Part 6 test test_robust kills a thread that holds a BUCKET mutex. The GLOBAL and RWLOCK builds do not use the bucket mutexes (they lock their one lock), so that mutex is never
+# unlocked and TSan reports "destroy of a locked mutex" at cleanup: an artifact of the test, not of mactable.c (notes/bugs.md item 37). ONLY that report kind is switched off; every
+# data race, lock-order and other report still fails the run. The default (STRIPED) build is run without the option.
+run env TSAN_OPTIONS=report_destroy_locked=0 $NOASLR ./build/test_mactable_global_tsan   # Part 21: the same under ThreadSanitizer
+run env TSAN_OPTIONS=report_destroy_locked=0 $NOASLR ./build/test_mactable_rwlock_tsan   # Part 21: the same under ThreadSanitizer
+run python3 tests/test_bench.py           # Part 21: forward.sh with every variant, bench / bench_mac, bad arguments, run.sh --quick, plot / report
+
+echo "Parts 1-21 unit and regression tests passed."

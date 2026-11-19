@@ -115,3 +115,12 @@ Status of Parts 1-15 comes from their own commits (all pushed before this sessio
 
 Applied with the owner's approval: scenario 7 now waits until every host has received the three learn broadcasts of the others before it resets the frame counters (one added check, 156 checks
 instead of 155). Before: about 1 failure in 4 runs. After: 12 consecutive normal runs passed (156/156), the TSan variant passed (122/122) and the valgrind variant passed (17/17).
+
+## 10. Follow-up: Part 21 (benchmark), started after the owner asked for it
+
+Implemented as in docs/Part21_Explanation.txt: `-DMAC_LOCK=STRIPED|GLOBAL|RWLOCK` in mactable.c, `make bench` (switch_global / switch_striped / switch_rwlock, bench/bench, bench/bench_mac_*),
+bench/run.sh, bench/plot.py, the results of one real run (bench/results.csv, throughput.png, one-page report.pdf), tests/test_bench.py (57 checks) and the MAC table unit tests against the two other
+strategies. Verified on a clean tree: `make test`, `make test-tsan`, `make test-valgrind` all EXIT 0 (the fifth `make test`; the first four stopped at: a missing build line for the Part 20 test_macshm,
+fixed; a one-off flake of the Part 2 test_host.py; a TSan report that is an artifact of the Part 6 test_robust on the variants that do not use the bucket mutexes, handled with a scoped TSAN option;
+a one-off timing flake of the Part 11 test_qos; details and proposed fixes in notes/bugs.md items 35-38). The Part 20 commit (5266fbc) had the missing build line, so on a clean checkout its
+`make test` would have stopped at test_macshm; the Part 21 commit fixes it. Part 22 was not started.

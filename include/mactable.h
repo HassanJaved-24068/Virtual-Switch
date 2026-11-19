@@ -15,6 +15,10 @@
  *     bucket lock while holding pool_lock.
  * The mutexes are PROCESS_SHARED and ROBUST (needed by bonus Part 20; they
  * work in ordinary heap memory too).
+ *
+ * Part 21 (benchmark): mactable.c can be built with another locking strategy, -DMAC_LOCK=STRIPED (default, the rules above), GLOBAL (ONE mutex instead of the bucket
+ * locks) or RWLOCK (ONE pthread_rwlock_t: mac_lookup takes the read lock, learn / age / flush / evict / clear take the write lock). pool_lock is unchanged. The variants
+ * exist to be measured (bench/); the --persist-mac recovery of Part 20 is only supported by STRIPED (mac_attach_shm returns ENOTSUP otherwise).
  */
 #ifndef MACTABLE_H
 #define MACTABLE_H
@@ -48,6 +52,10 @@ typedef struct {
     uint32_t magic;
     int32_t K;                     /* number of entries in the pool */
     int32_t nbuckets;              /* power of two */
+    /* Part 21: the lock of the GLOBAL and RWLOCK variants (mactable.c, -DMAC_LOCK=GLOBAL | RWLOCK). They exist in every build so that the layout never depends on the
+     * variant; the default (STRIPED) build uses the per-bucket locks and never touches them. */
+    pthread_mutex_t global_lock;
+    pthread_rwlock_t rw_lock;
     pthread_mutex_t pool_lock;
     int32_t free_head;             /* first free entry, -1 = pool empty */
     int count;                     /* entries in use */

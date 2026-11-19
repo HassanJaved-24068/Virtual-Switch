@@ -20,7 +20,7 @@ SMALL_TSAN_DIR = build/small_tsan
 COMMON_OBJ = $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(COMMON_SRC))
 TSAN_OBJ   = $(patsubst src/%.c,$(TSAN_DIR)/%.o,$(COMMON_SRC))
 
-.PHONY: all tsan clean test test-valgrind test-tsan
+.PHONY: all tsan clean test test-valgrind test-tsan bench bench-clean
 all: $(PROGRAMS)
 tsan: $(TSAN_PROGRAMS) switch_small_tsan
 
@@ -87,6 +87,50 @@ build/test_%: tests/test_%.c $(COMMON_OBJ)
 	@mkdir -p build
 	$(CC) $(CFLAGS) -MMD -MP -o $@ $^ $(LDLIBS)
 
+# ---- Part 21: the benchmark (global lock vs striped locks vs rwlock in the MAC table) ----
+# Everything is built with the same flags as the rest of the project (-O0 included). The three switches differ ONLY in mactable.c (-DMAC_LOCK=GLOBAL | STRIPED | RWLOCK);
+# bench/bench is the network load generator, bench/bench_mac_<variant> the in-process micro-benchmark that links the variant of mactable.c directly.
+BENCH_VARIANTS = global striped rwlock
+BENCH_DIR      = build/bench
+BENCH_TSAN_DIR = build/bench_tsan
+BENCH_SWITCHES = $(patsubst %,switch_%,$(BENCH_VARIANTS))
+BENCH_MAC      = $(patsubst %,bench/bench_mac_%,$(BENCH_VARIANTS))
+uc = $(shell echo $(1) | tr a-z A-Z)
+SWITCH_OTHER_OBJ = $(patsubst %,$(OBJ_DIR)/%.o,switch $(filter-out mactable,$(SWITCH_NAMES)))
+MAC_OTHER_OBJ    = $(patsubst %,$(OBJ_DIR)/%.o,$(filter-out mactable,$(SWITCH_NAMES)))
+MAC_OTHER_TSAN   = $(patsubst %,$(TSAN_DIR)/%.o,$(filter-out mactable,$(SWITCH_NAMES)))
+
+bench: $(BENCH_SWITCHES) bench/bench $(BENCH_MAC)
+
+$(BENCH_DIR)/mactable_%.o: src/mactable.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DMAC_LOCK=$(call uc,$*) -MMD -MP -c -o $@ $<
+
+$(BENCH_TSAN_DIR)/mactable_%.o: src/mactable.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fsanitize=thread -DMAC_LOCK=$(call uc,$*) -MMD -MP -c -o $@ $<
+
+$(BENCH_SWITCHES): switch_%: $(BENCH_DIR)/mactable_%.o $(SWITCH_OTHER_OBJ) $(COMMON_OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+bench/bench: bench/bench.c $(COMMON_OBJ)
+	$(CC) $(CFLAGS) -MMD -MP -o $@ $^ $(LDLIBS)
+
+$(BENCH_MAC): bench/bench_mac_%: bench/bench_mac.c $(BENCH_DIR)/mactable_%.o $(MAC_OTHER_OBJ) $(COMMON_OBJ)       # a STATIC pattern: a plain one would also match bench_mac_<v>.d
+	$(CC) $(CFLAGS) -DBENCH_VARIANT='"$*"' -MMD -MP -o $@ $^ $(LDLIBS)
+
+# the unit tests of the MAC table against the other two locking strategies (the default build is tested by build/test_mactable)
+build/test_mactable_global build/test_mactable_rwlock: build/test_mactable_%: tests/test_mactable.c $(BENCH_DIR)/mactable_%.o $(MAC_OTHER_OBJ) $(COMMON_OBJ)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+build/test_mactable_global_tsan build/test_mactable_rwlock_tsan: build/test_mactable_%_tsan: tests/test_mactable.c $(BENCH_TSAN_DIR)/mactable_%.o $(MAC_OTHER_TSAN) $(TSAN_OBJ)
+	@mkdir -p build
+	$(CC) $(CFLAGS) -fsanitize=thread -o $@ $^ $(LDLIBS)
+
+bench-clean:
+	rm -f $(BENCH_SWITCHES) bench/bench $(BENCH_MAC)
+
 # make test = ./tests/run_all.sh (normal variant: Parts 1-7 suite + the ten integration scripts)
 test:
 	./tests/run_all.sh
@@ -98,6 +142,9 @@ test-tsan:
 	VARIANT=tsan ./tests/run_all.sh
 
 clean:
-	rm -rf build $(PROGRAMS) $(TSAN_PROGRAMS) switch_small switch_small_tsan
+	rm -rf build $(PROGRAMS) $(TSAN_PROGRAMS) switch_small switch_small_tsan $(BENCH_SWITCHES) bench/bench $(BENCH_MAC) bench/*.d
 
--include $(wildcard $(OBJ_DIR)/*.d $(TSAN_DIR)/*.d $(SMALL_DIR)/*.d $(SMALL_TSAN_DIR)/*.d build/*.d)
+# Dependency files are never remade (without this, make tries to "link" an included X.d from X.d.o, which the bench pattern rules would happily build with a bogus -DMAC_LOCK).
+%.d: ;
+
+-include $(wildcard $(OBJ_DIR)/*.d $(TSAN_DIR)/*.d $(SMALL_DIR)/*.d $(SMALL_TSAN_DIR)/*.d build/*.d $(BENCH_DIR)/*.d $(BENCH_TSAN_DIR)/*.d bench/*.d)

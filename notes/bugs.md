@@ -495,3 +495,43 @@ program that ignores SIGINT.
 - Proof: with the counters reset only after every host had received the three broadcasts of the others (`wait_for(lambda: all(h.frames == 3 for h in hs))`) 8 consecutive runs passed (156 checks).
   It was first tried and reverted (historical tests are not edited without approval), then applied after the owner approved it.
 - The switch is not involved: no frame is duplicated (the surplus frame is the late broadcast), and the same scenario passed in the Parts 18 and 19 full runs.
+
+## 35. Part 21: three defects of the first draft of the benchmark itself (found by running it; no defect in the switch)
+- bench: the warm-up broadcast of host 0 was sent before the switch had given host 1 a port (the switch accepts one connection at a time), so host 1 never heard it and the warm-up
+  timed out ("1 of 2 broadcast frames arrived"). Fix: main repeats the broadcast of every host that is not yet known to all the others, until every host has received a broadcast of every other.
+- bench: the load generator died with SIGPIPE (exit status 141) when it closed its sockets at the end (a sender wrote to a closed connection). Fix: ignore SIGPIPE, as the switch does.
+- plot.py: `nice_max` looped over the bases before the powers of ten, so the y axis of the first graph ended at 100 instead of 12 and flattened every curve (seen on the first look at the
+  picture). Fix: powers of ten outside, bases inside. The generated explanation also claimed that more threads always LOWER the global lock's throughput; the data (16 threads on 2 cores
+  recover to 74 % of the 1-thread value) contradicts it, so the text is now computed from ranges of the data and notes the recovery.
+- Result worth recording: the single rwlock is the WORST variant (0.85M operations/s with 2 threads against 3.4M for the global mutex): a read-mostly mix with 10 % writers does not make one
+  rwlock scale.
+- Makefile (found by the second `make bench`): GNU make tries to remake an included dependency file `X.d`, and its built-in rule `%: %.o` made it look for `X.d.o`, which the new pattern rule
+  `build/bench/mactable_%.o: src/mactable.c` (a prerequisite that always exists) accepted, with a bogus `-DMAC_LOCK=STRIPED.D` (a compile error that did not stop the build, because the
+  include is `-include`, but filled build/bench with `*.d.d` files). Fixes: the benchmark programs are STATIC pattern rules, `%.d: ;` stops make from remaking dependency files, and
+  `make clean` removes bench/*.d. Verified: a clean build, a rebuild after `touch`, and a no-op build print no error.
+- tests/run_unit.sh (found by `make test` after a `make clean`, Part 21): the Part 20 unit test `build/test_macshm` (and `_tsan`) was never in the list of programs that run_unit.sh builds at
+  its start; it had only passed because the binary had been built by hand. A clean checkout's `make test` would have failed at `./build/test_macshm: No such file`. The Part 20 commit (5266fbc)
+  therefore has this gap; fixed in the Part 21 commit by adding both programs to the build line. Lesson: run `make clean` before the final full verification of every part.
+
+## 36. Part 2's test_host.py: one run in about 7 failed (test-side, environment; NOT changed: historical tests are not edited)
+- Symptom (once, during the Part 21 verification, right after `make clean` and a full rebuild): `FAIL: error message printed: 'host: connect to 127.0.0.1:<port> failed: Connection reset by peer'`.
+  The test connects to a port that nobody listens on and expects a "refused" message; 6 further runs on their own passed (109 checks).
+- Likely cause (not proven): the "closed" port comes from the ephemeral range; on a loaded machine another connection can briefly own it, and the connect then ends in a reset instead of a refusal.
+  src/host.c and the test are unchanged since Part 17; the switch is not involved. Proposed fix, for the owner to approve: accept "refused" OR "reset" in that one check, or pick the port from outside the
+  ephemeral range.
+
+## 37. Part 21: TSan "destroy of a locked mutex" in test_mactable under the GLOBAL and RWLOCK builds (test artifact, not a defect; found by the full suite, MISSED in my first manual run)
+- The Part 6 test `test_robust` makes a thread die while it holds a BUCKET mutex and then checks that the table recovers (EOWNERDEAD). With STRIPED the operations lock and unlock that mutex, so
+  the recovery unlocks it. The GLOBAL and RWLOCK builds never take the bucket mutexes, so the dead thread's mutex stays locked until `mac_destroy`, and ThreadSanitizer reports
+  "destroy of a locked mutex" (exit status 66). The default build is clean; for both variants that is the ONLY report (checked: with the option below, 0 other warnings, exit 0).
+- My first manual run of the two variant TSan tests printed only `tail -3` ("366 checks, 0 failures / ALL PASSED") and so did not show the report or the exit status; the suite did. Lesson: check the
+  exit status, not just the last lines.
+- Handling: the historical test is not edited; the two variant runs in tests/run_unit.sh use TSAN_OPTIONS=report_destroy_locked=0, which switches off exactly that report kind and nothing else.
+  The robust recovery of the global lock itself (lock_robust on `global_lock`) is therefore not exercised at unit level; it is the same helper that the bucket locks use.
+
+## 38. Part 11's test_qos.c control check failed once under load (test-side, timing; NOT changed: historical tests are not edited)
+- Symptom (once, in the 4th full `make test` of the Part 21 verification, a clean rebuild with the desktop's indexers running): `FAIL line 495: c < 0` ("control (no aging)": the low-priority frame was
+  SENT within 1.2 s although, without aging, 5:3:1 weights make it wait for about 1000 high frames). 8 consecutive runs on their own passed (1293 checks each); queue.c, queue.h and the test are unchanged.
+- Likely cause (not proven): the producers of the high-priority frames are ordinary threads; on a busy machine they are starved, the high queue runs dry and the low frame is then legitimately taken.
+  Proposed fix, for the owner to approve: count the frames sent before the low one (the weights are the claim) instead of using a wall-clock window.
+- Together with items 34 (fixed with approval) and 36, this is the third historical test that is sensitive to machine load; the full suite is therefore only meaningful on a quiet machine.

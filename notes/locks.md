@@ -76,3 +76,10 @@ The locks do not change: the bucket locks and `pool_lock` are the same process-s
 the bucket locks ONE AT A TIME in ascending order and then `pool_lock` (never together: the order bucket -> pool is not even needed), and rebuilds what a half-finished update can
 leave wrong (free list, `count`, chains, per-port `mac_count`) by a scan instead of trusting it. (3) A clean exit must NOT `pthread_mutex_destroy` the mutexes (`mac_detach` instead of
 `mac_destroy`): a destroyed mutex cannot be locked again by the next switch. The magic number is written LAST by `mac_init`, so a table that was being built when the process died is never "recovered".
+
+## Part 21: the locking strategy of the MAC table is a compile-time choice (benchmark only)
+
+`-DMAC_LOCK=STRIPED` (default, everything above), `GLOBAL` (`global_lock`, ONE mutex, in the header of the table) or `RWLOCK` (`rw_lock`, ONE `pthread_rwlock_t`). Only `bucket_lock` /
+`bucket_rdlock` / `bucket_unlock` differ; `mac_lookup` is the only reader (`bucket_rdlock`), everything that writes uses `bucket_lock`. The rule "at most ONE bucket lock at a time, nobody
+waits for a bucket lock while holding `pool_lock`" is what makes the variants safe: with a single lock a second acquisition by the same thread would deadlock, and nothing takes one.
+The order is unchanged: `ports_lock` -> (bucket | global | rw) lock -> `pool_lock`. The two extra locks exist in every build (the layout does not depend on the variant) and are unused by STRIPED.

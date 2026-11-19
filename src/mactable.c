@@ -17,6 +17,21 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/*
+ * Part 21: the locking strategy of the table, chosen at compile time with -DMAC_LOCK=STRIPED (default) | GLOBAL | RWLOCK (see mactable.h). The only difference is what
+ * bucket_lock / bucket_rdlock / bucket_unlock do; every caller is the same code. At most ONE of these locks is held at a time (also for GLOBAL and RWLOCK, which would
+ * otherwise deadlock on a second one), so the three variants are interchangeable.
+ */
+#define STRIPED 1
+#define GLOBAL 2
+#define RWLOCK 3
+#ifndef MAC_LOCK
+#define MAC_LOCK STRIPED
+#endif
+#if MAC_LOCK != STRIPED && MAC_LOCK != GLOBAL && MAC_LOCK != RWLOCK
+#error "MAC_LOCK must be STRIPED, GLOBAL or RWLOCK"
+#endif
+
 #define LEARN_RETRIES 3                 /* evictions tried when the pool is empty */
 #define MAX_BUCKETS (1 << 20)
 #define MAX_ENTRIES (1 << 20)
@@ -90,8 +105,19 @@ static void lock_robust(pthread_mutex_t *m)
     CHECK_PT(rc);
 }
 
-static void bucket_lock(mac_bucket_t *b)  { lock_robust(&b->lock); }
+#if MAC_LOCK == STRIPED
+static void bucket_lock(mac_bucket_t *b)   { lock_robust(&b->lock); }
+static void bucket_rdlock(mac_bucket_t *b) { lock_robust(&b->lock); }      /* a mutex has no read side */
 static void bucket_unlock(mac_bucket_t *b) { CHECK_PT(pthread_mutex_unlock(&b->lock)); }
+#elif MAC_LOCK == GLOBAL
+static void bucket_lock(mac_bucket_t *b)   { (void)b; lock_robust(&mt->global_lock); }
+static void bucket_rdlock(mac_bucket_t *b) { (void)b; lock_robust(&mt->global_lock); }
+static void bucket_unlock(mac_bucket_t *b) { (void)b; CHECK_PT(pthread_mutex_unlock(&mt->global_lock)); }
+#else /* RWLOCK */
+static void bucket_lock(mac_bucket_t *b)   { (void)b; CHECK_PT(pthread_rwlock_wrlock(&mt->rw_lock)); }
+static void bucket_rdlock(mac_bucket_t *b) { (void)b; CHECK_PT(pthread_rwlock_rdlock(&mt->rw_lock)); }
+static void bucket_unlock(mac_bucket_t *b) { (void)b; CHECK_PT(pthread_rwlock_unlock(&mt->rw_lock)); }
+#endif
 static void pool_lock(void)               { lock_robust(&mt->pool_lock); }
 static void pool_unlock(void)             { CHECK_PT(pthread_mutex_unlock(&mt->pool_lock)); }
 
@@ -131,6 +157,18 @@ int mac_init(void *region, int K, int nbuckets)
     int rc = init_robust_mutex(&t->pool_lock);
     if (rc != 0)
         return rc;
+    rc = init_robust_mutex(&t->global_lock);                 /* Part 21: only the GLOBAL variant uses it, but it always exists */
+    if (rc != 0)
+        return rc;
+    pthread_rwlockattr_t rwattr;
+    rc = pthread_rwlockattr_init(&rwattr);
+    if (rc == 0)
+        rc = pthread_rwlockattr_setpshared(&rwattr, PTHREAD_PROCESS_SHARED);
+    if (rc == 0)
+        rc = pthread_rwlock_init(&t->rw_lock, &rwattr);
+    CHECK_PT(pthread_rwlockattr_destroy(&rwattr));
+    if (rc != 0)
+        return rc;
     for (int i = 0; i < nbuckets; i++) {
         buckets(t)[i].first = -1;
         rc = init_robust_mutex(&buckets(t)[i].lock);
@@ -157,6 +195,8 @@ void mac_destroy(void)
     for (int i = 0; i < mt->nbuckets; i++)
         CHECK_PT(pthread_mutex_destroy(&buckets(mt)[i].lock));
     CHECK_PT(pthread_mutex_destroy(&mt->pool_lock));
+    CHECK_PT(pthread_mutex_destroy(&mt->global_lock));
+    CHECK_PT(pthread_rwlock_destroy(&mt->rw_lock));
     mt->magic = 0;
     mt = NULL;
 }
@@ -248,6 +288,9 @@ int mac_attach_shm(const char *name, int K, int nbuckets, void **region, size_t 
     struct stat st;
     int rc = 0;
 
+#if MAC_LOCK != STRIPED
+    return ENOTSUP;                                            /* Part 21: the recovery relies on the robust per-bucket mutexes of the default build */
+#endif
     if (size == 0 || name == NULL || name[0] != '/')           /* a POSIX shared-memory name starts with '/' */
         return EINVAL;
     int fd = shm_open(name, O_CREAT | O_RDWR, 0600);           /* no O_EXCL: an existing table is reused */
@@ -468,7 +511,7 @@ int mac_lookup(uint16_t vlan, const mac_t mac)
     mac_bucket_t *b = &buckets(mt)[bucket_of(vlan, mac)];
     int port = -1;
 
-    bucket_lock(b);
+    bucket_rdlock(b);                                       /* RWLOCK: the read side (nothing is written here) */
     int32_t idx = chain_find(b, vlan, mac, NULL);
     if (idx >= 0)
         port = entries(mt)[idx].port;                       /* last_seen is NOT touched */

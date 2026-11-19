@@ -13,3 +13,20 @@ core.*
 .idea/
 *~
 .DS_Store
+
+# Part 21 and earlier: the programs built in the project directory, and the dependency files of the benchmark
+/switch
+/switch_small
+/switch_tsan
+/switch_small_tsan
+/switch_global
+/switch_striped
+/switch_rwlock
+/host
+/host_tsan
+/swctl
+/supervisor
+/bench/bench
+/bench/bench_mac_*
+/bench/*.d
+__pycache__/
